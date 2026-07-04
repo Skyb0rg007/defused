@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: 2026 Skye Soss <skye@soss.website>
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Treefmt, the formatter multiplexer - https://github.com/numtide/treefmt
+
+[formatter.clang-format]
+command = "clang-format"
+options = ["-i"]
+includes = [ "*.c", "*.h" ]
+
+[formatter.nixfmt]
+command = "nixfmt"
+includes = [ "*.nix" ]
