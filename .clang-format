@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: 2026 Skye Soss <skye@soss.website>
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+---
+BasedOnStyle: LLVM
+IndentWidth: 4
+---

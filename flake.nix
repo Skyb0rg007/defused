@@ -35,6 +35,9 @@
             buildInputs = [
               pkgs.fuse
             ];
+            shellHook = ''
+              export NIX_CFLAGS_COMPILE="-U_FORTIFY_SOURCE $NIX_CFLAGS_COMPILE"
+            '';
           };
         }
       );
