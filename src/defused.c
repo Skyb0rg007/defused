@@ -34,6 +34,7 @@ static int recv_request(int sock, union defused_req *req, ssize_t *out_len,
                         int fds[2], int *out_fd_count, struct ucred *cred)
     __attribute__((__nonnull__(2, 3, 5, 6), __warn_unused_result__));
 static int send_response(int sock, uint32_t status, int sys_errno, int fd);
+static const char *status_name(uint32_t status) __attribute__((__const__, __warn_unused_result__));
 static int join_peer_mnt_ns(int sock) __attribute__((__warn_unused_result__));
 static int check_mount_policy(const struct defused_mount_req *req)
     __attribute__((__nonnull__(1), __warn_unused_result__));
@@ -92,26 +93,43 @@ int main(int argc, char *argv[]) {
     int client_fds[2] = {-1, -1};
     ssize_t n = -1;
     ret = recv_request(sock, &req, &n, client_fds, &client_fd_count, &cred);
-    if (ret < 0)
+    if (ret < 0) {
+        fprintf(stderr, "defused: failed to receive request: %s\n",
+                strerror(-ret));
         goto out;
+    }
 
     if ((size_t)n < sizeof(req.hdr) || req.hdr.magic != DEFUSED_PROTO_MAGIC ||
-        req.hdr.version != DEFUSED_PROTO_VERSION)
+        req.hdr.version != DEFUSED_PROTO_VERSION) {
+        fprintf(stderr,
+                "defused: malformed request header (len=%zd, magic=%#x, version=%u)\n",
+                n, (size_t)n >= sizeof(req.hdr) ? req.hdr.magic : 0,
+                (size_t)n >= sizeof(req.hdr) ? req.hdr.version : 0);
         goto malformed;
+    }
 
     switch (req.hdr.op) {
     case DEFUSED_OP_MOUNT:
-        if ((size_t)n != sizeof(req.mount) || client_fd_count != 2)
+        if ((size_t)n != sizeof(req.mount) || client_fd_count != 2) {
+            fprintf(stderr,
+                    "defused: malformed mount request (len=%zd, fds=%d)\n",
+                    n, client_fd_count);
             goto malformed;
+        }
         ret =
             handle_mount(sock, &req.mount, client_fds[1], client_fds[0], &cred);
         break;
     case DEFUSED_OP_UNMOUNT:
-        if ((size_t)n != sizeof(req.umount) || client_fd_count != 1)
+        if ((size_t)n != sizeof(req.umount) || client_fd_count != 1) {
+            fprintf(stderr,
+                    "defused: malformed unmount request (len=%zd, fds=%d)\n",
+                    n, client_fd_count);
             goto malformed;
+        }
         ret = handle_umount(sock, &req.umount, client_fds[0], proc_fd, &cred);
         break;
     default:
+        fprintf(stderr, "defused: unknown request operation %u\n", req.hdr.op);
         goto malformed;
     }
 
@@ -152,29 +170,39 @@ static int recv_request(int sock, union defused_req *req, ssize_t *out_len,
     *out_fd_count = 0;
 
     socklen_t cred_len = sizeof(*cred);
-    if (getsockopt(sock, SOL_SOCKET, SO_PEERCRED, cred, &cred_len) == -1)
+    if (getsockopt(sock, SOL_SOCKET, SO_PEERCRED, cred, &cred_len) == -1) {
+        fprintf(stderr, "defused: SO_PEERCRED failed: %s\n", strerror(errno));
         return -errno;
+    }
 
     ssize_t n = recvmsg(sock, &msg, MSG_CMSG_CLOEXEC);
-    if (n < 0)
+    if (n < 0) {
+        fprintf(stderr, "defused: recvmsg failed: %s\n", strerror(errno));
         return -errno;
+    }
     /* Ensure neither the message nor ancillary data were truncated */
     if (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) {
+        fprintf(stderr, "defused: request or ancillary data was truncated\n");
         return -EMSGSIZE;
     }
 
     for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
         if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
-            if (c->cmsg_len < CMSG_LEN(0))
+            if (c->cmsg_len < CMSG_LEN(0)) {
+                fprintf(stderr, "defused: malformed SCM_RIGHTS header\n");
                 return -EMSGSIZE;
+            }
             size_t payload_len = c->cmsg_len - CMSG_LEN(0);
-            if (payload_len == 0 || payload_len % sizeof(int) != 0)
+            if (payload_len == 0 || payload_len % sizeof(int) != 0) {
+                fprintf(stderr, "defused: malformed SCM_RIGHTS payload\n");
                 return -EMSGSIZE;
+            }
             size_t fd_count = payload_len / sizeof(int);
             if (*out_fd_count + (int)fd_count > 2) {
                 int *extra = (int *)CMSG_DATA(c);
                 for (size_t i = 0; i < fd_count; i++)
                     close(extra[i]);
+                fprintf(stderr, "defused: too many request file descriptors\n");
                 return -EMSGSIZE;
             }
             memcpy(&fds[*out_fd_count], CMSG_DATA(c), fd_count * sizeof(int));
@@ -211,9 +239,37 @@ static int send_response(int sock, uint32_t status, int sys_errno, int fd) {
     }
 
     /* Don't send a signal if the peer is gone, just return an error */
-    if (sendmsg(sock, &msg, MSG_NOSIGNAL) == -1)
+    if (sendmsg(sock, &msg, MSG_NOSIGNAL) == -1) {
+        fprintf(stderr, "defused: failed to send response %s: %s\n",
+                status_name(status), strerror(errno));
         return -errno;
+    }
     return 0;
+}
+
+static const char *status_name(uint32_t status) {
+    switch (status) {
+    case DEFUSED_OK:
+        return "DEFUSED_OK";
+    case DEFUSED_ERR_MALFORMED:
+        return "DEFUSED_ERR_MALFORMED";
+    case DEFUSED_ERR_BAD_OPTION:
+        return "DEFUSED_ERR_BAD_OPTION";
+    case DEFUSED_ERR_NOT_ALLOWED:
+        return "DEFUSED_ERR_NOT_ALLOWED";
+    case DEFUSED_ERR_TOO_MANY_MOUNTS:
+        return "DEFUSED_ERR_TOO_MANY_MOUNTS";
+    case DEFUSED_ERR_NOT_A_FUSE_MOUNT:
+        return "DEFUSED_ERR_NOT_A_FUSE_MOUNT";
+    case DEFUSED_ERR_MOUNT_FAILED:
+        return "DEFUSED_ERR_MOUNT_FAILED";
+    case DEFUSED_ERR_UNMOUNT_FAILED:
+        return "DEFUSED_ERR_UNMOUNT_FAILED";
+    case DEFUSED_ERR_SETNS_FAILED:
+        return "DEFUSED_ERR_SETNS_FAILED";
+    default:
+        return "unknown status";
+    }
 }
 
 /* Joins the peer's mount namespace using the socket peer's pidfd */
@@ -221,11 +277,17 @@ static int join_peer_mnt_ns(int sock) {
     int pidfd = -1;
     int ret = 0;
     socklen_t len = sizeof(pidfd);
-    if (getsockopt(sock, SOL_SOCKET, SO_PEERPIDFD, &pidfd, &len) == -1)
+    if (getsockopt(sock, SOL_SOCKET, SO_PEERPIDFD, &pidfd, &len) == -1) {
+        fprintf(stderr, "defused: SO_PEERPIDFD failed: %s\n", strerror(errno));
         return -errno;
+    }
 
     if (setns(pidfd, CLONE_NEWNS) == -1)
+    if (setns(pidfd, CLONE_NEWNS) == -1) {
+        fprintf(stderr, "defused: failed to join peer mount namespace: %s\n",
+                strerror(errno));
         ret = -errno;
+    }
 
     if (pidfd >= 0)
         close(pidfd);
@@ -498,6 +560,10 @@ static int handle_mount(int sock, const struct defused_mount_req *req,
     return send_response(sock, DEFUSED_OK, 0, -1);
 
 fail:
+    fprintf(stderr,
+            "defused: mount request failed with %s (ret=%d, errno=%d: %s)\n",
+            status_name(status), ret, sys_errno,
+            sys_errno ? strerror(sys_errno) : "none");
     (void)send_response(sock, status, sys_errno, -1);
     return ret;
 }
@@ -596,6 +662,11 @@ static int handle_umount(int sock, const struct defused_umount_req *req,
 out:
     if (mnt_fd >= 0)
         close(mnt_fd);
+    if (ret < 0)
+        fprintf(stderr,
+                "defused: unmount request failed with %s (ret=%d, errno=%d: %s)\n",
+                status_name(status), ret, sys_errno,
+                sys_errno ? strerror(sys_errno) : "none");
     int send_ret = send_response(sock, status, sys_errno, -1);
     if (ret == 0)
         ret = send_ret;
