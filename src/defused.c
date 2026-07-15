@@ -544,6 +544,9 @@ static int handle_umount(int sock, const struct defused_umount_req *req,
         sys_errno = -ret;
         goto out;
     }
+    close(mnt_fd);
+    mnt_fd = -1;
+
     if (mnt_id == parent_mnt_id) {
         status = DEFUSED_ERR_NOT_A_FUSE_MOUNT;
         ret = -EINVAL;
