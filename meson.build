@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Skye Soss <skye@soss.website>
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+
 project(
   'defused',
   'c',
@@ -6,18 +10,22 @@ project(
   default_options : ['warning_level=3'],
 )
 
-dependencies = [
-]
+# XXX: Check for function availability
+common_c_args = ['-DHAVE_CLOSE_RANGE']
 
-sources = [
-  'src/defused.c',
-]
-
-exe = executable(
+defused_exe = executable(
   'defused',
-  sources,
-  dependencies : dependencies,
+  'src/defused.c',
+  'src/util.c',
+  c_args : common_c_args,
   install : true,
 )
 
-test('basic', exe)
+fusermount3_exe = executable(
+  'fusermount3',
+  'src/fusermount3.c',
+  'src/util.c',
+  c_args : common_c_args + ['-DDEFUSED_VERSION="@0@"'.format(meson.project_version())],
+  install : true,
+)
+

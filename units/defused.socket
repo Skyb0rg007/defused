@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2026 Skye Soss <skye@soss.website>
+#
+# SPDX-License-Identifier: MIT-0
+
+[Unit]
+Description=defused FUSE mount service listening socket
+Documentation=https://github.com/Skyb0rg007/defused
+
+[Socket]
+Accept=yes
+ListenSequentialPacket=/run/defused/defused.sock
+RuntimeDirectory=defused

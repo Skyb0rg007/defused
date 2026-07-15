@@ -45,7 +45,9 @@ you can run the service with `systemd-socket-activate`.
 
 ## Licensing
 
-This project is licensed under the GPL version 2 or later.
+This project copies a lot of helpers from libfuse, which are either
+GPL-2.0-only or LGPL-2.1-only.
+All of my code is licensed under GPL-2.0-or-later.
 
 [FUSE-Wikipedia]: https://en.wikipedia.org/wiki/Filesystem_in_Userspace
 [FUSE]: https://www.kernel.org/doc/html/next/filesystems/fuse.html
