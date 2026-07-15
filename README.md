@@ -25,7 +25,10 @@ $ setpriv --no-new-privs -- fuse-overlayfs -o lowerdir=_lower _mnt
 fuse-overlayfs: cannot mount: Operation not permitted
 ```
 
-The `no_new_privileges` flag is important for proper application sandboxing.
+The `no_new_privileges` flag is important for proper application sandboxing,
+as Linux features such as [landlock][] and [seccomp-bpf][] can only be used
+after a call to `prctl(PR_SET_NO_NEW_PRIVS, 1)`.
+
 Using Unix domain sockets like defused does means that privileges can be
 granted or denied by bind-mounting the sockets into the application's
 namespace.
@@ -53,3 +56,5 @@ All of my code is licensed under GPL-2.0-or-later.
 [FUSE]: https://www.kernel.org/doc/html/next/filesystems/fuse.html
 [libfuse]: https://github.com/libfuse/libfuse
 [NoNewPrivileges]: https://docs.kernel.org/userspace-api/no_new_privs.html
+[seccomp-bpf]: https://docs.kernel.org/userspace-api/seccomp_filter.html
+[landlock]: https://docs.kernel.org/userspace-api/landlock.html
