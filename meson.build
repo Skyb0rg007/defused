@@ -22,6 +22,7 @@ defused_exe = executable(
   'src/util.c',
   c_args : common_c_args,
   dependencies : [seccomp_dep],
+  install_dir : get_option('prefix') / 'lib/defused',
   install : true,
 )
 

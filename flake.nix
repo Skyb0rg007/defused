@@ -17,6 +17,11 @@
       forAllSystems = lib.genAttrs systems;
     in
     {
+      nixosModules = {
+        default = import ./nixos/module.nix { inherit self; };
+        defused = self.nixosModules.default;
+      };
+
       packages = forAllSystems (
         system:
         let
@@ -33,7 +38,6 @@
               pkgs.ninja
             ];
             buildInputs = [
-              pkgs.fuse
               pkgs.libseccomp
             ];
             shellHook = ''
@@ -57,6 +61,7 @@
               pkgs.nixfmt
               pkgs.clang-tools
               pkgs.reuse
+              pkgs.fuse
             ];
           };
         }
