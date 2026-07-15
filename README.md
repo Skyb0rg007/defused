@@ -49,8 +49,9 @@ you can run the service with `systemd-socket-activate`.
 
 Defused intentionally uses a stricter mountpoint ownership model than
 libfuse's setuid `fusermount3`.
-For non-root mounts, the mountpoint must be a directory owned by the caller,
-and it must be writable and searchable by that caller.
+For non-root mounts, the mountpoint must be a directory or regular file owned
+by the caller.
+It must be writable by that caller; directories must also be searchable.
 
 This means defused rejects mounts on writable shared directories owned by
 another user, even when libfuse's setuid helper would allow them because the

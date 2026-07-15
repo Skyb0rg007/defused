@@ -96,7 +96,8 @@ enum defused_mount_flag {
  * The ancillary data is, in order:
  *
  *  1. A file descriptor opened from /dev/fuse
- *  2. A file descriptor opened to the destination mountpoint directory
+ *  2. A file descriptor opened to the destination mountpoint directory or
+ *     regular file
  *
  * The service will then attempt to create the mountpoint with the given
  * options at the location specified by the second file descriptor.

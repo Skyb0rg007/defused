@@ -24,4 +24,8 @@
   mount-options = import ./mount-options.nix {
     inherit self pkgs system;
   };
+
+  file-mountpoint = import ./file-mountpoint.nix {
+    inherit self pkgs system;
+  };
 }

@@ -573,16 +573,16 @@ static int handle_mount(int sock, const struct defused_mount_req *req,
         ret = -errno;
         goto fail;
     }
-    if (!S_ISDIR(st.st_mode)) {
+    if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) {
         status = DEFUSED_ERR_MALFORMED;
-        sys_errno = ENOTDIR;
-        ret = -ENOTDIR;
+        sys_errno = S_ISLNK(st.st_mode) ? ELOOP : ENOTDIR;
+        ret = -sys_errno;
         goto fail;
     }
-    /* Callers may only mount on writable directories they own,
+    /* Callers may only mount on writable mountpoints they own,
      * and only over filesystems libfuse permits for unprivileged mounts. */
     if (st.st_uid != cred->uid || !(st.st_mode & S_IWUSR) ||
-        !(st.st_mode & S_IXUSR)) {
+        (S_ISDIR(st.st_mode) && !(st.st_mode & S_IXUSR))) {
         status = DEFUSED_ERR_NOT_ALLOWED;
         ret = -EPERM;
         goto fail;

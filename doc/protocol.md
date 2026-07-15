@@ -85,7 +85,7 @@ device itself and never changes uid or gid.
 That preserves device-node access policy: a client that cannot open `/dev/fuse`
 cannot ask the service to do it on its behalf.
 The service validates the mountpoint fd with `fstat()`, including that it names
-a directory.
+a directory or regular file.
 The detached mount is attached to that fd with `move_mount(..., MOVE_MOUNT_T_EMPTY_PATH)`.
 
 `mount_flags` is the final option bitmask requested by the client.
@@ -97,10 +97,12 @@ Policy applied before the mount is attempted:
 
 - `ALLOW_OTHER` requires the service to have been started with
   `--user-allow-other`, else `DEFUSED_ERR_NOT_ALLOWED`.
-- The mountpoint must be a directory (`DEFUSED_ERR_MALFORMED` otherwise).
-- The mountpoint fd must name a caller-owned writable and searchable directory
+- The mountpoint must be a directory or regular file
+  (`DEFUSED_ERR_MALFORMED` otherwise).
+- The mountpoint fd must name a caller-owned writable mountpoint
   on a backing filesystem type that libfuse permits for unprivileged mounts
   (`DEFUSED_ERR_NOT_ALLOWED` otherwise).
+  Directories must also be searchable by the caller.
   This is an intentional policy difference from libfuse's setuid
   `fusermount3`: libfuse allows writable non-sticky shared directories owned
   by another user, while defused requires caller ownership so the privileged
