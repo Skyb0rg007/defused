@@ -29,10 +29,9 @@ The `no_new_privileges` flag is important for proper application sandboxing,
 as Linux features such as [landlock][] and [seccomp-bpf][] can only be used
 after a call to `prctl(PR_SET_NO_NEW_PRIVS, 1)`.
 
-Using Unix domain sockets like defused does means that privileges can be
+Using Unix domain sockets like defused does also means that privileges can be
 granted or denied by bind-mounting the sockets into the application's
-namespace.
-Doing so with `/usr/bin` is much more challenging.
+namespace. Doing so with `/usr/bin` is much more challenging.
 
 ## Project structure
 
@@ -45,6 +44,20 @@ The system service is written to use systemd socket activation with
 `Accept=yes`.
 On systems without systemd as service manager or and for testing,
 you can run the service with `systemd-socket-activate`.
+
+## Mountpoint ownership model
+
+Defused intentionally uses a stricter mountpoint ownership model than
+libfuse's setuid `fusermount3`.
+For non-root mounts, the mountpoint must be a directory owned by the caller,
+and it must be writable and searchable by that caller.
+
+This means defused rejects mounts on writable shared directories owned by
+another user, even when libfuse's setuid helper would allow them because the
+directory is not sticky.
+The stricter rule keeps the privileged service's authorization decision tied
+to the mountpoint file descriptor it receives, instead of trying to reproduce
+libfuse's path-based `access(W_OK)` check across the client/service protocol.
 
 ## Licensing
 

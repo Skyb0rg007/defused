@@ -101,9 +101,10 @@ Policy applied before the mount is attempted:
 - The mountpoint fd must name a caller-owned writable and searchable directory
   on a backing filesystem type that libfuse permits for unprivileged mounts
   (`DEFUSED_ERR_NOT_ALLOWED` otherwise).
-  Defused is stricter than libfuse for writable non-sticky shared directories,
-  because the privileged service cannot safely reuse the client's exact
-  path-based `access(W_OK)` result from the fixed-size protocol.
+  This is an intentional policy difference from libfuse's setuid
+  `fusermount3`: libfuse allows writable non-sticky shared directories owned
+  by another user, while defused requires caller ownership so the privileged
+  service can authorize the received mountpoint fd directly.
 - If `--mount-max` (default 1000, `-1` disables it) is already reached, the
   mount is refused (`DEFUSED_ERR_TOO_MANY_MOUNTS`).
 
