@@ -47,8 +47,8 @@ you can run the service with `systemd-socket-activate`.
 
 ## Mountpoint ownership model
 
-Defused intentionally uses a stricter mountpoint ownership model than
-libfuse's setuid `fusermount3`.
+Defused uses a different mountpoint ownership model than libfuse's setuid
+`fusermount3`.
 For non-root mounts, the mountpoint must be a directory or regular file owned
 by the caller.
 It must be writable by that caller; directories must also be searchable.
@@ -59,6 +59,15 @@ directory is not sticky.
 The stricter rule keeps the privileged service's authorization decision tied
 to the mountpoint file descriptor it receives, instead of trying to reproduce
 libfuse's path-based `access(W_OK)` check across the client/service protocol.
+
+This does lead to some additional mounting possibilities, all due to other
+filesystem restrictions.
+If a given file path is owned by the user, but the process is unable to write
+to the path due to POSIX ACLs, LSMs like SELinux, AppArmor, or Landlock,
+libfuse's setuid implementation will deny the mount while this implementation
+will still perform it.
+I do not believe this is an issue, however, as sandboxed applications should
+deny access to `/dev/fuse` or `/run/defused/defused.sock`.
 
 ## Licensing
 
