@@ -29,3 +29,28 @@ fusermount3_exe = executable(
   install : true,
 )
 
+## Tests ##
+
+test_protocol_exe = executable(
+  'test-protocol',
+  'tests/test_protocol.c',
+  include_directories : include_directories('src'),
+)
+
+test('protocol', test_protocol_exe, args : [defused_exe])
+
+test_client_exe = executable(
+  'test-client',
+  'tests/test_client.c',
+  include_directories : include_directories('src'),
+)
+
+test('client', test_client_exe, args : [fusermount3_exe])
+
+test_mountns_exe = executable(
+  'test-mountns',
+  'tests/test_mountns.c',
+  include_directories : include_directories('src'),
+)
+
+test('mountns', test_mountns_exe, args : [defused_exe])
