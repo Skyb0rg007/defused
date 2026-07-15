@@ -213,11 +213,16 @@ This doesn't work for non-lazy unmounts, as that file descriptor is considered
 an additional open file descriptor, so `umount2()` will return `EBUSY`.
 
 This mirrors the libfuse `fusermount3`'s own `chdir_to_parent()` + by-name
-`umount2(..., UMOUNT_NOFOLLOW)`: name the target without ever holding
-a long-lived reference to it.
+`umount2(..., UMOUNT_NOFOLLOW)`:
+name the target without ever holding a reference to it.
 And exactly like libfuse, defused checks that the mount ID is okay to unmount
 but closes the file descriptor before calling `umount2()` to avoid the `EBUSY`
 issue.
+
+Even though this looks like a TOCTOU issue, mountpoints are not able to
+be renamed, and the unmount cannot be misdirected via symlink due to
+`UMOUNT_NOFOLLOW`.
+This is also what libfuse has done forever.
 
 ### Versioning
 
