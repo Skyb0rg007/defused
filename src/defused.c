@@ -17,8 +17,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
-#include <seccomp.h>
 #include <sched.h>
+#include <seccomp.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,9 +35,12 @@ static int recv_request(int sock, union defused_req *req, ssize_t *out_len,
                         int fds[2], int *out_fd_count, struct ucred *cred)
     __attribute__((__nonnull__(2, 3, 5, 6), __warn_unused_result__));
 static int send_response(int sock, uint32_t status, int sys_errno, int fd);
-static const char *status_name(uint32_t status) __attribute__((__const__, __warn_unused_result__));
-static int join_peer_mnt_ns(int sock) __attribute__((__warn_unused_result__));
-static int install_seccomp(void) __attribute__((__warn_unused_result__));
+static const char *status_name(uint32_t status)
+    __attribute__((__const__, __warn_unused_result__));
+static int join_peer_mnt_ns(int sock, enum defused_op op)
+    __attribute__((__warn_unused_result__));
+static int install_seccomp(enum defused_op op)
+    __attribute__((__warn_unused_result__));
 static int check_mount_policy(const struct defused_mount_req *req)
     __attribute__((__nonnull__(1), __warn_unused_result__));
 static int check_mountpoint_fstype(int mnt_fd)
@@ -104,7 +107,8 @@ int main(int argc, char *argv[]) {
     if ((size_t)n < sizeof(req.hdr) || req.hdr.magic != DEFUSED_PROTO_MAGIC ||
         req.hdr.version != DEFUSED_PROTO_VERSION) {
         fprintf(stderr,
-                "defused: malformed request header (len=%zd, magic=%#x, version=%u)\n",
+                "defused: malformed request header (len=%zd, magic=%#x, "
+                "version=%u)\n",
                 n, (size_t)n >= sizeof(req.hdr) ? req.hdr.magic : 0,
                 (size_t)n >= sizeof(req.hdr) ? req.hdr.version : 0);
         goto malformed;
@@ -114,8 +118,8 @@ int main(int argc, char *argv[]) {
     case DEFUSED_OP_MOUNT:
         if ((size_t)n != sizeof(req.mount) || client_fd_count != 2) {
             fprintf(stderr,
-                    "defused: malformed mount request (len=%zd, fds=%d)\n",
-                    n, client_fd_count);
+                    "defused: malformed mount request (len=%zd, fds=%d)\n", n,
+                    client_fd_count);
             goto malformed;
         }
         ret =
@@ -124,8 +128,8 @@ int main(int argc, char *argv[]) {
     case DEFUSED_OP_UNMOUNT:
         if ((size_t)n != sizeof(req.umount) || client_fd_count != 1) {
             fprintf(stderr,
-                    "defused: malformed unmount request (len=%zd, fds=%d)\n",
-                    n, client_fd_count);
+                    "defused: malformed unmount request (len=%zd, fds=%d)\n", n,
+                    client_fd_count);
             goto malformed;
         }
         ret = handle_umount(sock, &req.umount, client_fds[0], proc_fd, &cred);
@@ -275,7 +279,7 @@ static const char *status_name(uint32_t status) {
 }
 
 /* Joins the peer's mount namespace using the socket peer's pidfd */
-static int join_peer_mnt_ns(int sock) {
+static int join_peer_mnt_ns(int sock, enum defused_op op) {
     int pidfd = -1;
     int ret = 0;
     socklen_t len = sizeof(pidfd);
@@ -284,12 +288,14 @@ static int join_peer_mnt_ns(int sock) {
         return -errno;
     }
 
-    ret = install_seccomp();
+    ret = install_seccomp(op);
     if (ret < 0) {
         fprintf(stderr, "defused: failed to install seccomp filter: %s\n",
                 strerror(-ret));
         goto out;
     }
+
+    fprintf(stderr, "defused: seccomp installed\n");
 
     if (setns(pidfd, CLONE_NEWNS) == -1) {
         fprintf(stderr, "defused: failed to join peer mount namespace: %s\n",
@@ -305,12 +311,60 @@ out:
 
 /* After setns(), the filesystem will be controlled by the client.
  * Restrict ourselves before that to make sure nothing bad happens. */
-static int install_seccomp(void) {
+static int install_seccomp(enum defused_op op) {
+    static const int allowed_syscalls[] = {
+        SCMP_SYS(read),  SCMP_SYS(write),      SCMP_SYS(close),
+        SCMP_SYS(fstat), SCMP_SYS(sendmsg),    SCMP_SYS(exit),
+        SCMP_SYS(fcntl), SCMP_SYS(exit_group), SCMP_SYS(setns),
+        SCMP_SYS(rt_sigreturn),
+    };
+    static const int mount_syscalls[] = {
+        SCMP_SYS(move_mount),
+        SCMP_SYS(fsopen),
+        SCMP_SYS(fsconfig),
+        SCMP_SYS(fsmount),
+    };
+    static const int unmount_syscalls[] = {
+        SCMP_SYS(fchdir),
+        SCMP_SYS(umount2),
+        SCMP_SYS(openat),
+    };
+
     scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_LOG);
     if (!ctx)
         return -ENOMEM;
 
-    int ret = seccomp_load(ctx);
+    int ret = 0;
+    for (size_t i = 0;
+         i < sizeof(allowed_syscalls) / sizeof(allowed_syscalls[0]); i++) {
+        ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, allowed_syscalls[i], 0);
+        if (ret < 0)
+            goto out;
+    }
+
+    switch (op) {
+    case DEFUSED_OP_MOUNT:
+        for (size_t i = 0;
+             i < sizeof(mount_syscalls) / sizeof(mount_syscalls[0]); i++) {
+            ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, mount_syscalls[i], 0);
+            if (ret < 0)
+                goto out;
+        }
+        break;
+    case DEFUSED_OP_UNMOUNT:
+        for (size_t i = 0;
+             i < sizeof(unmount_syscalls) / sizeof(unmount_syscalls[0]); i++) {
+            ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, unmount_syscalls[i], 0);
+            if (ret < 0)
+                goto out;
+        }
+        break;
+    default:
+        return -EINVAL;
+    }
+
+    ret = seccomp_load(ctx);
+out:
     seccomp_release(ctx);
     return ret < 0 ? ret : 0;
 }
@@ -564,7 +618,7 @@ static int handle_mount(int sock, const struct defused_mount_req *req,
         }
     }
 
-    ret = join_peer_mnt_ns(sock);
+    ret = join_peer_mnt_ns(sock, DEFUSED_OP_MOUNT);
     if (ret < 0) {
         status = DEFUSED_ERR_SETNS_FAILED;
         sys_errno = -ret;
@@ -640,7 +694,7 @@ static int handle_umount(int sock, const struct defused_umount_req *req,
         goto out;
     }
 
-    ret = join_peer_mnt_ns(sock);
+    ret = join_peer_mnt_ns(sock, DEFUSED_OP_UNMOUNT);
     if (ret < 0) {
         status = DEFUSED_ERR_SETNS_FAILED;
         sys_errno = -ret;
@@ -684,10 +738,11 @@ out:
     if (mnt_fd >= 0)
         close(mnt_fd);
     if (ret < 0)
-        fprintf(stderr,
-                "defused: unmount request failed with %s (ret=%d, errno=%d: %s)\n",
-                status_name(status), ret, sys_errno,
-                sys_errno ? strerror(sys_errno) : "none");
+        fprintf(
+            stderr,
+            "defused: unmount request failed with %s (ret=%d, errno=%d: %s)\n",
+            status_name(status), ret, sys_errno,
+            sys_errno ? strerror(sys_errno) : "none");
     int send_ret = send_response(sock, status, sys_errno, -1);
     if (ret == 0)
         ret = send_ret;
@@ -759,8 +814,8 @@ static int socket_activation_fd(int *out_fd) {
     const char *pid_str = getenv("LISTEN_PID");
     const char *fds_str = getenv("LISTEN_FDS");
     if (!pid_str || !fds_str) {
-        fprintf(stderr,
-                "defused: not socket-activated ($LISTEN_PID/$LISTEN_FDS not set)\n");
+        fprintf(stderr, "defused: not socket-activated "
+                        "($LISTEN_PID/$LISTEN_FDS not set)\n");
         return -EINVAL;
     }
 
@@ -775,7 +830,8 @@ static int socket_activation_fd(int *out_fd) {
     long nfds;
     if (libfuse_strtol(fds_str, &nfds) < 0 || nfds != 1) {
         fprintf(stderr,
-                "defused: expected exactly one socket-activation fd , got $LISTEN_FDS=%s\n",
+                "defused: expected exactly one socket-activation fd , got "
+                "$LISTEN_FDS=%s\n",
                 fds_str);
         return -EINVAL;
     }
