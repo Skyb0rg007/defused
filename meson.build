@@ -10,6 +10,9 @@ project(
   default_options : ['warning_level=3'],
 )
 
+cc = meson.get_compiler('c')
+seccomp_dep = cc.find_library('seccomp', has_headers : ['seccomp.h'])
+
 # XXX: Check for function availability
 common_c_args = ['-DHAVE_CLOSE_RANGE']
 
@@ -18,6 +21,7 @@ defused_exe = executable(
   'src/defused.c',
   'src/util.c',
   c_args : common_c_args,
+  dependencies : [seccomp_dep],
   install : true,
 )
 

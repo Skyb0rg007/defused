@@ -34,6 +34,7 @@
             ];
             buildInputs = [
               pkgs.fuse
+              pkgs.libseccomp
             ];
             shellHook = ''
               export NIX_CFLAGS_COMPILE="-U_FORTIFY_SOURCE $NIX_CFLAGS_COMPILE"

@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <seccomp.h>
 #include <sched.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -36,6 +37,7 @@ static int recv_request(int sock, union defused_req *req, ssize_t *out_len,
 static int send_response(int sock, uint32_t status, int sys_errno, int fd);
 static const char *status_name(uint32_t status) __attribute__((__const__, __warn_unused_result__));
 static int join_peer_mnt_ns(int sock) __attribute__((__warn_unused_result__));
+static int install_seccomp(void) __attribute__((__warn_unused_result__));
 static int check_mount_policy(const struct defused_mount_req *req)
     __attribute__((__nonnull__(1), __warn_unused_result__));
 static int check_mountpoint_fstype(int mnt_fd)
@@ -282,16 +284,35 @@ static int join_peer_mnt_ns(int sock) {
         return -errno;
     }
 
-    if (setns(pidfd, CLONE_NEWNS) == -1)
+    ret = install_seccomp();
+    if (ret < 0) {
+        fprintf(stderr, "defused: failed to install seccomp filter: %s\n",
+                strerror(-ret));
+        goto out;
+    }
+
     if (setns(pidfd, CLONE_NEWNS) == -1) {
         fprintf(stderr, "defused: failed to join peer mount namespace: %s\n",
                 strerror(errno));
         ret = -errno;
     }
 
+out:
     if (pidfd >= 0)
         close(pidfd);
     return ret;
+}
+
+/* After setns(), the filesystem will be controlled by the client.
+ * Restrict ourselves before that to make sure nothing bad happens. */
+static int install_seccomp(void) {
+    scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_LOG);
+    if (!ctx)
+        return -ENOMEM;
+
+    int ret = seccomp_load(ctx);
+    seccomp_release(ctx);
+    return ret < 0 ? ret : 0;
 }
 
 /* Check the client's mount request against the configured policy */
