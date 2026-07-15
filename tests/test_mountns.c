@@ -13,11 +13,9 @@
  *    is a *grandchild* that additionally unshare(CLONE_NEWNS)'d into its
  *    own namespace B, a descendant of A. defused should be able to setns()
  *    into B (it has CAP_SYS_ADMIN there) and proceed with the request; we
- *    prove the join happened by sending a request with a deliberately bad
- *    mount flag and checking the response is DEFUSED_ERR_BAD_OPTION (from
- *    the policy check *after* the namespace join in main()) rather than
- *    DEFUSED_ERR_SETNS_FAILED (which is what a failed or skipped join
- *    would produce instead).
+ *    prove the join happened by sending an unmount request for a non-FUSE
+ *    bind mount and checking the response is DEFUSED_ERR_NOT_A_FUSE_MOUNT
+ *    rather than DEFUSED_ERR_SETNS_FAILED.
  *
  *  - test_cannot_join: defused runs unprivileged in the plain host
  *    namespace, like every other test in this suite. The client
@@ -30,9 +28,8 @@
  *    mounting against the wrong mount table while believing it's the
  *    client's).
  *
- * Neither test reaches the real mount(2) call, for the same reason as
- * test_protocol.c: that's the one part of request handling that needs
- * privilege to succeed, orthogonal to what's being tested here.
+ * Neither test reaches a real FUSE mount/unmount. The client creates only a
+ * private bind mount inside its own mount namespace.
  */
 #define _GNU_SOURCE
 #include "defused.h"
@@ -45,7 +42,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -91,55 +90,7 @@ static int map_root(uid_t real_uid, gid_t real_gid) {
     return 0;
 }
 
-/* Sends a mount request (deliberately bad mount_flags, matching
- * test_protocol.c's technique) carrying the required mount fds, and returns
- * the service's response status, or -1 on a transport-level failure. */
-static int send_bad_mount_request(int sock) {
-    struct defused_mount_req req = {
-        .hdr = {DEFUSED_PROTO_MAGIC, DEFUSED_PROTO_VERSION, DEFUSED_OP_MOUNT},
-        .mount_flags = 1u << 31, /* never in DEFUSED_MOUNT_FLAGS_MASK */
-    };
-    int mnt_fd = open(".", O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    if (mnt_fd < 0) {
-        perror("open");
-        return -errno;
-    }
-    int dev_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
-    if (dev_fd < 0) {
-        int ret = -errno;
-        perror("open /dev/null");
-        close(mnt_fd);
-        return ret;
-    }
-
-    struct iovec iov = {.iov_base = &req, .iov_len = sizeof(req)};
-    union {
-        struct cmsghdr h;
-        char buf[CMSG_SPACE(2 * sizeof(int))];
-    } cbuf;
-    struct msghdr msg = {
-        .msg_iov = &iov,
-        .msg_iovlen = 1,
-        .msg_control = cbuf.buf,
-        .msg_controllen = sizeof(cbuf.buf),
-    };
-    struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
-    c->cmsg_level = SOL_SOCKET;
-    c->cmsg_type = SCM_RIGHTS;
-    c->cmsg_len = CMSG_LEN(2 * sizeof(int));
-    int fds[] = {dev_fd, mnt_fd};
-    memcpy(CMSG_DATA(c), fds, sizeof(fds));
-
-    if (sendmsg(sock, &msg, 0) < 0) {
-        int ret = -errno;
-        perror("sendmsg");
-        close(dev_fd);
-        close(mnt_fd);
-        return ret;
-    }
-    close(dev_fd);
-    close(mnt_fd);
-
+static int recv_response_status(int sock) {
     struct defused_resp resp;
     struct iovec riov = {.iov_base = &resp, .iov_len = sizeof(resp)};
     struct msghdr rmsg = {.msg_iov = &riov, .msg_iovlen = 1};
@@ -157,6 +108,86 @@ static int send_bad_mount_request(int sock) {
         fprintf(stderr, "(setns failed, sys_errno=%d: %s)\n", resp.sys_errno,
                 strerror(resp.sys_errno));
     return (int)resp.status;
+}
+
+/* Sends an unmount request for a bind mount that is intentionally not FUSE.
+ * A service that can enter the client's namespace should therefore return
+ * DEFUSED_ERR_NOT_A_FUSE_MOUNT; a service that cannot enter it should fail
+ * earlier with DEFUSED_ERR_SETNS_FAILED. */
+static int send_non_fuse_umount_request(int sock) {
+    char dir_template[] = "/tmp/defused-mountns-XXXXXX";
+    char *dir = mkdtemp(dir_template);
+    if (!dir) {
+        perror("mkdtemp");
+        return -errno;
+    }
+
+    char target[sizeof(dir_template) + sizeof("/target")];
+    snprintf(target, sizeof(target), "%s/target", dir);
+    if (mkdir(target, 0700) == -1) {
+        int ret = -errno;
+        perror("mkdir target");
+        rmdir(dir);
+        return ret;
+    }
+
+    if (mount(target, target, NULL, MS_BIND, NULL) == -1) {
+        int ret = -errno;
+        perror("bind mount target");
+        rmdir(target);
+        rmdir(dir);
+        return ret;
+    }
+
+    int parent_fd = open(dir, O_PATH | O_DIRECTORY | O_CLOEXEC);
+    if (parent_fd < 0) {
+        int ret = -errno;
+        perror("open parent");
+        umount2(target, MNT_DETACH);
+        rmdir(target);
+        rmdir(dir);
+        return ret;
+    }
+
+    struct defused_umount_req req = {
+        .hdr = {DEFUSED_PROTO_MAGIC, DEFUSED_PROTO_VERSION, DEFUSED_OP_UNMOUNT},
+    };
+    strncpy(req.name, "target", sizeof(req.name));
+
+    struct iovec iov = {.iov_base = &req, .iov_len = sizeof(req)};
+    union {
+        struct cmsghdr h;
+        char buf[CMSG_SPACE(sizeof(int))];
+    } cbuf;
+    struct msghdr msg = {
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+        .msg_control = cbuf.buf,
+        .msg_controllen = sizeof(cbuf.buf),
+    };
+    struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(c), &parent_fd, sizeof(parent_fd));
+
+    if (sendmsg(sock, &msg, 0) < 0) {
+        int ret = -errno;
+        perror("sendmsg");
+        close(parent_fd);
+        umount2(target, MNT_DETACH);
+        rmdir(target);
+        rmdir(dir);
+        return ret;
+    }
+
+    close(parent_fd);
+    int status = recv_response_status(sock);
+
+    umount2(target, MNT_DETACH);
+    rmdir(target);
+    rmdir(dir);
+    return status;
 }
 
 static int abstract_addr(struct sockaddr_un *sa, socklen_t *len,
@@ -270,9 +301,9 @@ static int test_can_join(const char *defused_path) {
             int client_sock = connect_addr(&sa, salen);
             if (client_sock < 0)
                 _exit(1);
-            int status = send_bad_mount_request(client_sock);
+            int status = send_non_fuse_umount_request(client_sock);
             close(client_sock);
-            _exit(status == DEFUSED_ERR_BAD_OPTION ? 0 : 1);
+            _exit(status == DEFUSED_ERR_NOT_A_FUSE_MOUNT ? 0 : 1);
         }
 
         int conn = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
@@ -341,7 +372,7 @@ static int test_cannot_join(const char *defused_path) {
         int client_sock = connect_addr(&sa, salen);
         if (client_sock < 0)
             _exit(1);
-        int status = send_bad_mount_request(client_sock);
+        int status = send_non_fuse_umount_request(client_sock);
         close(client_sock);
         if (status != DEFUSED_ERR_SETNS_FAILED)
             fprintf(stderr, "test_cannot_join: got status %d, expected %d\n",

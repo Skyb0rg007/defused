@@ -49,8 +49,8 @@ static int handle_mount(int sock, const struct defused_mount_req *req,
                         int mnt_fd, int dev_fd, const struct ucred *cred)
     __attribute__((__nonnull__(2, 5), __warn_unused_result__));
 static int handle_umount(int sock, const struct defused_umount_req *req,
-                         int parent_fd, const struct ucred *cred)
-    __attribute__((__nonnull__(2, 4), __warn_unused_result__));
+                         int parent_fd, int proc_fd, const struct ucred *cred)
+    __attribute__((__nonnull__(2, 5), __warn_unused_result__));
 static void usage(const char *prog) __attribute__((__nonnull__(1)));
 static int parse_args(int argc, char *argv[])
     __attribute__((__nonnull__(2), __warn_unused_result__));
@@ -58,10 +58,10 @@ static int socket_activation_fd(int *out_fd)
     __attribute__((__nonnull__(1), __warn_unused_result__));
 static int fuse_mount_entry(const char *line, const char **out_sep)
     __attribute__((__nonnull__(1, 2), __warn_unused_result__));
-static int fd_mnt_id(int fd, long *out_id)
-    __attribute__((__nonnull__(2), __warn_unused_result__));
-static int fuse_mount_owner(long mnt_id, uid_t *out_uid)
-    __attribute__((__nonnull__(2), __warn_unused_result__));
+static int fd_mnt_id(int proc_fd, int fd, long *out_id)
+    __attribute__((__nonnull__(3), __warn_unused_result__));
+static int fuse_mount_owner(int proc_fd, long mnt_id, uid_t *out_uid)
+    __attribute__((__nonnull__(3), __warn_unused_result__));
 
 static long cfg_mount_max = 1000;
 static bool cfg_user_allow_other = false;
@@ -77,10 +77,19 @@ int main(int argc, char *argv[]) {
     ret = socket_activation_fd(&sock);
     if (ret < 0)
         return EXIT_FAILURE;
+
+    int client_fd_count = 0;
+
+    /* Keep a handle to the service's procfs before entering the client's
+     * mount namespace. */
+    int proc_fd = open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (proc_fd == -1) {
+        fprintf(stderr, "defused: failed to open /proc: %s\n", strerror(errno));
+        goto out;
+    }
     union defused_req req;
     struct ucred cred;
     int client_fds[2] = {-1, -1};
-    int client_fd_count = 0;
     ssize_t n = -1;
     ret = recv_request(sock, &req, &n, client_fds, &client_fd_count, &cred);
     if (ret < 0)
@@ -89,13 +98,6 @@ int main(int argc, char *argv[]) {
     if ((size_t)n < sizeof(req.hdr) || req.hdr.magic != DEFUSED_PROTO_MAGIC ||
         req.hdr.version != DEFUSED_PROTO_VERSION)
         goto malformed;
-
-    /* Join the peer's mount namespace before handling the mountpoints */
-    ret = join_peer_mnt_ns(sock);
-    if (ret < 0) {
-        send_response(sock, DEFUSED_ERR_SETNS_FAILED, -ret, -1);
-        goto out;
-    }
 
     switch (req.hdr.op) {
     case DEFUSED_OP_MOUNT:
@@ -107,7 +109,7 @@ int main(int argc, char *argv[]) {
     case DEFUSED_OP_UNMOUNT:
         if ((size_t)n != sizeof(req.umount) || client_fd_count != 1)
             goto malformed;
-        ret = handle_umount(sock, &req.umount, client_fds[0], &cred);
+        ret = handle_umount(sock, &req.umount, client_fds[0], proc_fd, &cred);
         break;
     default:
         goto malformed;
@@ -121,6 +123,8 @@ malformed:
 out:
     for (int i = 0; i < client_fd_count; i++)
         close(client_fds[i]);
+    if (proc_fd >= 0)
+        close(proc_fd);
     if (sock >= 0)
         close(sock);
     return exit_status;
@@ -477,6 +481,13 @@ static int handle_mount(int sock, const struct defused_mount_req *req,
         }
     }
 
+    ret = join_peer_mnt_ns(sock);
+    if (ret < 0) {
+        status = DEFUSED_ERR_SETNS_FAILED;
+        sys_errno = -ret;
+        goto fail;
+    }
+
     ret = mount_fuse_new_api(req, mnt_fd, dev_fd, &st, cred);
     if (ret < 0) {
         status = DEFUSED_ERR_MOUNT_FAILED;
@@ -492,7 +503,7 @@ fail:
 }
 
 static int handle_umount(int sock, const struct defused_umount_req *req,
-                         int parent_fd, const struct ucred *cred) {
+                         int parent_fd, int proc_fd, const struct ucred *cred) {
     uint32_t status = DEFUSED_OK;
     int sys_errno = 0;
     int ret = 0;
@@ -515,7 +526,7 @@ static int handle_umount(int sock, const struct defused_umount_req *req,
     }
 
     long parent_mnt_id = -1;
-    ret = fd_mnt_id(parent_fd, &parent_mnt_id);
+    ret = fd_mnt_id(proc_fd, parent_fd, &parent_mnt_id);
     if (ret < 0) {
         status = DEFUSED_ERR_MALFORMED;
         sys_errno = -ret;
@@ -527,7 +538,7 @@ static int handle_umount(int sock, const struct defused_umount_req *req,
      * fdinfo's mnt_id comes straight from the VFS and therefore works even
      * if the FUSE server is not responding */
     long mnt_id = -1;
-    ret = fd_mnt_id(mnt_fd, &mnt_id);
+    ret = fd_mnt_id(proc_fd, mnt_fd, &mnt_id);
     if (ret < 0) {
         status = DEFUSED_ERR_MALFORMED;
         sys_errno = -ret;
@@ -539,10 +550,17 @@ static int handle_umount(int sock, const struct defused_umount_req *req,
         goto out;
     }
 
+    ret = join_peer_mnt_ns(sock);
+    if (ret < 0) {
+        status = DEFUSED_ERR_SETNS_FAILED;
+        sys_errno = -ret;
+        goto out;
+    }
+
     /* The fd's mount must actually be FUSE, and be recorded as mounted
      * by this caller. Both facts come from the same mountinfo line. */
     uid_t owner;
-    ret = fuse_mount_owner(mnt_id, &owner);
+    ret = fuse_mount_owner(proc_fd, mnt_id, &owner);
     if (ret < 0) {
         status = DEFUSED_ERR_NOT_A_FUSE_MOUNT;
         goto out;
@@ -553,9 +571,16 @@ static int handle_umount(int sock, const struct defused_umount_req *req,
         goto out;
     }
 
-    /* Unmount via parent file descriptor + filename */
+    /* Unmount via procfs fd, parent file descriptor, and filename. */
+    if (fchdir(proc_fd) == -1) {
+        status = DEFUSED_ERR_UNMOUNT_FAILED;
+        sys_errno = errno;
+        ret = -errno;
+        goto out;
+    }
+
     char proc_path[32 + DEFUSED_MAX_FILENAME];
-    snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d/%s", parent_fd,
+    snprintf(proc_path, sizeof(proc_path), "self/fd/%d/%s", parent_fd,
              req->name);
     if (umount2(proc_path, (req->lazy ? MNT_DETACH : 0) | UMOUNT_NOFOLLOW) ==
         -1) {
@@ -670,7 +695,7 @@ static int socket_activation_fd(int *out_fd) {
     return 0;
 }
 
-/* Convert a FUSE mount's /proc/self/mountinfo line into
+/* Convert a FUSE mount's self/mountinfo line into
  * " - <fstype> <source> <superopts>".
  * Writes NULL into out_sep if the mount isn't FUSE.
  */
@@ -687,14 +712,22 @@ static int fuse_mount_entry(const char *line, const char **out_sep) {
     return 0;
 }
 
-/* Determine the mount ID given a mount file descriptor */
-static int fd_mnt_id(int fd, long *out_id) {
+/* Determine the mount ID given a mount file descriptor via trusted procfs */
+static int fd_mnt_id(int proc_fd, int fd, long *out_id) {
     char path[48];
-    snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", fd);
-    FILE *f = fopen(path, "r");
+    snprintf(path, sizeof(path), "self/fdinfo/%d", fd);
+    int info_fd = openat(proc_fd, path, O_RDONLY | O_CLOEXEC);
 
-    if (!f)
+    if (info_fd == -1)
         return -errno;
+
+    FILE *f = fdopen(info_fd, "r");
+    if (!f) {
+        int saved_errno = errno;
+        close(info_fd);
+        errno = saved_errno;
+        return -errno;
+    }
 
     char line[256];
     long id = -1;
@@ -710,11 +743,19 @@ static int fd_mnt_id(int fd, long *out_id) {
 
 /* Extract the `user_id=` option from a FUSE mount.
  * This determines who originally mounted it. */
-static int fuse_mount_owner(long mnt_id, uid_t *out_uid) {
-    FILE *f = fopen("/proc/self/mountinfo", "r");
+static int fuse_mount_owner(int proc_fd, long mnt_id, uid_t *out_uid) {
+    int mountinfo_fd = openat(proc_fd, "self/mountinfo", O_RDONLY | O_CLOEXEC);
 
-    if (!f)
+    if (mountinfo_fd == -1)
         return -errno;
+
+    FILE *f = fdopen(mountinfo_fd, "r");
+    if (!f) {
+        int saved_errno = errno;
+        close(mountinfo_fd);
+        errno = saved_errno;
+        return -errno;
+    }
 
     char line[1024];
     int ret = -ENOENT;
