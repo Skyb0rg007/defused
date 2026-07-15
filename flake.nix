@@ -22,6 +22,18 @@
         defused = self.nixosModules.default;
       };
 
+      checks = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        {
+          nixos = import ./nixos/tests/defused.nix {
+            inherit self pkgs system;
+          };
+        }
+      );
+
       packages = forAllSystems (
         system:
         let
@@ -46,6 +58,7 @@
           };
         }
       );
+
       devShells = forAllSystems (
         system:
         let
