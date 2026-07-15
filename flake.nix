@@ -27,10 +27,8 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
         in
-        {
-          nixos = import ./nixos/tests/defused.nix {
-            inherit self pkgs system;
-          };
+        import ./nixos/tests {
+          inherit self pkgs system;
         }
       );
 
