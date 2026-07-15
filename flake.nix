@@ -44,7 +44,10 @@
           defused = pkgs.stdenv.mkDerivation {
             pname = "defused";
             version = "0.1.0";
-            src = ./.;
+            src = lib.fileset.toSource {
+              root = ./.;
+              fileset = lib.fileset.gitTracked ./.;
+            };
             nativeBuildInputs = [
               pkgs.meson
               pkgs.ninja
@@ -52,9 +55,6 @@
             buildInputs = [
               pkgs.libseccomp
             ];
-            shellHook = ''
-              export NIX_CFLAGS_COMPILE="-U_FORTIFY_SOURCE $NIX_CFLAGS_COMPILE"
-            '';
           };
         }
       );
@@ -76,6 +76,9 @@
               pkgs.reuse
               pkgs.fuse
             ];
+            shellHook = ''
+              export NIX_CFLAGS_COMPILE="-U_FORTIFY_SOURCE $NIX_CFLAGS_COMPILE"
+            '';
           };
         }
       );
