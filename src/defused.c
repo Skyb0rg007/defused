@@ -117,9 +117,11 @@ static int prepare_mount(const struct defused_mount_req *req, int dev_fd,
                          const struct stat *st, const struct ucred *cred,
                          struct prepared_mount *out)
     __attribute__((__nonnull__(1, 3, 4, 5), __warn_unused_result__));
-static int run_sandboxed_mount(int pidfd, const struct prepared_mount *mnt,
-                               int mnt_fd, uint32_t *status, int *sys_errno)
-    __attribute__((__nonnull__(2, 4, 5), __warn_unused_result__));
+static int create_detached_mount(const struct prepared_mount *mnt)
+    __attribute__((__nonnull__(1), __warn_unused_result__));
+static int run_sandboxed_mount(int pidfd, int mountfd, int mnt_fd,
+                               uint32_t *status, int *sys_errno)
+    __attribute__((__nonnull__(4, 5), __warn_unused_result__));
 static int run_sandboxed_unmount(int pidfd, int proc_fd, int parent_fd,
                                  const struct defused_umount_req *req,
                                  long mnt_id, uid_t uid, uint32_t *status,
@@ -423,9 +425,6 @@ static int install_seccomp(enum defused_op op) {
     };
     static const int mount_syscalls[] = {
         SCMP_SYS(move_mount),
-        SCMP_SYS(fsopen),
-        SCMP_SYS(fsconfig),
-        SCMP_SYS(fsmount),
     };
     static const int unmount_syscalls[] = {
         SCMP_SYS(fchdir),
@@ -476,14 +475,14 @@ out:
 
 static int neg_errno(void) { return -errno; }
 
-static int sandbox_fsconfig_string(int fsfd, const char *key,
+static int mount_fsconfig_string(int fsfd, const char *key,
                                    const char *value) {
     if (fsconfig(fsfd, FSCONFIG_SET_STRING, key, value, 0) == -1)
         return neg_errno();
     return 0;
 }
 
-static int sandbox_fsconfig_flag(int fsfd, const char *key) {
+static int mount_fsconfig_flag(int fsfd, const char *key) {
     if (fsconfig(fsfd, FSCONFIG_SET_FLAG, key, NULL, 0) == -1)
         return neg_errno();
     return 0;
@@ -759,8 +758,7 @@ static int prepare_mount(const struct defused_mount_req *req, int dev_fd,
     return 0;
 }
 
-static int sandbox_mount_fuse_new_api(const struct prepared_mount *mnt,
-                                  int mnt_fd) {
+static int create_detached_mount(const struct prepared_mount *mnt) {
     int fsfd = fsopen(mnt->type, FSOPEN_CLOEXEC);
     if (fsfd == -1)
         return neg_errno();
@@ -769,59 +767,59 @@ static int sandbox_mount_fuse_new_api(const struct prepared_mount *mnt,
     int ret = 0;
 
     if (mnt->have_subtype) {
-        ret = sandbox_fsconfig_string(fsfd, "subtype", mnt->type + 5);
+        ret = mount_fsconfig_string(fsfd, "subtype", mnt->type + 5);
         if (ret < 0)
             goto out;
     }
 
-    ret = sandbox_fsconfig_string(fsfd, "source", mnt->source);
+    ret = mount_fsconfig_string(fsfd, "source", mnt->source);
     if (ret < 0)
         goto out;
-    ret = sandbox_fsconfig_string(fsfd, "fd", mnt->fd);
+    ret = mount_fsconfig_string(fsfd, "fd", mnt->fd);
     if (ret < 0)
         goto out;
-    ret = sandbox_fsconfig_string(fsfd, "rootmode", mnt->rootmode);
+    ret = mount_fsconfig_string(fsfd, "rootmode", mnt->rootmode);
     if (ret < 0)
         goto out;
-    ret = sandbox_fsconfig_string(fsfd, "user_id", mnt->user_id);
+    ret = mount_fsconfig_string(fsfd, "user_id", mnt->user_id);
     if (ret < 0)
         goto out;
-    ret = sandbox_fsconfig_string(fsfd, "group_id", mnt->group_id);
+    ret = mount_fsconfig_string(fsfd, "group_id", mnt->group_id);
     if (ret < 0)
         goto out;
 
     if (mnt->flags & DEFUSED_FUSE_ALLOW_OTHER) {
-        ret = sandbox_fsconfig_flag(fsfd, "allow_other");
+        ret = mount_fsconfig_flag(fsfd, "allow_other");
         if (ret < 0)
             goto out;
     }
     if (mnt->flags & DEFUSED_FUSE_DEFAULT_PERMISSIONS) {
-        ret = sandbox_fsconfig_flag(fsfd, "default_permissions");
+        ret = mount_fsconfig_flag(fsfd, "default_permissions");
         if (ret < 0)
             goto out;
     }
     if (mnt->have_max_read) {
-        ret = sandbox_fsconfig_string(fsfd, "max_read", mnt->max_read);
+        ret = mount_fsconfig_string(fsfd, "max_read", mnt->max_read);
         if (ret < 0)
             goto out;
     }
     if (mnt->have_blksize) {
-        ret = sandbox_fsconfig_string(fsfd, "blksize", mnt->blksize);
+        ret = mount_fsconfig_string(fsfd, "blksize", mnt->blksize);
         if (ret < 0)
             goto out;
     }
     if (mnt->flags & DEFUSED_MOUNT_RDONLY) {
-        ret = sandbox_fsconfig_flag(fsfd, "ro");
+        ret = mount_fsconfig_flag(fsfd, "ro");
         if (ret < 0)
             goto out;
     }
     if (mnt->flags & DEFUSED_MOUNT_SYNCHRONOUS) {
-        ret = sandbox_fsconfig_flag(fsfd, "sync");
+        ret = mount_fsconfig_flag(fsfd, "sync");
         if (ret < 0)
             goto out;
     }
     if (mnt->flags & DEFUSED_MOUNT_DIRSYNC) {
-        ret = sandbox_fsconfig_flag(fsfd, "dirsync");
+        ret = mount_fsconfig_flag(fsfd, "dirsync");
         if (ret < 0)
             goto out;
     }
@@ -837,16 +835,8 @@ static int sandbox_mount_fuse_new_api(const struct prepared_mount *mnt,
         goto out;
     }
 
-    close(fsfd);
-    fsfd = -1;
-
-    if (move_mount(mountfd, "", mnt_fd, "",
-                   MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH) == -1) {
-        ret = neg_errno();
-        goto out;
-    }
-
-    ret = 0;
+    ret = mountfd;
+    mountfd = -1;
 
 out:
     if (mountfd >= 0)
@@ -1012,8 +1002,8 @@ static int wait_sandbox(pid_t pid) {
     }
 }
 
-static int run_sandboxed_mount(int pidfd, const struct prepared_mount *mnt,
-                               int mnt_fd, uint32_t *status, int *sys_errno) {
+static int run_sandboxed_mount(int pidfd, int mountfd, int mnt_fd,
+                               uint32_t *status, int *sys_errno) {
     int pipefd[2];
     if (pipe2(pipefd, O_CLOEXEC) == -1)
         return -errno;
@@ -1049,7 +1039,12 @@ static int run_sandboxed_mount(int pidfd, const struct prepared_mount *mnt,
             sandbox_finish(pipefd[1], result);
         }
 
-        ret = sandbox_mount_fuse_new_api(mnt, mnt_fd);
+        if (move_mount(mountfd, "", mnt_fd, "",
+                       MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH) ==
+            -1)
+            ret = neg_errno();
+        else
+            ret = 0;
         struct sandbox_result result = {
             .status = ret < 0 ? DEFUSED_ERR_MOUNT_FAILED : DEFUSED_OK,
             .sys_errno = ret < 0 ? -ret : 0,
@@ -1188,6 +1183,7 @@ static int handle_mount(sd_varlink *link, int sock,
     uint32_t status;
     int sys_errno = 0;
     int ret = 0;
+    int mountfd = -1;
 
     if (strnlen(req->fsname, DEFUSED_MAX_NAME) == DEFUSED_MAX_NAME ||
         strnlen(req->subtype, DEFUSED_MAX_NAME) == DEFUSED_MAX_NAME ||
@@ -1280,14 +1276,27 @@ static int handle_mount(sd_varlink *link, int sock,
         goto fail;
     }
 
-    ret = run_sandboxed_mount(pidfd, &prepared, mnt_fd, &status, &sys_errno);
+    mountfd = create_detached_mount(&prepared);
+    if (mountfd < 0) {
+        status = DEFUSED_ERR_MOUNT_FAILED;
+        sys_errno = -mountfd;
+        ret = mountfd;
+        close(pidfd);
+        goto fail;
+    }
+
+    ret = run_sandboxed_mount(pidfd, mountfd, mnt_fd, &status, &sys_errno);
     close(pidfd);
+    close(mountfd);
+    mountfd = -1;
     if (ret < 0)
         goto fail;
 
     return reply_response(link, DEFUSED_OK, 0);
 
 fail:
+    if (mountfd >= 0)
+        close(mountfd);
     fprintf(stderr,
             "defused: mount request failed with %s (ret=%d, errno=%d: %s)\n",
             status_name(status), ret, sys_errno,
