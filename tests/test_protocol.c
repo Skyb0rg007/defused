@@ -3,7 +3,7 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * Exercises the defused.h wire protocol against a real `defused` process
+ * Exercises the defused.h Varlink protocol against a real `defused` process
  * without requiring root or CAP_SYS_ADMIN. The requests intentionally stop
  * before the real mount(2) call, since that's the one part of request
  * handling that needs privilege to succeed.
@@ -13,17 +13,20 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <systemd/sd-json.h>
+#include <systemd/sd-varlink.h>
 #include <unistd.h>
 
 static int spawn_defused(const char *defused_path, int *client_sock,
                          pid_t *out_pid) {
     int sv[2];
-    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) == -1) {
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == -1) {
         perror("socketpair");
         return -errno;
     }
@@ -54,47 +57,67 @@ static int spawn_defused(const char *defused_path, int *client_sock,
 
 static int send_mount_req(int sock, const struct defused_mount_req *req,
                           int dev_fd, int mnt_fd, struct defused_resp *resp) {
-    struct iovec iov = {.iov_base = (void *)req, .iov_len = sizeof(*req)};
-    union {
-        struct cmsghdr h;
-        char buf[CMSG_SPACE(2 * sizeof(int))];
-    } cbuf;
-    struct msghdr msg = {
-        .msg_iov = &iov,
-        .msg_iovlen = 1,
-        .msg_control = cbuf.buf,
-        .msg_controllen = sizeof(cbuf.buf),
+    sd_varlink *link = NULL;
+    sd_json_variant *reply = NULL;
+    const char *error_id = NULL;
+    int ret = sd_varlink_connect_fd(&link, sock);
+    if (ret < 0)
+        return ret;
+    sock = -1;
+
+    ret = sd_varlink_set_allow_fd_passing_input(link, true);
+    if (ret < 0)
+        goto out;
+    ret = sd_varlink_set_allow_fd_passing_output(link, true);
+    if (ret < 0)
+        goto out;
+    ret = sd_varlink_push_fd(link, dev_fd);
+    if (ret < 0)
+        goto out;
+    ret = sd_varlink_push_fd(link, mnt_fd);
+    if (ret < 0)
+        goto out;
+
+    ret = sd_varlink_callbo(
+        link, DEFUSED_VARLINK_METHOD_MOUNT, &reply, &error_id,
+        SD_JSON_BUILD_PAIR_UNSIGNED("fuseFileDescriptor", 0),
+        SD_JSON_BUILD_PAIR_UNSIGNED("mountpointFileDescriptor", 1),
+        SD_JSON_BUILD_PAIR_UNSIGNED("mountFlags", req->mount_flags),
+        SD_JSON_BUILD_PAIR_UNSIGNED("maxRead", req->max_read),
+        SD_JSON_BUILD_PAIR_UNSIGNED("blockSize", req->blksize),
+        SD_JSON_BUILD_PAIR_STRING("fsName", req->fsname),
+        SD_JSON_BUILD_PAIR_STRING("subtype", req->subtype));
+    if (ret < 0)
+        goto out;
+    if (error_id != NULL) {
+        fprintf(stderr, "FAIL: Varlink error %s\n", error_id);
+        ret = -EBADMSG;
+        goto out;
+    }
+
+    struct service_response {
+        uint32_t status;
+        int32_t sys_errno;
+    } parsed = {};
+    static const sd_json_dispatch_field dispatch_table[] = {
+        {"status", SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uint32,
+         offsetof(struct service_response, status), SD_JSON_MANDATORY},
+        {"sysErrno", SD_JSON_VARIANT_INTEGER, sd_json_dispatch_int32,
+         offsetof(struct service_response, sys_errno), SD_JSON_MANDATORY},
+        {},
     };
-    struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
-    c->cmsg_level = SOL_SOCKET;
-    c->cmsg_type = SCM_RIGHTS;
-    c->cmsg_len = CMSG_LEN(2 * sizeof(int));
-    int fds[] = {dev_fd, mnt_fd};
-    memcpy(CMSG_DATA(c), fds, sizeof(fds));
+    ret = sd_json_dispatch(reply, dispatch_table, 0, &parsed);
+    if (ret < 0)
+        goto out;
+    resp->status = parsed.status;
+    resp->sys_errno = parsed.sys_errno;
 
-    if (sendmsg(sock, &msg, 0) < 0) {
-        perror("sendmsg");
-        return -errno;
-    }
-
-    struct iovec riov = {.iov_base = resp, .iov_len = sizeof(*resp)};
-    struct msghdr rmsg = {.msg_iov = &riov, .msg_iovlen = 1};
-    ssize_t n = recvmsg(sock, &rmsg, 0);
-    if (n < 0) {
-        perror("recvmsg");
-        return -errno;
-    }
-    if (n != (ssize_t)sizeof(*resp)) {
-        fprintf(stderr, "FAIL: short response (%zd bytes)\n", n);
-        return -EBADMSG;
-    }
-    if (resp->hdr.magic != DEFUSED_PROTO_MAGIC ||
-        resp->hdr.version != DEFUSED_PROTO_VERSION) {
-        fprintf(stderr, "FAIL: bad response header (magic=%#x version=%u)\n",
-                resp->hdr.magic, resp->hdr.version);
-        return -EBADMSG;
-    }
-    return 0;
+out:
+    sd_json_variant_unref(reply);
+    sd_varlink_flush_close_unref(link);
+    if (sock >= 0)
+        close(sock);
+    return ret;
 }
 
 /* Runs one mount request against a fresh defused instance and reports the
@@ -188,9 +211,7 @@ static int test_polkit_gate(const char *defused_path) {
         return -errno;
     }
 
-    struct defused_mount_req req = {
-        .hdr = {DEFUSED_PROTO_MAGIC, DEFUSED_PROTO_VERSION, DEFUSED_OP_MOUNT},
-    };
+    struct defused_mount_req req = {};
     uint32_t status = DEFUSED_OK;
     int ret = run_mount_req(defused_path, &req, dir, "/dev/fuse", &status);
     rmdir(dir);
@@ -221,7 +242,6 @@ int main(int argc, char *argv[]) {
     }
 
     struct defused_mount_req bad_opt = {
-        .hdr = {DEFUSED_PROTO_MAGIC, DEFUSED_PROTO_VERSION, DEFUSED_OP_MOUNT},
         .mount_flags = 1u << 31, /* never in DEFUSED_MOUNT_FLAGS_MASK */
     };
     if (run_mount_req_expect(argv[1], &bad_opt, ".", DEFUSED_ERR_BAD_OPTION) !=
@@ -229,10 +249,7 @@ int main(int argc, char *argv[]) {
         return 1;
 
     if (getuid() != 0) {
-        struct defused_mount_req root_owned = {
-            .hdr = {DEFUSED_PROTO_MAGIC, DEFUSED_PROTO_VERSION,
-                    DEFUSED_OP_MOUNT},
-        };
+        struct defused_mount_req root_owned = {};
         if (run_mount_req_expect(argv[1], &root_owned, "/",
                                  DEFUSED_ERR_NOT_ALLOWED) != 0)
             return 1;

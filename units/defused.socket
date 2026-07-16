@@ -8,5 +8,5 @@ Documentation=https://github.com/Skyb0rg007/defused
 
 [Socket]
 Accept=yes
-ListenSequentialPacket=/run/defused/defused.sock
+ListenStream=/run/defused/defused.sock
 RuntimeDirectory=defused
