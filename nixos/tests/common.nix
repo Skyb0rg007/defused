@@ -221,6 +221,19 @@ let
         package = package;
       };
 
+      # These tests exercise defused's own mount plumbing, not polkit's
+      # interactive-auth UX (there's no session/agent in a headless VM to
+      # answer an AUTH_ADMIN_KEEP challenge), so grant the mount action
+      # unconditionally here. A real deployment would tighten or replace
+      # this rule -- see doc/protocol.md.
+      security.polkit.extraConfig = ''
+        polkit.addRule(function(action, subject) {
+          if (action.id == "website.soss.defused.mount") {
+            return polkit.Result.YES;
+          }
+        });
+      '';
+
       users.users.alice = {
         isNormalUser = true;
         createHome = true;

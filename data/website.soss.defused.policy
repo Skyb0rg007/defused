@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+SPDX-FileCopyrightText: 2026 Skye Soss <skye@soss.website>
+
+SPDX-License-Identifier: GPL-2.0-or-later
+-->
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>defused</vendor>
+  <vendor_url>https://github.com/Skyb0rg007/defused</vendor_url>
+
+  <action id="website.soss.defused.mount">
+    <description>Create a FUSE mount</description>
+    <message>Authentication is required to create a FUSE mount</message>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+</policyconfig>

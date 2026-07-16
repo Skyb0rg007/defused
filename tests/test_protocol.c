@@ -97,9 +97,12 @@ static int send_mount_req(int sock, const struct defused_mount_req *req,
     return 0;
 }
 
+/* Runs one mount request against a fresh defused instance and reports the
+ * response status via *out_status, without asserting what it should be --
+ * callers decide what counts as a pass. */
 static int run_mount_req(const char *defused_path,
                          const struct defused_mount_req *req, const char *path,
-                         uint32_t expect_status) {
+                         const char *dev_path, uint32_t *out_status) {
     int sock;
     pid_t pid;
     int ret = spawn_defused(defused_path, &sock, &pid);
@@ -112,10 +115,10 @@ static int run_mount_req(const char *defused_path,
         perror(path);
         return ret;
     }
-    int dev_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
+    int dev_fd = open(dev_path, O_RDWR | O_CLOEXEC);
     if (dev_fd < 0) {
         ret = -errno;
-        perror("/dev/null");
+        perror(dev_path);
         close(mnt_fd);
         return ret;
     }
@@ -137,14 +140,76 @@ static int run_mount_req(const char *defused_path,
                     WTERMSIG(wstatus));
         return ret;
     }
-    if (resp.status != expect_status) {
-        fprintf(stderr, "FAIL: expected status %u, got %u\n", expect_status,
-                resp.status);
-        return -EINVAL;
-    }
     if (!WIFEXITED(wstatus)) {
         fprintf(stderr, "FAIL: service did not exit normally\n");
         return -ECHILD;
+    }
+    *out_status = resp.status;
+    return 0;
+}
+
+static int run_mount_req_expect(const char *defused_path,
+                                const struct defused_mount_req *req,
+                                const char *path, uint32_t expect_status) {
+    uint32_t status;
+    int ret = run_mount_req(defused_path, req, path, "/dev/null", &status);
+    if (ret < 0)
+        return ret;
+    if (status != expect_status) {
+        fprintf(stderr, "FAIL: expected status %u, got %u\n", expect_status,
+                status);
+        return -EINVAL;
+    }
+    return 0;
+}
+
+/* The mountpoint ownership check happens before the polkit check, so it
+ * takes a real self-owned mountpoint (and a real /dev/fuse fd, since
+ * check_fuse_device_fd() validates the device major/minor) to reach
+ * check_polkit_authorized() at all. Skips gracefully if this sandbox has
+ * no /dev/fuse, rather than asserting anything about polkit's specific
+ * answer -- what matters here is that an unauthorized request never gets
+ * past this gate to the privileged mount syscalls, not what a particular
+ * polkit configuration decides. */
+static int test_polkit_gate(const char *defused_path) {
+    int probe = open("/dev/fuse", O_RDWR | O_CLOEXEC);
+    if (probe < 0) {
+        fprintf(stderr,
+                "SKIP: /dev/fuse not usable here (%s), skipping polkit gate "
+                "test\n",
+                strerror(errno));
+        return 0;
+    }
+    close(probe);
+
+    char dir[] = "/tmp/defused-polkit-test-XXXXXX";
+    if (mkdtemp(dir) == NULL) {
+        perror("mkdtemp");
+        return -errno;
+    }
+
+    struct defused_mount_req req = {
+        .hdr = {DEFUSED_PROTO_MAGIC, DEFUSED_PROTO_VERSION, DEFUSED_OP_MOUNT},
+    };
+    uint32_t status = DEFUSED_OK;
+    int ret = run_mount_req(defused_path, &req, dir, "/dev/fuse", &status);
+    rmdir(dir);
+    if (ret < 0)
+        return ret;
+
+    /* Without an interactive polkit agent, an AUTH_ADMIN_KEEP action can
+     * never succeed; either polkit is reachable and says no
+     * (DEFUSED_ERR_NOT_ALLOWED), or it isn't reachable at all in this
+     * sandbox and the check fails closed (DEFUSED_ERR_MOUNT_FAILED). Either
+     * is a pass -- DEFUSED_OK (or any earlier, deterministic error) would
+     * mean the gate was skipped or something regressed before it. */
+    if (status != DEFUSED_ERR_NOT_ALLOWED &&
+        status != DEFUSED_ERR_MOUNT_FAILED) {
+        fprintf(stderr,
+                "FAIL: expected the polkit gate to block the mount (got "
+                "status %u)\n",
+                status);
+        return -EINVAL;
     }
     return 0;
 }
@@ -159,7 +224,8 @@ int main(int argc, char *argv[]) {
         .hdr = {DEFUSED_PROTO_MAGIC, DEFUSED_PROTO_VERSION, DEFUSED_OP_MOUNT},
         .mount_flags = 1u << 31, /* never in DEFUSED_MOUNT_FLAGS_MASK */
     };
-    if (run_mount_req(argv[1], &bad_opt, ".", DEFUSED_ERR_BAD_OPTION) != 0)
+    if (run_mount_req_expect(argv[1], &bad_opt, ".", DEFUSED_ERR_BAD_OPTION) !=
+        0)
         return 1;
 
     if (getuid() != 0) {
@@ -167,8 +233,11 @@ int main(int argc, char *argv[]) {
             .hdr = {DEFUSED_PROTO_MAGIC, DEFUSED_PROTO_VERSION,
                     DEFUSED_OP_MOUNT},
         };
-        if (run_mount_req(argv[1], &root_owned, "/", DEFUSED_ERR_NOT_ALLOWED) !=
-            0)
+        if (run_mount_req_expect(argv[1], &root_owned, "/",
+                                 DEFUSED_ERR_NOT_ALLOWED) != 0)
+            return 1;
+
+        if (test_polkit_gate(argv[1]) != 0)
             return 1;
     }
 

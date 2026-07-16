@@ -79,6 +79,22 @@ extra-substituters = https://defused.cachix.org
 extra-trusted-public-keys = defused.cachix.org-1:/YD+2Bmle49JSliBhGRqTKpLYhvruoFyMPPU071YCAY=
 ```
 
+## Polkit authorization
+
+Owning the mountpoint answers "is this file the caller's to use", not
+"is this caller allowed to create FUSE mounts at all".
+For the latter, defused asks polkit (`website.soss.defused.mount`) before
+creating a mount, so that policy can be configured system-wide (see
+`data/website.soss.defused.policy`) or per-client with a
+`/etc/polkit-1/rules.d/*.rules` script, independently of who owns the
+mountpoint.
+The shipped default is `auth_admin_keep`, and defused fails closed if
+polkit can't be reached at all -- see `doc/protocol.md` for the full
+reasoning.
+Unmounting isn't gated by polkit, since the existing ownership check (only
+the mount's own creator may tear it down) is already a complete answer for
+that operation.
+
 ## Licensing
 
 This project copies a lot of helpers from libfuse, which are either

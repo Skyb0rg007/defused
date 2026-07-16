@@ -29,8 +29,13 @@
 #include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/vfs.h>
+#include <systemd/sd-bus.h>
 #include <systemd/sd-daemon.h>
 #include <unistd.h>
+
+/* polkit action id checked before creating a FUSE mount; see
+ * data/website.soss.defused.policy for its declared defaults. */
+#define DEFUSED_POLKIT_ACTION_MOUNT "website.soss.defused.mount"
 
 static int recv_request(int sock, union defused_req *req, ssize_t *out_len,
                         int fds[2], int *out_fd_count, struct ucred *cred)
@@ -44,6 +49,8 @@ static int install_seccomp(enum defused_op op)
     __attribute__((__warn_unused_result__));
 static int check_mount_policy(const struct defused_mount_req *req)
     __attribute__((__nonnull__(1), __warn_unused_result__));
+static int check_polkit_authorized(int sock, const struct ucred *cred)
+    __attribute__((__nonnull__(2), __warn_unused_result__));
 static int check_mountpoint_fstype(int mnt_fd)
     __attribute__((__warn_unused_result__));
 static int check_fuse_device_fd(int dev_fd)
@@ -381,6 +388,162 @@ static int check_mount_policy(const struct defused_mount_req *req) {
     return 0;
 }
 
+/* Asks polkit whether the connecting process is allowed to create a FUSE
+ * mount at all. This is independent of (and in addition to) the mountpoint
+ * ownership check: ownership says the caller has the right to act on *this
+ * particular file*, polkit says the caller is allowed to use defused at
+ * all, and lets an administrator's policy (or a custom polkit rules.d
+ * script) decide that per uid/gid, interactively, or based on details like
+ * the current mount count.
+ *
+ * The subject's pid is conveyed to polkit as a pidfd obtained from this
+ * connection's SO_PEERPIDFD, not a bare pid, for the same TOCTOU reason
+ * join_peer_mnt_ns() uses SO_PEERPIDFD instead of the pid from
+ * SO_PEERCRED: a pid alone can be recycled between the credential check and
+ * whenever polkit gets around to looking at it, and a pidfd names one
+ * specific process no matter what.
+ *
+ * Fails closed: if polkit cannot be reached at all (e.g. not installed or
+ * not running), the mount is refused rather than silently falling back to
+ * the ownership check alone. */
+static int check_polkit_authorized(int sock, const struct ucred *cred) {
+    int pidfd = -1;
+    socklen_t pidfd_len = sizeof(pidfd);
+    if (getsockopt(sock, SOL_SOCKET, SO_PEERPIDFD, &pidfd, &pidfd_len) == -1) {
+        fprintf(stderr, "defused: SO_PEERPIDFD failed: %s\n", strerror(errno));
+        return -errno;
+    }
+
+    sd_bus *bus = NULL;
+    sd_bus_message *call = NULL;
+    sd_bus_message *reply = NULL;
+    sd_bus_error error = SD_BUS_ERROR_NULL;
+    int ret;
+
+    ret = sd_bus_open_system(&bus);
+    if (ret < 0) {
+        fprintf(stderr, "defused: failed to connect to the system bus: %s\n",
+                strerror(-ret));
+        goto out;
+    }
+
+    ret = sd_bus_message_new_method_call(
+        bus, &call, "org.freedesktop.PolicyKit1",
+        "/org/freedesktop/PolicyKit1/Authority",
+        "org.freedesktop.PolicyKit1.Authority", "CheckAuthorization");
+    if (ret < 0)
+        goto out;
+
+    /* subject: (sa{sv}) = ("unix-process", {"uid": <i>, "pidfd": <h>}).
+     * Passing both "uid" and "pidfd" (rather than "pid"/"start-time") makes
+     * polkit resolve the subject from the pidfd directly -- see
+     * polkit_subject_new_for_gvariant_invocation() in polkit's
+     * src/polkit/polkitsubject.c. */
+    ret = sd_bus_message_open_container(call, 'r', "sa{sv}");
+    if (ret < 0)
+        goto out;
+    ret = sd_bus_message_append(call, "s", "unix-process");
+    if (ret < 0)
+        goto out;
+    ret = sd_bus_message_open_container(call, 'a', "{sv}");
+    if (ret < 0)
+        goto out;
+    ret = sd_bus_message_open_container(call, 'e', "sv");
+    if (ret < 0)
+        goto out;
+    ret = sd_bus_message_append(call, "s", "uid");
+    if (ret < 0)
+        goto out;
+    ret = sd_bus_message_append(call, "v", "i", (int32_t)cred->uid);
+    if (ret < 0)
+        goto out;
+    ret = sd_bus_message_close_container(call); /* e: uid */
+    if (ret < 0)
+        goto out;
+    ret = sd_bus_message_open_container(call, 'e', "sv");
+    if (ret < 0)
+        goto out;
+    ret = sd_bus_message_append(call, "s", "pidfd");
+    if (ret < 0)
+        goto out;
+    ret = sd_bus_message_append(call, "v", "h", pidfd);
+    if (ret < 0)
+        goto out;
+    ret = sd_bus_message_close_container(call); /* e: pidfd */
+    if (ret < 0)
+        goto out;
+    ret = sd_bus_message_close_container(call); /* a{sv} */
+    if (ret < 0)
+        goto out;
+    ret = sd_bus_message_close_container(call); /* (sa{sv}) */
+    if (ret < 0)
+        goto out;
+
+    /* action_id */
+    ret = sd_bus_message_append(call, "s", DEFUSED_POLKIT_ACTION_MOUNT);
+    if (ret < 0)
+        goto out;
+
+    /* details: a{ss}, empty for now */
+    ret = sd_bus_message_open_container(call, 'a', "{ss}");
+    if (ret < 0)
+        goto out;
+    ret = sd_bus_message_close_container(call);
+    if (ret < 0)
+        goto out;
+
+    /* flags: CHECK_AUTHORIZATION_FLAGS_ALLOW_USER_INTERACTION, so that an
+     * agent in the caller's session can answer an AUTH_ADMIN_KEEP-style
+     * challenge instead of it failing outright. */
+    ret = sd_bus_message_append(call, "u", (uint32_t)1);
+    if (ret < 0)
+        goto out;
+
+    /* cancellation_id: unused, we never call CancelCheckAuthorization */
+    ret = sd_bus_message_append(call, "s", "");
+    if (ret < 0)
+        goto out;
+
+    ret = sd_bus_call(bus, call, 0, &error, &reply);
+    if (ret < 0) {
+        fprintf(stderr, "defused: polkit CheckAuthorization failed: %s\n",
+                error.message ? error.message : strerror(-ret));
+        goto out;
+    }
+
+    int is_authorized = 0;
+    int is_challenge = 0;
+    ret = sd_bus_message_enter_container(reply, 'r', "bba{ss}");
+    if (ret < 0)
+        goto out;
+    ret = sd_bus_message_read(reply, "bb", &is_authorized, &is_challenge);
+    if (ret < 0)
+        goto out;
+    ret = sd_bus_message_skip(reply, "a{ss}");
+    if (ret < 0)
+        goto out;
+    ret = sd_bus_message_exit_container(reply);
+    if (ret < 0)
+        goto out;
+
+    if (!is_authorized) {
+        fprintf(stderr, "defused: polkit denied %s to uid %u (challenge=%d)\n",
+                DEFUSED_POLKIT_ACTION_MOUNT, (unsigned)cred->uid, is_challenge);
+        ret = -EACCES;
+        goto out;
+    }
+    ret = 0;
+
+out:
+    sd_bus_error_free(&error);
+    sd_bus_message_unref(call);
+    sd_bus_message_unref(reply);
+    sd_bus_flush_close_unref(bus);
+    if (pidfd >= 0)
+        close(pidfd);
+    return ret;
+}
+
 static int check_mountpoint_fstype(int mnt_fd) {
     struct statfs fs;
     if (fstatfs(mnt_fd, &fs) == -1)
@@ -617,6 +780,14 @@ static int handle_mount(int sock, const struct defused_mount_req *req,
             ret = -EUSERS;
             goto fail;
         }
+    }
+
+    ret = check_polkit_authorized(sock, cred);
+    if (ret < 0) {
+        status =
+            ret == -EACCES ? DEFUSED_ERR_NOT_ALLOWED : DEFUSED_ERR_MOUNT_FAILED;
+        sys_errno = -ret;
+        goto fail;
     }
 
     ret = join_peer_mnt_ns(sock, DEFUSED_OP_MOUNT);

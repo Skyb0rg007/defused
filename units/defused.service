@@ -5,6 +5,8 @@
 [Unit]
 Description=defused FUSE mount service
 Documentation=https://github.com/Skyb0rg007/defused
+Wants=polkit.service
+After=polkit.service
 
 [Service]
 ExecStart=/usr/lib/defused/defused

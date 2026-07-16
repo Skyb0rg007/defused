@@ -35,6 +35,11 @@ fusermount3_exe = executable(
   install : true,
 )
 
+install_data(
+  'data/website.soss.defused.policy',
+  install_dir : get_option('datadir') / 'polkit-1/actions',
+)
+
 ## Tests ##
 
 test_protocol_exe = executable(
