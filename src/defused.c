@@ -33,9 +33,27 @@
 #include <systemd/sd-daemon.h>
 #include <unistd.h>
 
-/* polkit action id checked before creating a FUSE mount; see
- * data/website.soss.defused.policy for its declared defaults. */
+/* polkit action ids checked before creating/tearing down a FUSE mount; see
+ * data/website.soss.defused.policy for their declared defaults. */
 #define DEFUSED_POLKIT_ACTION_MOUNT "website.soss.defused.mount"
+#define DEFUSED_POLKIT_ACTION_UNMOUNT "website.soss.defused.unmount"
+
+/* Mount flags reported to polkit by name in the "privileged-flags" detail
+ * (see check_polkit_authorized()), so a rule can tell which capabilities a
+ * mount request actually needs instead of only "is any capability used at
+ * all". A rule should treat any name it doesn't specifically recognize as
+ * requiring AUTH_ADMIN_KEEP -- examples/50-defused-mount-policy.rules does
+ * this by checking requested names against its own allowlist and falling
+ * back otherwise, so a rule written before a new privileged option existed
+ * denies it by default instead of silently granting it. Add future
+ * privileged options (suid, cuse, blkdev, ...) here as they're
+ * implemented. */
+static const struct {
+    uint32_t flag;
+    const char *name;
+} privileged_mount_flags[] = {
+    {DEFUSED_FUSE_ALLOW_OTHER, "allow_other"},
+};
 
 static int recv_request(int sock, union defused_req *req, ssize_t *out_len,
                         int fds[2], int *out_fd_count, struct ucred *cred)
@@ -50,8 +68,12 @@ static int install_seccomp(enum defused_op op)
 static int check_mount_policy(const struct defused_mount_req *req)
     __attribute__((__nonnull__(1), __warn_unused_result__));
 static int check_polkit_authorized(int sock, const struct ucred *cred,
-                                   long current_mounts, bool allow_other)
-    __attribute__((__nonnull__(2), __warn_unused_result__));
+                                   const char *action_id, long current_mounts,
+                                   const char *privileged_flags)
+    __attribute__((__nonnull__(2, 3), __warn_unused_result__));
+static void format_privileged_flags(uint32_t mount_flags, char *buf,
+                                    size_t bufsz)
+    __attribute__((__nonnull__(2)));
 static int check_mountpoint_fstype(int mnt_fd)
     __attribute__((__warn_unused_result__));
 static int check_fuse_device_fd(int dev_fd)
@@ -383,14 +405,52 @@ static int check_mount_policy(const struct defused_mount_req *req) {
     return 0;
 }
 
-/* Asks polkit whether the connecting process is allowed to create this FUSE
- * mount. This is independent of (and in addition to) the mountpoint
- * ownership check: ownership says the caller has the right to act on *this
- * particular file*, polkit says the caller is allowed to use defused, with
- * these specific options, at all -- including whether allow_other is
- * permitted -- and lets an administrator's policy (or a custom polkit
- * rules.d script) decide that per uid/gid, interactively, or based on the
- * details passed below.
+/* Writes a comma-separated list of privileged_mount_flags[] names for the
+ * bits set in mount_flags into buf (empty string if none are set), for the
+ * "privileged-flags" polkit detail -- see privileged_mount_flags[]'s doc
+ * comment. buf is always NUL-terminated; names that wouldn't fit are
+ * silently dropped, which only matters if this table grows to carry far
+ * more (and far longer) names than it does today. */
+static void format_privileged_flags(uint32_t mount_flags, char *buf,
+                                    size_t bufsz) {
+    size_t len = 0;
+    buf[0] = '\0';
+
+    for (size_t i = 0;
+         i < sizeof(privileged_mount_flags) / sizeof(privileged_mount_flags[0]);
+         i++) {
+        if (!(mount_flags & privileged_mount_flags[i].flag))
+            continue;
+
+        const char *name = privileged_mount_flags[i].name;
+        size_t name_len = strlen(name);
+        size_t sep_len = len > 0 ? 1 : 0;
+        if (len + sep_len + name_len >= bufsz)
+            break;
+
+        if (sep_len)
+            buf[len++] = ',';
+        memcpy(buf + len, name, name_len);
+        len += name_len;
+        buf[len] = '\0';
+    }
+}
+
+/* Asks polkit whether the connecting process is allowed to perform
+ * action_id (one of the DEFUSED_POLKIT_ACTION_* ids). This is independent
+ * of (and in addition to) the ownership checks in handle_mount()/
+ * handle_umount(): ownership says the caller has the right to act on
+ * *this particular file or mount*, polkit says the caller is allowed to
+ * use defused for this operation, with these specific options, at all --
+ * and lets an administrator's policy (or a custom polkit rules.d script)
+ * decide that per uid/gid, interactively, or based on the details passed
+ * below.
+ *
+ * current_mounts and privileged_flags are mount-specific details (see
+ * below); pass current_mounts < 0 and/or privileged_flags NULL or "" to
+ * omit either, for actions/requests that have no use for them (unmount
+ * has no use for either; an ordinary mount request with no privileged
+ * options set has no use for privileged_flags).
  *
  * The subject's pid is conveyed to polkit as a pidfd obtained from this
  * connection's SO_PEERPIDFD, not a bare pid, for the same TOCTOU reason
@@ -400,10 +460,12 @@ static int check_mount_policy(const struct defused_mount_req *req) {
  * specific process no matter what.
  *
  * Fails closed: if polkit cannot be reached at all (e.g. not installed or
- * not running), the mount is refused rather than silently falling back to
- * the ownership check alone. */
+ * not running), the operation is refused rather than silently falling back
+ * to the ownership check alone. */
 static int check_polkit_authorized(int sock, const struct ucred *cred,
-                                   long current_mounts, bool allow_other) {
+                                   const char *action_id, long current_mounts,
+                                   const char *privileged_flags) {
+    bool have_privileged_flags = privileged_flags && privileged_flags[0];
     int pidfd = -1;
     socklen_t pidfd_len = sizeof(pidfd);
     if (getsockopt(sock, SOL_SOCKET, SO_PEERPIDFD, &pidfd, &pidfd_len) == -1) {
@@ -431,37 +493,49 @@ static int check_polkit_authorized(int sock, const struct ucred *cred,
     if (ret < 0)
         goto out;
 
-    /* sd_bus_message_append()'s type string grammar handles structs,
-     * arrays, dict entries, and variants recursively, so the whole method
-     * call -- subject, action_id, details, flags, cancellation_id -- is one
-     * composite append.
-     *
-     * subject: (sa{sv}) = ("unix-process", {"uid": <i>, "pidfd": <h>}).
+    /* subject: (sa{sv}) = ("unix-process", {"uid": <i>, "pidfd": <h>}).
      * Passing both "uid" and "pidfd" (rather than "pid"/"start-time") makes
      * polkit resolve the subject from the pidfd directly -- see
      * polkit_subject_new_for_gvariant_invocation() in polkit's
-     * src/polkit/polkitsubject.c.
-     *
-     * details: a{ss}. uid, gid, and pid are deliberately not included: a
+     * src/polkit/polkitsubject.c. */
+    ret = sd_bus_message_append(call, "(sa{sv})s", "unix-process", 2u, "uid",
+                                "i", (int32_t)cred->uid, "pidfd", "h", pidfd,
+                                action_id);
+    if (ret < 0)
+        goto out;
+
+    /* details: a{ss}. uid, gid, and pid are deliberately not included: a
      * rule already gets those from the subject polkit itself constructs
      * (subject.uid, subject.groups, subject.pid), no need to duplicate them
-     * here. current-mounts and allow-other let a rule implement a
-     * per-caller mount-count and allow_other policy -- see
-     * examples/50-defused-mount-policy.rules for a rule that uses both.
-     *
-     * flags: CHECK_AUTHORIZATION_FLAGS_ALLOW_USER_INTERACTION (1), so that
-     * an agent in the caller's session can answer an AUTH_ADMIN_KEEP-style
-     * challenge instead of it failing outright.
-     *
-     * cancellation_id: unused, we never call CancelCheckAuthorization. */
-    char mounts_buf[16];
-    snprintf(mounts_buf, sizeof(mounts_buf), "%ld", current_mounts);
+     * here. current-mounts and privileged-flags (mount only, see above) are
+     * the only things a rule can't get any other way, and are each omitted
+     * entirely when the caller has nothing to say -- see
+     * examples/50-defused-mount-policy.rules for a rule that uses both. */
+    ret = sd_bus_message_open_container(call, 'a', "{ss}");
+    if (ret < 0)
+        goto out;
+    char mounts_buf[32];
+    if (current_mounts >= 0) {
+        snprintf(mounts_buf, sizeof(mounts_buf), "%ld", current_mounts);
+        ret = sd_bus_message_append(call, "{ss}", "current-mounts", mounts_buf);
+        if (ret < 0)
+            goto out;
+    }
+    if (have_privileged_flags) {
+        ret = sd_bus_message_append(call, "{ss}", "privileged-flags",
+                                    privileged_flags);
+        if (ret < 0)
+            goto out;
+    }
+    ret = sd_bus_message_close_container(call);
+    if (ret < 0)
+        goto out;
 
-    ret = sd_bus_message_append(
-        call, "(sa{sv})sa{ss}us", "unix-process", 2u, "uid", "i",
-        (int32_t)cred->uid, "pidfd", "h", pidfd, DEFUSED_POLKIT_ACTION_MOUNT,
-        2u, "current-mounts", mounts_buf, "allow-other",
-        allow_other ? "true" : "false", (uint32_t)1, "");
+    /* flags: CHECK_AUTHORIZATION_FLAGS_ALLOW_USER_INTERACTION (1), so that
+     * an agent in the caller's session can answer an AUTH_ADMIN_KEEP-style
+     * challenge instead of it failing outright. cancellation_id: unused, we
+     * never call CancelCheckAuthorization. */
+    ret = sd_bus_message_append(call, "us", (uint32_t)1, "");
     if (ret < 0)
         goto out;
 
@@ -489,7 +563,7 @@ static int check_polkit_authorized(int sock, const struct ucred *cred,
 
     if (!is_authorized) {
         fprintf(stderr, "defused: polkit denied %s to uid %u (challenge=%d)\n",
-                DEFUSED_POLKIT_ACTION_MOUNT, (unsigned)cred->uid, is_challenge);
+                action_id, (unsigned)cred->uid, is_challenge);
         ret = -EACCES;
         goto out;
     }
@@ -737,9 +811,12 @@ static int handle_mount(int sock, const struct defused_mount_req *req,
         goto fail;
     }
 
-    ret = check_polkit_authorized(
-        sock, cred, current_mounts,
-        (req->mount_flags & DEFUSED_FUSE_ALLOW_OTHER) != 0);
+    char privileged_flags[128];
+    format_privileged_flags(req->mount_flags, privileged_flags,
+                            sizeof(privileged_flags));
+
+    ret = check_polkit_authorized(sock, cred, DEFUSED_POLKIT_ACTION_MOUNT,
+                                  current_mounts, privileged_flags);
     if (ret < 0) {
         status =
             ret == -EACCES ? DEFUSED_ERR_NOT_ALLOWED : DEFUSED_ERR_MOUNT_FAILED;
@@ -820,6 +897,20 @@ static int handle_umount(int sock, const struct defused_umount_req *req,
     if (mnt_id == parent_mnt_id) {
         status = DEFUSED_ERR_NOT_A_FUSE_MOUNT;
         ret = -EINVAL;
+        goto out;
+    }
+
+    /* Before join_peer_mnt_ns(): the seccomp filter it installs has no
+     * room for the syscalls talking to polkit over D-Bus needs. This asks
+     * only whether the caller may use unmount at all -- whether this
+     * specific mount is theirs to tear down is the ownership check below,
+     * which needs the caller's mount namespace and so can't move here. */
+    ret = check_polkit_authorized(sock, cred, DEFUSED_POLKIT_ACTION_UNMOUNT, -1,
+                                  NULL);
+    if (ret < 0) {
+        status = ret == -EACCES ? DEFUSED_ERR_NOT_ALLOWED
+                                : DEFUSED_ERR_UNMOUNT_FAILED;
+        sys_errno = -ret;
         goto out;
     }
 

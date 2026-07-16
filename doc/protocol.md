@@ -106,10 +106,11 @@ Policy applied before the mount is attempted:
   by another user, while defused requires caller ownership so the privileged
   service can authorize the received mountpoint fd directly.
 - The service asks polkit (`org.freedesktop.PolicyKit1.Authority
-  .CheckAuthorization`) whether the caller may create *this* mount --
-  including whether `ALLOW_OTHER` is permitted and whether the caller
-  already has too many mounts open; see "Why defused asks polkit" below.
-  A denial or challenge maps to `DEFUSED_ERR_NOT_ALLOWED`; being unable to
+  .CheckAuthorization`) whether the caller may create this mount at all
+  (`website.soss.defused.mount`), telling it which privileged options
+  (currently just `ALLOW_OTHER`) the request actually sets via the
+  `privileged-flags` detail -- see "Why defused asks polkit" below. A
+  denial or challenge maps to `DEFUSED_ERR_NOT_ALLOWED`; being unable to
   reach polkit at all (not installed, not running, D-Bus unreachable)
   fails closed as `DEFUSED_ERR_MOUNT_FAILED` rather than silently falling
   back to the ownership check alone.
@@ -143,10 +144,20 @@ The service opens `name` under the parent fd to identify the target via its
 matching `/proc/self/mountinfo` line, then closes the target fd before doing
 anything further.
 The target must be a mountpoint under the parent, not just a regular directory
-inside the same mount, so the target and parent mount IDs must differ.
-The target lookup must also show the mount as a FUSE mount
-(`DEFUSED_ERR_NOT_A_FUSE_MOUNT` otherwise), and its `user_id=` superblock
-option must match the caller's uid (`DEFUSED_ERR_NOT_ALLOWED` otherwise).
+inside the same mount, so the target and parent mount IDs must differ
+(`DEFUSED_ERR_NOT_A_FUSE_MOUNT` otherwise).
+
+The service then asks polkit whether the caller may use
+`website.soss.defused.unmount` at all -- see "Why defused asks polkit"
+below; a denial maps to `DEFUSED_ERR_NOT_ALLOWED`, being unable to reach
+polkit at all fails closed as `DEFUSED_ERR_UNMOUNT_FAILED`. After joining
+the caller's mount namespace, the target lookup must also show the mount
+as a FUSE mount (`DEFUSED_ERR_NOT_A_FUSE_MOUNT` otherwise), and its
+`user_id=` superblock option must match the caller's uid
+(`DEFUSED_ERR_NOT_ALLOWED` otherwise) -- this ownership check is what
+actually decides whether *this specific mount* is the caller's to tear
+down; the polkit check only answers whether the caller may use unmount at
+all.
 
 The actual `umount2()` call is made by path, as
 `/proc/self/fd/<parent fd>/<name>`, with `UMOUNT_NOFOLLOW`.
@@ -172,7 +183,7 @@ struct defused_resp {
 | 3 | `DEFUSED_ERR_NOT_ALLOWED` | The mountpoint/mount isn't the caller's to use, or polkit denied the mount (including a mount count or `ALLOW_OTHER` a rule decided against) |
 | 4 | `DEFUSED_ERR_NOT_A_FUSE_MOUNT` | Unmount target isn't a FUSE mount |
 | 5 | `DEFUSED_ERR_MOUNT_FAILED` | Mount setup or attachment failed, or polkit couldn't be reached; see `sys_errno` |
-| 6 | `DEFUSED_ERR_UNMOUNT_FAILED` | `umount2(2)` failed; see `sys_errno` |
+| 6 | `DEFUSED_ERR_UNMOUNT_FAILED` | `umount2(2)` failed, or polkit couldn't be reached; see `sys_errno` |
 | 7 | `DEFUSED_ERR_SETNS_FAILED` | Couldn't join the caller's mount namespace; see `sys_errno` |
 
 A client should treat any response it cannot parse (wrong size, bad magic,
@@ -244,22 +255,23 @@ A rule already has the caller's uid, pid, and group membership from the
 subject polkit itself constructs -- `subject.uid`, `subject.pid`,
 `subject.groups` (and `subject.user` for the resolved username) -- so
 `details` only needs to carry what a rule genuinely can't get any other
-way:
+way. For the mount action that's:
 
 | Key | Value |
 |---|---|
 | `current-mounts` | The caller's live FUSE mount count, decimal. A rule wanting a mount-count limit implements it entirely from this. |
-| `allow-other` | `"true"` if the request sets `DEFUSED_FUSE_ALLOW_OTHER` (`-o allow_other`), `"false"` otherwise. Whether a given caller may request it is entirely a polkit policy decision. |
+| `privileged-flags` | Comma-separated names of the privileged mount options (see `privileged_mount_flags[]` in `defused.c`; currently just `allow_other`) the request actually sets. Omitted entirely when the request sets none. |
 
 Both values are strings (`a{ss}`, as the `CheckAuthorization` signature
 requires), so a rule comparing `current-mounts` numerically needs to
-`parseInt()` it first, and one comparing `allow-other` needs a string
-comparison against `"true"`.
+`parseInt()` it first, and one inspecting `privileged-flags` needs to
+`.split(",")` it.
 `examples/50-defused-mount-policy.rules` is a complete, installable rule
-using both: it grants ordinary mounts (fewer than 100 open, no
-`allow_other`) without prompting, and falls back to the shipped
-`AUTH_ADMIN_KEEP` default -- interactive administrator authentication --
-for anything past that limit or requesting `allow_other`.
+using both: it grants ordinary mounts (fewer than 100 open, requesting no
+privileged option the rule doesn't explicitly allowlist) without
+prompting, and falls back to the shipped `AUTH_ADMIN_KEEP` default --
+interactive administrator authentication -- for anything past that limit
+or outside the allowlist.
 
 polkit only lets a *trusted* caller of `CheckAuthorization` pass a
 non-empty `details` dict at all -- uid 0, or the uid named by the action's
@@ -270,9 +282,11 @@ non-empty `details` dict at all -- uid 0, or the uid named by the action's
 answer. This is a non-issue for defused's actual deployment (it runs as
 root, like any service that also needs `CAP_SYS_ADMIN` to mount FUSE
 filesystems must), but it does mean a `defused` binary run manually as a
-non-root user for testing will have every mount request fail closed at
-this step -- `tests/test_protocol.c`'s polkit test accounts for exactly
-that.
+non-root user for testing will have every request fail closed at this
+step -- `tests/test_protocol.c`'s polkit test accounts for exactly that,
+and so do `tests/test_mountns.c`'s two namespace-joining tests (see that
+file's own comment for why the polkit gate now makes them unable to
+distinguish their two scenarios when run unprivileged).
 
 The subject sent to polkit is a `unix-process` identified by a `pidfd`
 (obtained from this connection's `SO_PEERPIDFD`) plus `uid`, not the older
@@ -287,27 +301,51 @@ this way as of the `polkit_unix_process_new_pidfd()` code path in
 Unlike the mount namespace join, this check is *not* something defused can
 opt out of by construction if polkit is missing: if
 `org.freedesktop.PolicyKit1` has no owner on the system bus at all, or the
-`CheckAuthorization` call otherwise fails, the mount is refused
-(`DEFUSED_ERR_MOUNT_FAILED`) rather than treated as "polkit isn't
-configured, so allow it". A fail-open policy would mean a temporarily
-unreachable or crashed `polkitd` silently reduces the mount policy to
-"ownership only" with no way to notice from the client side. The tradeoff
-is that any system running defused needs polkit installed, running, and
-carrying a policy that actually grants `website.soss.defused.mount` to
-someone -- the shipped `.policy` file's `AUTH_ADMIN_KEEP` default is
-deliberately conservative, and most deployments will want to loosen it
-with their own rule, e.g. `examples/50-defused-mount-policy.rules` (the
-NixOS test suite exercises both: `nixos/tests/common.nix`'s shared node
-grants the action outright so the rest of the suite can do real mounts,
-and `nixos/tests/polkit.nix` specifically checks the shipped default and
+`CheckAuthorization` call otherwise fails, the operation is refused
+(`DEFUSED_ERR_MOUNT_FAILED`/`DEFUSED_ERR_UNMOUNT_FAILED`) rather than
+treated as "polkit isn't configured, so allow it". A fail-open policy
+would mean a temporarily unreachable or crashed `polkitd` silently reduces
+the mount policy to "ownership only" with no way to notice from the
+client side. The tradeoff is that any system running defused needs polkit
+installed and running -- the shipped defaults (below) are chosen so a
+system with no custom rule at all still behaves reasonably out of the
+box, but a deployment that wants ordinary mounts to not require
+interactive authentication needs a rule like
+`examples/50-defused-mount-policy.rules` (the NixOS test suite exercises
+both: `nixos/tests/common.nix`'s shared node grants every defused action
+outright so the rest of the suite can do real mounts, and
+`nixos/tests/polkit.nix` specifically checks the shipped defaults and
 that example rule).
 
-Only `DEFUSED_OP_MOUNT` asks polkit. `DEFUSED_OP_UNMOUNT` doesn't need a
-second gate the same way: the ownership check there (the mount's
-`user_id=` must match the caller) is already the complete answer to "is
-this caller allowed to tear down this specific mount", since nobody but
-its owner should be able to unmount it regardless of any broader
-"is this caller allowed to use defused" policy.
+### Why `privileged-flags` is a name list
+
+`ALLOW_OTHER` lets *other* users access the mount, which is a materially
+different risk than an ordinary self-only mount -- and more capabilities
+in the same category are planned (e.g. `suid`, `cuse`, `blkdev`), so
+`privileged-flags` carries every privileged capability name a request
+sets, not just a single fixed boolean. That lets a rule allowlist
+capabilities by name and fail closed (`AUTH_ADMIN_KEEP`) on any name it
+doesn't recognize -- exactly what
+`examples/50-defused-mount-policy.rules` does. A rule that ignores
+`privileged-flags` entirely -- like `nixos/tests/common.nix`'s shared
+node, deliberately, since it exists to test mount plumbing rather than
+policy -- does not get this property; the safety here lives in the rule,
+not the protocol.
+
+### Why unmount's default policy differs from mount's
+
+Both mount and every privileged mount capability default to
+`AUTH_ADMIN_KEEP`, but `website.soss.defused.unmount`'s shipped default is
+plain `yes`. The ownership check that follows it (the mount's `user_id=`
+must match the caller) is already the complete answer to "is this caller
+allowed to tear down this specific mount", since nobody but its owner
+should be able to unmount it. The polkit gate only answers the coarser
+"is this caller allowed to use unmount at all" question, so making
+everyone wait on interactive authentication for it by default would add
+friction without a correspondingly clearer security win -- but a
+deployment that *does* want that friction, or wants to throttle/log
+unmounts, can still tighten `website.soss.defused.unmount`'s policy with
+its own rule, exactly like mount.
 
 ### Versioning
 

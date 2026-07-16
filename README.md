@@ -83,24 +83,31 @@ extra-trusted-public-keys = defused.cachix.org-1:/YD+2Bmle49JSliBhGRqTKpLYhvruoF
 
 Owning the mountpoint answers "is this file the caller's to use", not
 "is this caller allowed to create FUSE mounts at all".
-For the latter, defused asks polkit (`website.soss.defused.mount`) before
-creating a mount, so that policy can be configured system-wide (see
+For the latter, defused asks polkit (`website.soss.defused.mount` to
+create a mount, `website.soss.defused.unmount` to remove one) so that
+policy can be configured system-wide (see
 `data/website.soss.defused.policy`) or per-client with a
 `/etc/polkit-1/rules.d/*.rules` script, independently of who owns the
 mountpoint.
-The shipped default is `auth_admin_keep`, and defused fails closed if
-polkit can't be reached at all -- see `doc/protocol.md` for the full
-reasoning.
-Unmounting isn't gated by polkit, since the existing ownership check (only
-the mount's own creator may tear it down) is already a complete answer for
-that operation.
+Mount's shipped default is `auth_admin_keep`; unmount's is plain `yes`,
+since the ownership check that follows it (only the mount's own creator
+may tear it down) is already a complete answer for that specific
+operation.
+defused fails closed if polkit can't be reached at all -- see
+`doc/protocol.md` for the full reasoning.
 
 defused has no config file or options beyond `--help`.
-The caller's current FUSE mount count and whether `-o allow_other` was
-requested are passed to polkit as details on every `CheckAuthorization`
-call, so that policy can be expressed per client in a rule.
-`examples/50-defused-mount-policy.rules` is a complete, installable
-example.
+The caller's current FUSE mount count, and the names of any privileged
+mount options the request sets (currently just `allow_other`, with more --
+`suid`, `cuse`, `blkdev`, ... -- planned), are passed to polkit as details
+on every mount `CheckAuthorization` call, so a rule can implement a
+mount-count policy and decide per client which privileged options it's
+willing to grant automatically.
+A rule should treat any privileged option name it doesn't specifically
+recognize as requiring `AUTH_ADMIN_KEEP`, so that one written before some
+future privileged option existed still denies it by default instead of
+silently granting it -- `examples/50-defused-mount-policy.rules` is a
+complete, installable rule that does this.
 
 ## Licensing
 
