@@ -3,13 +3,13 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * Exercises the defused.h Varlink protocol against a real `defused` process
- * without requiring root or CAP_SYS_ADMIN. The requests intentionally stop
- * before the real mount(2) call, since that's the one part of request
+ * Exercises the defused_proto.h Varlink protocol against a real `defused`
+ * process without requiring root or CAP_SYS_ADMIN. The requests intentionally
+ * stop before the real mount(2) call, since that's the one part of request
  * handling that needs privilege to succeed.
  */
 #define _GNU_SOURCE
-#include "defused.h"
+#include "defused_proto.h"
 
 #include <errno.h>
 #include <fcntl.h>

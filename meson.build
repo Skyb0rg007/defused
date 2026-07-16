@@ -20,6 +20,7 @@ common_c_args = ['-DHAVE_CLOSE_RANGE']
 defused_exe = executable(
   'defused',
   'src/defused.c',
+  'src/defused-sandbox.c',
   'src/defused-varlink.c',
   'src/util.c',
   c_args : common_c_args,
