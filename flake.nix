@@ -15,6 +15,10 @@
       inherit (nixpkgs) lib;
       systems = lib.platforms.linux;
       forAllSystems = lib.genAttrs systems;
+      src = lib.fileset.toSource {
+        root = ./.;
+        fileset = lib.fileset.gitTracked ./.;
+      };
     in
     {
       nixosModules = {
@@ -27,8 +31,15 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
         in
-        import ./nixos/tests {
+        (import ./nixos/tests {
           inherit self pkgs system;
+        })
+        // {
+          reuse-lint = pkgs.runCommand "defused-reuse-lint" { nativeBuildInputs = [ pkgs.reuse ]; } ''
+            cd ${src}
+            reuse lint
+            touch $out
+          '';
         }
       );
 
@@ -42,10 +53,7 @@
           defused = pkgs.stdenv.mkDerivation {
             pname = "defused";
             version = "0.1.0";
-            src = lib.fileset.toSource {
-              root = ./.;
-              fileset = lib.fileset.gitTracked ./.;
-            };
+            inherit src;
             nativeBuildInputs = [
               pkgs.meson
               pkgs.ninja
