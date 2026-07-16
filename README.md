@@ -69,6 +69,16 @@ will still perform it.
 I do not believe this is an issue, however, as sandboxed applications should
 deny access to `/dev/fuse` or `/run/defused/defused.sock`.
 
+## Nix binary cache
+
+I am using cachix as a binary cache:
+
+```
+# Add to nix.conf
+extra-substituters = https://defused.cachix.org
+extra-trusted-public-keys = defused.cachix.org-1:/YD+2Bmle49JSliBhGRqTKpLYhvruoFyMPPU071YCAY=
+```
+
 ## Licensing
 
 This project copies a lot of helpers from libfuse, which are either
