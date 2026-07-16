@@ -52,7 +52,7 @@
  * nixos/tests/mount-namespace.nix instead.
  */
 #define _GNU_SOURCE
-#include "defused.h"
+#include "defused_proto.h"
 
 #include <errno.h>
 #include <fcntl.h>

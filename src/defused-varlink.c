@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
-#include "defused.h"
+#include "defused_proto.h"
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic push
