@@ -49,7 +49,8 @@ static int install_seccomp(enum defused_op op)
     __attribute__((__warn_unused_result__));
 static int check_mount_policy(const struct defused_mount_req *req)
     __attribute__((__nonnull__(1), __warn_unused_result__));
-static int check_polkit_authorized(int sock, const struct ucred *cred)
+static int check_polkit_authorized(int sock, const struct ucred *cred,
+                                   long current_mounts, long mount_max)
     __attribute__((__nonnull__(2), __warn_unused_result__));
 static int check_mountpoint_fstype(int mnt_fd)
     __attribute__((__warn_unused_result__));
@@ -393,8 +394,10 @@ static int check_mount_policy(const struct defused_mount_req *req) {
  * ownership check: ownership says the caller has the right to act on *this
  * particular file*, polkit says the caller is allowed to use defused at
  * all, and lets an administrator's policy (or a custom polkit rules.d
- * script) decide that per uid/gid, interactively, or based on details like
- * the current mount count.
+ * script) decide that per uid/gid, interactively, or based on the details
+ * passed below -- including the caller's current FUSE mount count, so a
+ * rule can implement its own per-caller mount limit instead of (or in
+ * addition to) the blunt, service-wide --mount-max.
  *
  * The subject's pid is conveyed to polkit as a pidfd obtained from this
  * connection's SO_PEERPIDFD, not a bare pid, for the same TOCTOU reason
@@ -406,7 +409,8 @@ static int check_mount_policy(const struct defused_mount_req *req) {
  * Fails closed: if polkit cannot be reached at all (e.g. not installed or
  * not running), the mount is refused rather than silently falling back to
  * the ownership check alone. */
-static int check_polkit_authorized(int sock, const struct ucred *cred) {
+static int check_polkit_authorized(int sock, const struct ucred *cred,
+                                   long current_mounts, long mount_max) {
     int pidfd = -1;
     socklen_t pidfd_len = sizeof(pidfd);
     if (getsockopt(sock, SOL_SOCKET, SO_PEERPIDFD, &pidfd, &pidfd_len) == -1) {
@@ -434,73 +438,50 @@ static int check_polkit_authorized(int sock, const struct ucred *cred) {
     if (ret < 0)
         goto out;
 
-    /* subject: (sa{sv}) = ("unix-process", {"uid": <i>, "pidfd": <h>}).
+    /* sd_bus_message_append()'s type string grammar handles structs,
+     * arrays, dict entries, and variants recursively, so the whole method
+     * call -- subject, action_id, details, flags, cancellation_id -- is one
+     * composite append instead of a tree of open/close_container calls.
+     *
+     * subject: (sa{sv}) = ("unix-process", {"uid": <i>, "pidfd": <h>}).
      * Passing both "uid" and "pidfd" (rather than "pid"/"start-time") makes
      * polkit resolve the subject from the pidfd directly -- see
      * polkit_subject_new_for_gvariant_invocation() in polkit's
-     * src/polkit/polkitsubject.c. */
-    ret = sd_bus_message_open_container(call, 'r', "sa{sv}");
-    if (ret < 0)
-        goto out;
-    ret = sd_bus_message_append(call, "s", "unix-process");
-    if (ret < 0)
-        goto out;
-    ret = sd_bus_message_open_container(call, 'a', "{sv}");
-    if (ret < 0)
-        goto out;
-    ret = sd_bus_message_open_container(call, 'e', "sv");
-    if (ret < 0)
-        goto out;
-    ret = sd_bus_message_append(call, "s", "uid");
-    if (ret < 0)
-        goto out;
-    ret = sd_bus_message_append(call, "v", "i", (int32_t)cred->uid);
-    if (ret < 0)
-        goto out;
-    ret = sd_bus_message_close_container(call); /* e: uid */
-    if (ret < 0)
-        goto out;
-    ret = sd_bus_message_open_container(call, 'e', "sv");
-    if (ret < 0)
-        goto out;
-    ret = sd_bus_message_append(call, "s", "pidfd");
-    if (ret < 0)
-        goto out;
-    ret = sd_bus_message_append(call, "v", "h", pidfd);
-    if (ret < 0)
-        goto out;
-    ret = sd_bus_message_close_container(call); /* e: pidfd */
-    if (ret < 0)
-        goto out;
-    ret = sd_bus_message_close_container(call); /* a{sv} */
-    if (ret < 0)
-        goto out;
-    ret = sd_bus_message_close_container(call); /* (sa{sv}) */
-    if (ret < 0)
-        goto out;
+     * src/polkit/polkitsubject.c.
+     *
+     * details: a{ss}. uid, gid, and pid are deliberately not included: a
+     * rule already gets those from the subject polkit itself constructs
+     * (subject.uid, subject.groups, subject.pid), no need to duplicate them
+     * here. current-mounts/mount-max let a rule implement a per-caller
+     * mount limit that --mount-max alone can't (it's the same number for
+     * everyone). mount-max is omitted entirely when unset (-1) rather than
+     * sent as a sentinel string, so a rule can tell "no limit configured"
+     * apart from any real value with a plain action.lookup() truthiness
+     * check -- that's the only reason this needs two variants of the same
+     * call instead of one.
+     *
+     * flags: CHECK_AUTHORIZATION_FLAGS_ALLOW_USER_INTERACTION (1), so that
+     * an agent in the caller's session can answer an AUTH_ADMIN_KEEP-style
+     * challenge instead of it failing outright.
+     *
+     * cancellation_id: unused, we never call CancelCheckAuthorization. */
+    char mounts_buf[16], max_buf[16];
+    snprintf(mounts_buf, sizeof(mounts_buf), "%ld", current_mounts);
 
-    /* action_id */
-    ret = sd_bus_message_append(call, "s", DEFUSED_POLKIT_ACTION_MOUNT);
-    if (ret < 0)
-        goto out;
-
-    /* details: a{ss}, empty for now */
-    ret = sd_bus_message_open_container(call, 'a', "{ss}");
-    if (ret < 0)
-        goto out;
-    ret = sd_bus_message_close_container(call);
-    if (ret < 0)
-        goto out;
-
-    /* flags: CHECK_AUTHORIZATION_FLAGS_ALLOW_USER_INTERACTION, so that an
-     * agent in the caller's session can answer an AUTH_ADMIN_KEEP-style
-     * challenge instead of it failing outright. */
-    ret = sd_bus_message_append(call, "u", (uint32_t)1);
-    if (ret < 0)
-        goto out;
-
-    /* cancellation_id: unused, we never call CancelCheckAuthorization */
-    ret = sd_bus_message_append(call, "s", "");
+    if (mount_max != -1) {
+        snprintf(max_buf, sizeof(max_buf), "%ld", mount_max);
+        ret = sd_bus_message_append(call, "(sa{sv})sa{ss}us", "unix-process",
+                                    2u, "uid", "i", (int32_t)cred->uid, "pidfd",
+                                    "h", pidfd, DEFUSED_POLKIT_ACTION_MOUNT, 2u,
+                                    "current-mounts", mounts_buf, "mount-max",
+                                    max_buf, (uint32_t)1, "");
+    } else {
+        ret = sd_bus_message_append(
+            call, "(sa{sv})sa{ss}us", "unix-process", 2u, "uid", "i",
+            (int32_t)cred->uid, "pidfd", "h", pidfd,
+            DEFUSED_POLKIT_ACTION_MOUNT, 1u, "current-mounts", mounts_buf,
+            (uint32_t)1, "");
+    }
     if (ret < 0)
         goto out;
 
@@ -764,25 +745,25 @@ static int handle_mount(int sock, const struct defused_mount_req *req,
         goto fail;
     }
 
-    if (cfg_mount_max != -1) {
-        errno = 0;
-        int n = count_fuse_fs("defused");
-
-        if (n < 0) {
-            int saved_errno = errno ? errno : EIO;
-            status = DEFUSED_ERR_MOUNT_FAILED;
-            sys_errno = saved_errno;
-            ret = -saved_errno;
-            goto fail;
-        }
-        if (n >= cfg_mount_max) {
-            status = DEFUSED_ERR_TOO_MANY_MOUNTS;
-            ret = -EUSERS;
-            goto fail;
-        }
+    /* Counted unconditionally (not just when --mount-max is enabled) since
+     * it's also handed to polkit below, so a custom rule can implement its
+     * own per-caller mount limit even with --mount-max=-1. */
+    errno = 0;
+    int current_mounts = count_fuse_fs("defused");
+    if (current_mounts < 0) {
+        int saved_errno = errno ? errno : EIO;
+        status = DEFUSED_ERR_MOUNT_FAILED;
+        sys_errno = saved_errno;
+        ret = -saved_errno;
+        goto fail;
+    }
+    if (cfg_mount_max != -1 && current_mounts >= cfg_mount_max) {
+        status = DEFUSED_ERR_TOO_MANY_MOUNTS;
+        ret = -EUSERS;
+        goto fail;
     }
 
-    ret = check_polkit_authorized(sock, cred);
+    ret = check_polkit_authorized(sock, cred, current_mounts, cfg_mount_max);
     if (ret < 0) {
         status =
             ret == -EACCES ? DEFUSED_ERR_NOT_ALLOWED : DEFUSED_ERR_MOUNT_FAILED;

@@ -245,6 +245,47 @@ see `data/website.soss.defused.policy`), or with a custom
 `/etc/polkit-1/rules.d/*.rules` script that inspects the subject and the
 `CheckAuthorization` call's `details` dict.
 
+A rule already has the caller's uid, pid, and group membership from the
+subject polkit itself constructs -- `subject.uid`, `subject.pid`,
+`subject.groups` (and `subject.user` for the resolved username) -- so
+`details` only needs to carry what a rule genuinely can't get any other
+way:
+
+| Key | Value |
+|---|---|
+| `current-mounts` | The caller's live FUSE mount count (same value `--mount-max` compares against), decimal. |
+| `mount-max` | The configured `--mount-max` value, decimal. Omitted entirely when `--mount-max=-1` (no limit), so a rule can tell "no limit configured" apart from any real value with a plain `action.lookup()` truthiness check. |
+
+Both values are strings (`a{ss}`, as the `CheckAuthorization` signature
+requires), so a rule comparing `current-mounts` numerically needs to
+`parseInt()` it first. A rule using these to implement its own per-caller
+mount limit -- independent of, and finer-grained than, the single
+service-wide `--mount-max` -- looks like:
+
+```js
+polkit.addRule(function(action, subject) {
+  if (action.id != "website.soss.defused.mount")
+    return polkit.Result.NOT_HANDLED;
+  var limit = 5; /* per-uid limit, e.g. keyed off subject.user */
+  if (parseInt(action.lookup("current-mounts")) < limit)
+    return polkit.Result.YES;
+  return polkit.Result.NO;
+});
+```
+
+polkit only lets a *trusted* caller of `CheckAuthorization` pass a
+non-empty `details` dict at all -- uid 0, or the uid named by the action's
+`org.freedesktop.policykit.owner` annotation (see
+`may_identity_check_authorization()` in polkit's
+`polkitbackendinteractiveauthority.c`); anyone else gets
+`org.freedesktop.PolicyKit1.Error.NotAuthorized` back instead of an
+answer. This is a non-issue for defused's actual deployment (it runs as
+root, like any service that also needs `CAP_SYS_ADMIN` to mount FUSE
+filesystems must), but it does mean a `defused` binary run manually as a
+non-root user for testing will have every mount request fail closed at
+this step -- `tests/test_protocol.c`'s polkit test accounts for exactly
+that.
+
 The subject sent to polkit is a `unix-process` identified by a `pidfd`
 (obtained from this connection's `SO_PEERPIDFD`) plus `uid`, not the older
 `pid`+`start-time` pair. This mirrors why `join_peer_mnt_ns()` uses
