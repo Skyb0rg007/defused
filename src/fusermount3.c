@@ -493,18 +493,13 @@ static void print_service_error(uint32_t op, const char *mnt,
         break;
     case DEFUSED_ERR_NOT_ALLOWED:
         if (op == DEFUSED_OP_MOUNT)
-            fprintf(
-                stderr,
-                "%s: mount of %s not allowed by the defused service (options "
-                "like allow_other need user_allow_other)\n",
-                progname, mnt);
+            fprintf(stderr,
+                    "%s: mount of %s not allowed by the defused service\n",
+                    progname, mnt);
         else
             fprintf(stderr,
                     "%s: not allowed to unmount %s: not mounted by you\n",
                     progname, mnt);
-        break;
-    case DEFUSED_ERR_TOO_MANY_MOUNTS:
-        fprintf(stderr, "%s: too many FUSE filesystems mounted\n", progname);
         break;
     case DEFUSED_ERR_NOT_A_FUSE_MOUNT:
         fprintf(stderr, "%s: %s is not a FUSE mount\n", progname, mnt);

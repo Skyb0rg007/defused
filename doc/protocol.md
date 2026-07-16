@@ -95,8 +95,6 @@ The empty bitmask is the fusermount3-compatible unprivileged default:
 
 Policy applied before the mount is attempted:
 
-- `ALLOW_OTHER` requires the service to have been started with
-  `--user-allow-other`, else `DEFUSED_ERR_NOT_ALLOWED`.
 - The mountpoint must be a directory or regular file
   (`DEFUSED_ERR_MALFORMED` otherwise).
 - The mountpoint fd must name a caller-owned writable mountpoint
@@ -107,15 +105,14 @@ Policy applied before the mount is attempted:
   `fusermount3`: libfuse allows writable non-sticky shared directories owned
   by another user, while defused requires caller ownership so the privileged
   service can authorize the received mountpoint fd directly.
-- If `--mount-max` (default 1000, `-1` disables it) is already reached, the
-  mount is refused (`DEFUSED_ERR_TOO_MANY_MOUNTS`).
 - The service asks polkit (`org.freedesktop.PolicyKit1.Authority
-  .CheckAuthorization`) whether the caller may use `website.soss.defused
-  .mount` at all. A denial or challenge maps to `DEFUSED_ERR_NOT_ALLOWED`;
-  being unable to reach polkit at all (not installed, not running, D-Bus
-  unreachable) fails closed as `DEFUSED_ERR_MOUNT_FAILED` rather than
-  silently falling back to the ownership check alone. See "Why defused asks
-  polkit" below.
+  .CheckAuthorization`) whether the caller may create *this* mount --
+  including whether `ALLOW_OTHER` is permitted and whether the caller
+  already has too many mounts open; see "Why defused asks polkit" below.
+  A denial or challenge maps to `DEFUSED_ERR_NOT_ALLOWED`; being unable to
+  reach polkit at all (not installed, not running, D-Bus unreachable)
+  fails closed as `DEFUSED_ERR_MOUNT_FAILED` rather than silently falling
+  back to the ownership check alone.
 
 On success, the service creates the mount with the Linux new mount API
 (`fsopen()`/`fsconfig()`/`fsmount()`), attaches it to the received
@@ -172,12 +169,11 @@ struct defused_resp {
 | 0 | `DEFUSED_OK` | Success |
 | 1 | `DEFUSED_ERR_MALFORMED` | Bad magic/version/op/size, wrong fd count, or a request-level validation failure (e.g. a bad `name`) |
 | 2 | `DEFUSED_ERR_BAD_OPTION` | `mount_flags` outside its allowed mask |
-| 3 | `DEFUSED_ERR_NOT_ALLOWED` | A privileged option used without privilege, the mountpoint/mount isn't the caller's to use, or polkit denied the mount |
-| 4 | `DEFUSED_ERR_TOO_MANY_MOUNTS` | `--mount-max` reached |
-| 5 | `DEFUSED_ERR_NOT_A_FUSE_MOUNT` | Unmount target isn't a FUSE mount |
-| 6 | `DEFUSED_ERR_MOUNT_FAILED` | Mount setup or attachment failed, or polkit couldn't be reached; see `sys_errno` |
-| 7 | `DEFUSED_ERR_UNMOUNT_FAILED` | `umount2(2)` failed; see `sys_errno` |
-| 8 | `DEFUSED_ERR_SETNS_FAILED` | Couldn't join the caller's mount namespace; see `sys_errno` |
+| 3 | `DEFUSED_ERR_NOT_ALLOWED` | The mountpoint/mount isn't the caller's to use, or polkit denied the mount (including a mount count or `ALLOW_OTHER` a rule decided against) |
+| 4 | `DEFUSED_ERR_NOT_A_FUSE_MOUNT` | Unmount target isn't a FUSE mount |
+| 5 | `DEFUSED_ERR_MOUNT_FAILED` | Mount setup or attachment failed, or polkit couldn't be reached; see `sys_errno` |
+| 6 | `DEFUSED_ERR_UNMOUNT_FAILED` | `umount2(2)` failed; see `sys_errno` |
+| 7 | `DEFUSED_ERR_SETNS_FAILED` | Couldn't join the caller's mount namespace; see `sys_errno` |
 
 A client should treat any response it cannot parse (wrong size, bad magic,
 unexpected version) the same as a transport failure, not as a status code.
@@ -237,11 +233,10 @@ This is also what libfuse has done forever.
 ### Why defused asks polkit
 
 Mountpoint ownership answers "is this file the caller's to act on", not
-"is this caller allowed to use defused at all". Before polkit, those were
-the same question by construction -- ownership was the only gate. Asking
-polkit as a second, independent gate lets a system administrator decide the
-latter question separately: interactively by default (`AUTH_ADMIN_KEEP` --
-see `data/website.soss.defused.policy`), or with a custom
+"is this caller allowed to use defused at all". polkit is a second,
+independent gate for that latter question, letting a system administrator
+decide it separately: interactively by default (`AUTH_ADMIN_KEEP` -- see
+`data/website.soss.defused.policy`), or with a custom
 `/etc/polkit-1/rules.d/*.rules` script that inspects the subject and the
 `CheckAuthorization` call's `details` dict.
 
@@ -253,25 +248,18 @@ way:
 
 | Key | Value |
 |---|---|
-| `current-mounts` | The caller's live FUSE mount count (same value `--mount-max` compares against), decimal. |
-| `mount-max` | The configured `--mount-max` value, decimal. Omitted entirely when `--mount-max=-1` (no limit), so a rule can tell "no limit configured" apart from any real value with a plain `action.lookup()` truthiness check. |
+| `current-mounts` | The caller's live FUSE mount count, decimal. A rule wanting a mount-count limit implements it entirely from this. |
+| `allow-other` | `"true"` if the request sets `DEFUSED_FUSE_ALLOW_OTHER` (`-o allow_other`), `"false"` otherwise. Whether a given caller may request it is entirely a polkit policy decision. |
 
 Both values are strings (`a{ss}`, as the `CheckAuthorization` signature
 requires), so a rule comparing `current-mounts` numerically needs to
-`parseInt()` it first. A rule using these to implement its own per-caller
-mount limit -- independent of, and finer-grained than, the single
-service-wide `--mount-max` -- looks like:
-
-```js
-polkit.addRule(function(action, subject) {
-  if (action.id != "website.soss.defused.mount")
-    return polkit.Result.NOT_HANDLED;
-  var limit = 5; /* per-uid limit, e.g. keyed off subject.user */
-  if (parseInt(action.lookup("current-mounts")) < limit)
-    return polkit.Result.YES;
-  return polkit.Result.NO;
-});
-```
+`parseInt()` it first, and one comparing `allow-other` needs a string
+comparison against `"true"`.
+`examples/50-defused-mount-policy.rules` is a complete, installable rule
+using both: it grants ordinary mounts (fewer than 100 open, no
+`allow_other`) without prompting, and falls back to the shipped
+`AUTH_ADMIN_KEEP` default -- interactive administrator authentication --
+for anything past that limit or requesting `allow_other`.
 
 polkit only lets a *trusted* caller of `CheckAuthorization` pass a
 non-empty `details` dict at all -- uid 0, or the uid named by the action's
@@ -308,8 +296,11 @@ is that any system running defused needs polkit installed, running, and
 carrying a policy that actually grants `website.soss.defused.mount` to
 someone -- the shipped `.policy` file's `AUTH_ADMIN_KEEP` default is
 deliberately conservative, and most deployments will want to loosen it
-with their own rule (the NixOS test suite does exactly this in
-`nixos/tests/common.nix`, for example).
+with their own rule, e.g. `examples/50-defused-mount-policy.rules` (the
+NixOS test suite exercises both: `nixos/tests/common.nix`'s shared node
+grants the action outright so the rest of the suite can do real mounts,
+and `nixos/tests/polkit.nix` specifically checks the shipped default and
+that example rule).
 
 Only `DEFUSED_OP_MOUNT` asks polkit. `DEFUSED_OP_UNMOUNT` doesn't need a
 second gate the same way: the ownership check there (the mount's

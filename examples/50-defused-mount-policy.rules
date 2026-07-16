@@ -1,0 +1,32 @@
+// SPDX-FileCopyrightText: 2026 Skye Soss <skye@soss.website>
+//
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// Sample polkit rule for website.soss.defused.mount (see doc/protocol.md).
+//
+// The shipped default (data/website.soss.defused.policy) is
+// AUTH_ADMIN_KEEP for every request, which is safe but requires an
+// administrator to authenticate interactively for every single FUSE
+// mount. Install this file as e.g.
+// /etc/polkit-1/rules.d/50-defused-mount-policy.rules to instead grant
+// ordinary mounts automatically -- fewer than 100 concurrent FUSE mounts
+// for this caller, and no allow_other requested -- while still falling
+// back to the interactive AUTH_ADMIN_KEEP default for anything else
+// (more mounts than that, or allow_other, which lets *other* users access
+// the mount and so deserves more scrutiny).
+//
+// current-mounts and allow-other are details defused passes to every
+// CheckAuthorization call for this action; see doc/protocol.md for the
+// full list.
+polkit.addRule(function(action, subject) {
+    if (action.id != "website.soss.defused.mount")
+        return polkit.Result.NOT_HANDLED;
+
+    var currentMounts = parseInt(action.lookup("current-mounts"));
+    var allowOther = action.lookup("allow-other") == "true";
+
+    if (currentMounts < 100 && !allowOther)
+        return polkit.Result.YES;
+
+    return polkit.Result.AUTH_ADMIN_KEEP;
+});

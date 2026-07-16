@@ -95,6 +95,13 @@ Unmounting isn't gated by polkit, since the existing ownership check (only
 the mount's own creator may tear it down) is already a complete answer for
 that operation.
 
+defused has no config file or options beyond `--help`.
+The caller's current FUSE mount count and whether `-o allow_other` was
+requested are passed to polkit as details on every `CheckAuthorization`
+call, so that policy can be expressed per client in a rule.
+`examples/50-defused-mount-policy.rules` is a complete, installable
+example.
+
 ## Licensing
 
 This project copies a lot of helpers from libfuse, which are either

@@ -30,11 +30,13 @@ in
       extraArgs = lib.mkOption {
         type = lib.types.listOf lib.types.str;
         default = [ ];
-        example = [
-          "--user-allow-other"
-          "--mount-max=500"
-        ];
-        description = "Additional command-line arguments passed to defused.";
+        description = ''
+          Additional command-line arguments passed to defused. defused
+          currently takes no flags beyond --help -- mount policy is decided
+          per request by polkit, see security.polkit.extraConfig and
+          examples/50-defused-mount-policy.rules. Kept for forward
+          compatibility.
+        '';
       };
     };
 

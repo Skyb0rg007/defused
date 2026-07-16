@@ -38,26 +38,16 @@ pkgs.testers.nixosTest {
     # that challenge, so every mount must be refused.
     denied = plainNode;
 
-    # A custom rule that reads the current-mounts detail defused passes
-    # (see doc/protocol.md) to implement its own per-caller mount limit,
-    # independent of --mount-max. Proves those details actually reach a
-    # rule and are usable, not just that *some* rule can grant the action.
+    # Installs the actual shipped example rule (examples/
+    # 50-defused-mount-policy.rules) rather than an ad-hoc one, so this test
+    # also proves that specific file is correct, not just that *some* rule
+    # using current-mounts/allow-other can grant the action.
     allowed =
       { ... }:
       {
         imports = [ plainNode ];
-        security.polkit.extraConfig = ''
-          polkit.addRule(function(action, subject) {
-            if (action.id != "website.soss.defused.mount")
-              return polkit.Result.NOT_HANDLED;
-            if (subject.user != "alice")
-              return polkit.Result.NO;
-            var current = parseInt(action.lookup("current-mounts"));
-            if (current < 3)
-              return polkit.Result.YES;
-            return polkit.Result.NO;
-          });
-        '';
+        environment.etc."polkit-1/rules.d/50-defused-mount-policy.rules".source =
+          ../../examples/50-defused-mount-policy.rules;
       };
   };
 
@@ -86,12 +76,21 @@ pkgs.testers.nixosTest {
             "'not allowed by the defused service'"
         )
 
-    with subtest("a custom rule using the current-mounts detail grants the mount"):
+    with subtest("the sample rule grants an ordinary mount under the limit"):
         allowed.succeed("install -d -o alice -g users /home/alice/mnt")
         allowed.succeed(
             "timeout 45s runuser -u alice -- "
             "${pkgs.python3}/bin/python3 ${mountHelper} "
             "assert-mount /home/alice/mnt __empty__"
+        )
+
+    with subtest("the sample rule falls back to AUTH_ADMIN_KEEP for allow_other"):
+        allowed.succeed("install -d -o alice -g users /home/alice/mnt-other")
+        allowed.succeed(
+            "timeout 45s runuser -u alice -- "
+            "${pkgs.python3}/bin/python3 ${mountHelper} "
+            "expect-failure /home/alice/mnt-other allow_other "
+            "'not allowed by the defused service'"
         )
   '';
 }

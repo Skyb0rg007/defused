@@ -50,7 +50,7 @@ static int install_seccomp(enum defused_op op)
 static int check_mount_policy(const struct defused_mount_req *req)
     __attribute__((__nonnull__(1), __warn_unused_result__));
 static int check_polkit_authorized(int sock, const struct ucred *cred,
-                                   long current_mounts, long mount_max)
+                                   long current_mounts, bool allow_other)
     __attribute__((__nonnull__(2), __warn_unused_result__));
 static int check_mountpoint_fstype(int mnt_fd)
     __attribute__((__warn_unused_result__));
@@ -77,9 +77,6 @@ static int fd_mnt_id(int proc_fd, int fd, long *out_id)
     __attribute__((__nonnull__(3), __warn_unused_result__));
 static int fuse_mount_owner(int proc_fd, long mnt_id, uid_t *out_uid)
     __attribute__((__nonnull__(3), __warn_unused_result__));
-
-static long cfg_mount_max = 1000;
-static bool cfg_user_allow_other = false;
 
 int main(int argc, char *argv[]) {
     int exit_status = EXIT_FAILURE;
@@ -272,8 +269,6 @@ static const char *status_name(uint32_t status) {
         return "DEFUSED_ERR_BAD_OPTION";
     case DEFUSED_ERR_NOT_ALLOWED:
         return "DEFUSED_ERR_NOT_ALLOWED";
-    case DEFUSED_ERR_TOO_MANY_MOUNTS:
-        return "DEFUSED_ERR_TOO_MANY_MOUNTS";
     case DEFUSED_ERR_NOT_A_FUSE_MOUNT:
         return "DEFUSED_ERR_NOT_A_FUSE_MOUNT";
     case DEFUSED_ERR_MOUNT_FAILED:
@@ -378,26 +373,24 @@ out:
     return ret < 0 ? ret : 0;
 }
 
-/* Check the client's mount request against the configured policy */
+/* Check the client's mount request is well-formed. Policy questions like
+ * whether this caller may use allow_other are answered entirely by polkit
+ * (see check_polkit_authorized()); this only validates protocol shape. */
 static int check_mount_policy(const struct defused_mount_req *req) {
     if ((req->mount_flags & ~(uint32_t)DEFUSED_MOUNT_FLAGS_MASK) != 0)
         return -EINVAL;
 
-    if ((req->mount_flags & DEFUSED_FUSE_ALLOW_OTHER) && !cfg_user_allow_other)
-        return -EPERM;
-
     return 0;
 }
 
-/* Asks polkit whether the connecting process is allowed to create a FUSE
- * mount at all. This is independent of (and in addition to) the mountpoint
+/* Asks polkit whether the connecting process is allowed to create this FUSE
+ * mount. This is independent of (and in addition to) the mountpoint
  * ownership check: ownership says the caller has the right to act on *this
- * particular file*, polkit says the caller is allowed to use defused at
- * all, and lets an administrator's policy (or a custom polkit rules.d
- * script) decide that per uid/gid, interactively, or based on the details
- * passed below -- including the caller's current FUSE mount count, so a
- * rule can implement its own per-caller mount limit instead of (or in
- * addition to) the blunt, service-wide --mount-max.
+ * particular file*, polkit says the caller is allowed to use defused, with
+ * these specific options, at all -- including whether allow_other is
+ * permitted -- and lets an administrator's policy (or a custom polkit
+ * rules.d script) decide that per uid/gid, interactively, or based on the
+ * details passed below.
  *
  * The subject's pid is conveyed to polkit as a pidfd obtained from this
  * connection's SO_PEERPIDFD, not a bare pid, for the same TOCTOU reason
@@ -410,7 +403,7 @@ static int check_mount_policy(const struct defused_mount_req *req) {
  * not running), the mount is refused rather than silently falling back to
  * the ownership check alone. */
 static int check_polkit_authorized(int sock, const struct ucred *cred,
-                                   long current_mounts, long mount_max) {
+                                   long current_mounts, bool allow_other) {
     int pidfd = -1;
     socklen_t pidfd_len = sizeof(pidfd);
     if (getsockopt(sock, SOL_SOCKET, SO_PEERPIDFD, &pidfd, &pidfd_len) == -1) {
@@ -441,7 +434,7 @@ static int check_polkit_authorized(int sock, const struct ucred *cred,
     /* sd_bus_message_append()'s type string grammar handles structs,
      * arrays, dict entries, and variants recursively, so the whole method
      * call -- subject, action_id, details, flags, cancellation_id -- is one
-     * composite append instead of a tree of open/close_container calls.
+     * composite append.
      *
      * subject: (sa{sv}) = ("unix-process", {"uid": <i>, "pidfd": <h>}).
      * Passing both "uid" and "pidfd" (rather than "pid"/"start-time") makes
@@ -452,36 +445,23 @@ static int check_polkit_authorized(int sock, const struct ucred *cred,
      * details: a{ss}. uid, gid, and pid are deliberately not included: a
      * rule already gets those from the subject polkit itself constructs
      * (subject.uid, subject.groups, subject.pid), no need to duplicate them
-     * here. current-mounts/mount-max let a rule implement a per-caller
-     * mount limit that --mount-max alone can't (it's the same number for
-     * everyone). mount-max is omitted entirely when unset (-1) rather than
-     * sent as a sentinel string, so a rule can tell "no limit configured"
-     * apart from any real value with a plain action.lookup() truthiness
-     * check -- that's the only reason this needs two variants of the same
-     * call instead of one.
+     * here. current-mounts and allow-other let a rule implement a
+     * per-caller mount-count and allow_other policy -- see
+     * examples/50-defused-mount-policy.rules for a rule that uses both.
      *
      * flags: CHECK_AUTHORIZATION_FLAGS_ALLOW_USER_INTERACTION (1), so that
      * an agent in the caller's session can answer an AUTH_ADMIN_KEEP-style
      * challenge instead of it failing outright.
      *
      * cancellation_id: unused, we never call CancelCheckAuthorization. */
-    char mounts_buf[16], max_buf[16];
+    char mounts_buf[16];
     snprintf(mounts_buf, sizeof(mounts_buf), "%ld", current_mounts);
 
-    if (mount_max != -1) {
-        snprintf(max_buf, sizeof(max_buf), "%ld", mount_max);
-        ret = sd_bus_message_append(call, "(sa{sv})sa{ss}us", "unix-process",
-                                    2u, "uid", "i", (int32_t)cred->uid, "pidfd",
-                                    "h", pidfd, DEFUSED_POLKIT_ACTION_MOUNT, 2u,
-                                    "current-mounts", mounts_buf, "mount-max",
-                                    max_buf, (uint32_t)1, "");
-    } else {
-        ret = sd_bus_message_append(
-            call, "(sa{sv})sa{ss}us", "unix-process", 2u, "uid", "i",
-            (int32_t)cred->uid, "pidfd", "h", pidfd,
-            DEFUSED_POLKIT_ACTION_MOUNT, 1u, "current-mounts", mounts_buf,
-            (uint32_t)1, "");
-    }
+    ret = sd_bus_message_append(
+        call, "(sa{sv})sa{ss}us", "unix-process", 2u, "uid", "i",
+        (int32_t)cred->uid, "pidfd", "h", pidfd, DEFUSED_POLKIT_ACTION_MOUNT,
+        2u, "current-mounts", mounts_buf, "allow-other",
+        allow_other ? "true" : "false", (uint32_t)1, "");
     if (ret < 0)
         goto out;
 
@@ -745,9 +725,8 @@ static int handle_mount(int sock, const struct defused_mount_req *req,
         goto fail;
     }
 
-    /* Counted unconditionally (not just when --mount-max is enabled) since
-     * it's also handed to polkit below, so a custom rule can implement its
-     * own per-caller mount limit even with --mount-max=-1. */
+    /* Handed to polkit below so a rule can implement its own mount-count
+     * policy. */
     errno = 0;
     int current_mounts = count_fuse_fs("defused");
     if (current_mounts < 0) {
@@ -757,13 +736,10 @@ static int handle_mount(int sock, const struct defused_mount_req *req,
         ret = -saved_errno;
         goto fail;
     }
-    if (cfg_mount_max != -1 && current_mounts >= cfg_mount_max) {
-        status = DEFUSED_ERR_TOO_MANY_MOUNTS;
-        ret = -EUSERS;
-        goto fail;
-    }
 
-    ret = check_polkit_authorized(sock, cred, current_mounts, cfg_mount_max);
+    ret = check_polkit_authorized(
+        sock, cred, current_mounts,
+        (req->mount_flags & DEFUSED_FUSE_ALLOW_OTHER) != 0);
     if (ret < 0) {
         status =
             ret == -EACCES ? DEFUSED_ERR_NOT_ALLOWED : DEFUSED_ERR_MOUNT_FAILED;
@@ -903,29 +879,19 @@ out:
 }
 
 static void usage(const char *prog) {
-    fprintf(
-        stderr,
-        "usage: %s [--mount-max=N] [--user-allow-other]\n"
-        "\n"
-        "Handles one mount/unmount request on the socket-activation fd (see\n"
-        "defused.h); meant to be spawned by systemd socket activation, one\n"
-        "process per connection. There is no config file -- these two\n"
-        "options are the command-line equivalents of fuse.conf's mount_max\n"
-        "and user_allow_other.\n"
-        "\n"
-        "  --mount-max=N       cap on simultaneous FUSE mounts; -1 disables\n"
-        "                      the limit (default: 1000)\n"
-        "  --user-allow-other  let callers pass -o allow_other (default: "
-        "off)\n",
-        prog);
+    fprintf(stderr,
+            "usage: %s\n"
+            "\n"
+            "Handles one mount/unmount request on the socket-activation fd\n"
+            "(see defused.h); meant to be spawned by systemd socket\n"
+            "activation, one process per connection. There are no options --\n"
+            "policy decisions are made per request by polkit; see\n"
+            "doc/protocol.md.\n",
+            prog);
 }
 
 static int parse_args(int argc, char *argv[]) {
-    enum { OPT_MOUNT_MAX = 256, OPT_USER_ALLOW_OTHER };
-
     static const struct option opts[] = {
-        {"mount-max", required_argument, NULL, OPT_MOUNT_MAX},
-        {"user-allow-other", no_argument, NULL, OPT_USER_ALLOW_OTHER},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -935,20 +901,6 @@ static int parse_args(int argc, char *argv[]) {
         if (c == -1)
             break;
         switch (c) {
-        case OPT_MOUNT_MAX: {
-            long v;
-
-            if (libfuse_strtol(optarg, &v) < 0 || (v < 0 && v != -1)) {
-                fprintf(stderr, "%s: invalid --mount-max value: %s\n", argv[0],
-                        optarg);
-                return -EINVAL;
-            }
-            cfg_mount_max = v;
-            break;
-        }
-        case OPT_USER_ALLOW_OTHER:
-            cfg_user_allow_other = true;
-            break;
         case 'h':
             usage(argv[0]);
             exit(0);

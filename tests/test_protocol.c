@@ -41,7 +41,7 @@ static int spawn_defused(const char *defused_path, int *client_sock,
         snprintf(pidbuf, sizeof(pidbuf), "%d", (int)getpid());
         setenv("LISTEN_PID", pidbuf, 1);
         setenv("LISTEN_FDS", "1", 1);
-        execl(defused_path, "defused", "--mount-max=5", NULL);
+        execl(defused_path, "defused", NULL);
         perror("exec");
         _exit(127);
     }

@@ -24,7 +24,7 @@
  *    into it (no CAP_SYS_ADMIN there), and the test checks that this
  *    surfaces cleanly as DEFUSED_ERR_SETNS_FAILED/EPERM -- never as a
  *    silent fallback to operating on defused's own namespace instead,
- *    which would be a namespace-confusion bug (e.g. counting mount_max or
+ *    which would be a namespace-confusion bug (e.g. counting FUSE mounts or
  *    mounting against the wrong mount table while believing it's the
  *    client's).
  *
@@ -245,7 +245,7 @@ static int spawn_defused(const char *defused_path, int conn_fd,
         snprintf(pidbuf, sizeof(pidbuf), "%d", (int)getpid());
         setenv("LISTEN_PID", pidbuf, 1);
         setenv("LISTEN_FDS", "1", 1);
-        execl(defused_path, "defused", "--mount-max=5", NULL);
+        execl(defused_path, "defused", NULL);
         perror("exec defused");
         _exit(127);
     }
