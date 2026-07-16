@@ -19,6 +19,7 @@
 #include <getopt.h>
 #include <sched.h>
 #include <seccomp.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,9 +29,11 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <sys/vfs.h>
 #include <unistd.h>
 
+static int handle_connection(int sock) __attribute__((__warn_unused_result__));
 static int recv_request(int sock, union defused_req *req, ssize_t *out_len,
                         int fds[2], int *out_fd_count, struct ucred *cred)
     __attribute__((__nonnull__(2, 3, 5, 6), __warn_unused_result__));
@@ -62,6 +65,13 @@ static int parse_args(int argc, char *argv[])
     __attribute__((__nonnull__(2), __warn_unused_result__));
 static int socket_activation_fd(int *out_fd)
     __attribute__((__nonnull__(1), __warn_unused_result__));
+static int create_listening_socket(void) __attribute__((__warn_unused_result__));
+static int run_fork_daemon(void) __attribute__((__warn_unused_result__));
+static int bind_unix_socket(int fd, const struct sockaddr_un *sa,
+                            socklen_t sa_len, const char *path)
+    __attribute__((__nonnull__(2, 4), __warn_unused_result__));
+static int mkdir_parent(const char *path)
+    __attribute__((__nonnull__(1), __warn_unused_result__));
 static int fuse_mount_entry(const char *line, const char **out_sep)
     __attribute__((__nonnull__(1, 2), __warn_unused_result__));
 static int fd_mnt_id(int proc_fd, int fd, long *out_id)
@@ -71,19 +81,27 @@ static int fuse_mount_owner(int proc_fd, long mnt_id, uid_t *out_uid)
 
 static long cfg_mount_max = 1000;
 static bool cfg_user_allow_other = false;
+static bool cfg_daemon = false;
 
 int main(int argc, char *argv[]) {
-    int exit_status = EXIT_FAILURE;
-
     int ret = parse_args(argc, argv);
     if (ret < 0)
         return EXIT_FAILURE;
+
+    if (cfg_daemon)
+        return run_fork_daemon() == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 
     int sock = -1;
     ret = socket_activation_fd(&sock);
     if (ret < 0)
         return EXIT_FAILURE;
 
+    return handle_connection(sock);
+}
+
+static int handle_connection(int sock) {
+    int exit_status = EXIT_FAILURE;
+    int ret = 0;
     int client_fd_count = 0;
 
     /* Keep a handle to the service's procfs before entering the client's
@@ -149,8 +167,7 @@ out:
         close(client_fds[i]);
     if (proc_fd >= 0)
         close(proc_fd);
-    if (sock >= 0)
-        close(sock);
+    close(sock);
     return exit_status;
 }
 
@@ -752,14 +769,17 @@ out:
 static void usage(const char *prog) {
     fprintf(
         stderr,
-        "usage: %s [--mount-max=N] [--user-allow-other]\n"
+        "usage: %s [--daemon] [--mount-max=N] [--user-allow-other]\n"
         "\n"
-        "Handles one mount/unmount request on the socket-activation fd (see\n"
-        "defused.h); meant to be spawned by systemd socket activation, one\n"
-        "process per connection. There is no config file -- these two\n"
-        "options are the command-line equivalents of fuse.conf's mount_max\n"
-        "and user_allow_other.\n"
+        "By default, handles one mount/unmount request on the socket-activation\n"
+        "fd (see defused.h); meant to be spawned by systemd socket activation,\n"
+        "one process per connection. With --daemon, creates the defused socket\n"
+        "and forks a child to handle each accepted connection. There is no\n"
+        "config file -- the mount policy options are the command-line\n"
+        "equivalents of fuse.conf's mount_max and user_allow_other.\n"
         "\n"
+        "  --daemon            listen on DEFUSED_SOCKET or the default socket\n"
+        "                      path and fork a child for each connection\n"
         "  --mount-max=N       cap on simultaneous FUSE mounts; -1 disables\n"
         "                      the limit (default: 1000)\n"
         "  --user-allow-other  let callers pass -o allow_other (default: "
@@ -768,9 +788,10 @@ static void usage(const char *prog) {
 }
 
 static int parse_args(int argc, char *argv[]) {
-    enum { OPT_MOUNT_MAX = 256, OPT_USER_ALLOW_OTHER };
+    enum { OPT_DAEMON = 256, OPT_MOUNT_MAX, OPT_USER_ALLOW_OTHER };
 
     static const struct option opts[] = {
+        {"daemon", no_argument, NULL, OPT_DAEMON},
         {"mount-max", required_argument, NULL, OPT_MOUNT_MAX},
         {"user-allow-other", no_argument, NULL, OPT_USER_ALLOW_OTHER},
         {"help", no_argument, NULL, 'h'},
@@ -782,6 +803,9 @@ static int parse_args(int argc, char *argv[]) {
         if (c == -1)
             break;
         switch (c) {
+        case OPT_DAEMON:
+            cfg_daemon = true;
+            break;
         case OPT_MOUNT_MAX: {
             long v;
 
@@ -803,6 +827,167 @@ static int parse_args(int argc, char *argv[]) {
             usage(argv[0]);
             return -EINVAL;
         }
+    }
+    return 0;
+}
+
+static int run_fork_daemon(void) {
+    int listen_fd = create_listening_socket();
+    if (listen_fd < 0)
+        return listen_fd;
+
+    struct sigaction sa = {
+        .sa_handler = SIG_DFL,
+        .sa_flags = SA_NOCLDWAIT | SA_RESTART,
+    };
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGCHLD, &sa, NULL) == -1) {
+        int ret = -errno;
+        fprintf(stderr, "defused: sigaction(SIGCHLD): %s\n", strerror(errno));
+        close(listen_fd);
+        return ret;
+    }
+
+    for (;;) {
+        int conn = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
+        if (conn == -1) {
+            if (errno == EINTR)
+                continue;
+            int ret = -errno;
+            fprintf(stderr, "defused: accept4: %s\n", strerror(errno));
+            close(listen_fd);
+            return ret;
+        }
+
+        pid_t pid = fork();
+        if (pid == -1) {
+            int saved_errno = errno;
+            fprintf(stderr, "defused: fork: %s\n", strerror(saved_errno));
+            close(conn);
+            continue;
+        }
+        if (pid == 0) {
+            close(listen_fd);
+            _exit(handle_connection(conn) == EXIT_SUCCESS ? EXIT_SUCCESS
+                                                          : EXIT_FAILURE);
+        }
+        close(conn);
+    }
+}
+
+static int create_listening_socket(void) {
+    const char *path = getenv("DEFUSED_SOCKET");
+    if (path == NULL || *path == '\0')
+        path = DEFUSED_SOCKET_PATH;
+
+    struct sockaddr_un sa = {0};
+    sa.sun_family = AF_UNIX;
+    if (strlen(path) >= sizeof(sa.sun_path)) {
+        fprintf(stderr, "defused: socket path too long: %s\n", path);
+        return -ENAMETOOLONG;
+    }
+    (void)strlcpy(sa.sun_path, path, sizeof(sa.sun_path));
+
+    int ret = mkdir_parent(path);
+    if (ret < 0)
+        return ret;
+
+    int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    if (fd == -1) {
+        ret = -errno;
+        fprintf(stderr, "defused: socket: %s\n", strerror(errno));
+        return ret;
+    }
+
+    ret = bind_unix_socket(fd, &sa, sizeof(sa), path);
+    if (ret < 0)
+        goto out_close;
+
+    if (chmod(path, 0666) == -1) {
+        ret = -errno;
+        fprintf(stderr, "defused: chmod(%s): %s\n", path, strerror(errno));
+        goto out_unlink;
+    }
+
+    if (listen(fd, SOMAXCONN) == -1) {
+        ret = -errno;
+        fprintf(stderr, "defused: listen(%s): %s\n", path, strerror(errno));
+        goto out_unlink;
+    }
+
+    return fd;
+
+out_unlink:
+    unlink(path);
+out_close:
+    close(fd);
+    return ret;
+}
+
+static int bind_unix_socket(int fd, const struct sockaddr_un *sa,
+                            socklen_t sa_len, const char *path) {
+    if (bind(fd, (const struct sockaddr *)sa, sa_len) == 0)
+        return 0;
+
+    if (errno != EADDRINUSE) {
+        int ret = -errno;
+        fprintf(stderr, "defused: bind(%s): %s\n", path, strerror(errno));
+        return ret;
+    }
+
+    int probe = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    if (probe == -1) {
+        int ret = -errno;
+        fprintf(stderr, "defused: socket probe: %s\n", strerror(errno));
+        return ret;
+    }
+
+    int ret = 0;
+    if (connect(probe, (const struct sockaddr *)sa, sa_len) == 0) {
+        fprintf(stderr, "defused: socket already in use: %s\n", path);
+        ret = -EADDRINUSE;
+        goto out;
+    }
+    if (errno != ECONNREFUSED) {
+        ret = -errno;
+        fprintf(stderr, "defused: cannot connect to existing socket %s: %s\n",
+                path, strerror(errno));
+        goto out;
+    }
+
+    if (unlink(path) == -1) {
+        ret = -errno;
+        fprintf(stderr, "defused: unlink stale socket %s: %s\n", path,
+                strerror(errno));
+        goto out;
+    }
+    if (bind(fd, (const struct sockaddr *)sa, sa_len) == -1) {
+        ret = -errno;
+        fprintf(stderr, "defused: bind(%s): %s\n", path, strerror(errno));
+        goto out;
+    }
+
+out:
+    close(probe);
+    return ret;
+}
+
+static int mkdir_parent(const char *path) {
+    char dir[sizeof(((struct sockaddr_un *)0)->sun_path)];
+    size_t len = strlen(path);
+    if (len >= sizeof(dir))
+        return -ENAMETOOLONG;
+    memcpy(dir, path, len + 1);
+
+    char *slash = strrchr(dir, '/');
+    if (!slash || slash == dir)
+        return 0;
+    *slash = '\0';
+
+    if (mkdir(dir, 0755) == -1 && errno != EEXIST) {
+        int ret = -errno;
+        fprintf(stderr, "defused: mkdir(%s): %s\n", dir, strerror(errno));
+        return ret;
     }
     return 0;
 }
