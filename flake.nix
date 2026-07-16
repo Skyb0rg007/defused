@@ -57,9 +57,11 @@
             nativeBuildInputs = [
               pkgs.meson
               pkgs.ninja
+              pkgs.pkg-config
             ];
             buildInputs = [
               pkgs.libseccomp
+              pkgs.systemdLibs
             ];
           };
         }

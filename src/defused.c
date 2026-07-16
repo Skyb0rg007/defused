@@ -29,6 +29,7 @@
 #include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/vfs.h>
+#include <systemd/sd-daemon.h>
 #include <unistd.h>
 
 static int recv_request(int sock, union defused_req *req, ssize_t *out_len,
@@ -807,42 +808,22 @@ static int parse_args(int argc, char *argv[]) {
     return 0;
 }
 
-#define SD_LISTEN_FDS_START 3
-
 /* Implements systemd socket activation */
 static int socket_activation_fd(int *out_fd) {
-    const char *pid_str = getenv("LISTEN_PID");
-    const char *fds_str = getenv("LISTEN_FDS");
-    if (!pid_str || !fds_str) {
-        fprintf(stderr, "defused: not socket-activated "
-                        "($LISTEN_PID/$LISTEN_FDS not set)\n");
-        return -EINVAL;
+    int n = sd_listen_fds(1 /* unset_environment */);
+    if (n < 0) {
+        fprintf(stderr, "defused: sd_listen_fds failed: %s\n", strerror(-n));
+        return n;
     }
-
-    long pid;
-    if (libfuse_strtol(pid_str, &pid) < 0 || pid != (long)getpid()) {
+    if (n != 1) {
         fprintf(stderr,
-                "defused: $LISTEN_PID (%s) doesn't match our pid (%d)\n",
-                pid_str, (int)getpid());
+                "defused: not socket-activated with exactly one fd (got "
+                "%d) -- $LISTEN_PID/$LISTEN_FDS not set or wrong?\n",
+                n);
         return -EINVAL;
     }
 
-    long nfds;
-    if (libfuse_strtol(fds_str, &nfds) < 0 || nfds != 1) {
-        fprintf(stderr,
-                "defused: expected exactly one socket-activation fd , got "
-                "$LISTEN_FDS=%s\n",
-                fds_str);
-        return -EINVAL;
-    }
-
-    unsetenv("LISTEN_PID");
-    unsetenv("LISTEN_FDS");
-    unsetenv("LISTEN_FDNAMES");
-
-    int fd = SD_LISTEN_FDS_START;
-    fcntl(fd, F_SETFD, FD_CLOEXEC);
-    *out_fd = fd;
+    *out_fd = SD_LISTEN_FDS_START;
     return 0;
 }
 
