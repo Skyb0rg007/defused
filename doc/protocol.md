@@ -10,8 +10,8 @@ This document describes the protocol spoken between the unprivileged
 `fusermount3` replacement (the *client*) and the privileged `defused` system
 service.
 
-The authoritative constants are in `src/defused.h`; the Varlink interface is
-defined in `src/defused-varlink.c`.
+The authoritative constants are in `src/defused_proto.h`; the Varlink
+interface is defined in `src/defused-varlink.c`.
 
 ## Transport
 

@@ -19,7 +19,7 @@
  *    service error status surfaces as a nonzero exit.
  */
 #define _GNU_SOURCE
-#include "defused.h"
+#include "defused_proto.h"
 
 #include <errno.h>
 #include <fcntl.h>

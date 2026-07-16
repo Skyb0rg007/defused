@@ -14,7 +14,7 @@
  * FUSE option parsing happens here; the service wire protocol is Varlink.
  */
 #define _GNU_SOURCE
-#include "defused.h"
+#include "defused_proto.h"
 #include "util.h"
 
 #include <fcntl.h>
