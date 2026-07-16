@@ -67,6 +67,8 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <systemd/sd-json.h>
+#include <systemd/sd-varlink.h>
 #include <unistd.h>
 
 static int failures;
@@ -110,26 +112,6 @@ static int map_root(uid_t real_uid, gid_t real_gid) {
     return 0;
 }
 
-static int recv_response_status(int sock) {
-    struct defused_resp resp;
-    struct iovec riov = {.iov_base = &resp, .iov_len = sizeof(resp)};
-    struct msghdr rmsg = {.msg_iov = &riov, .msg_iovlen = 1};
-    ssize_t n = recvmsg(sock, &rmsg, 0);
-    if (n != (ssize_t)sizeof(resp)) {
-        fprintf(stderr, "short/failed response: %zd\n", n);
-        return n < 0 ? -errno : -EBADMSG;
-    }
-    if (resp.hdr.magic != DEFUSED_PROTO_MAGIC ||
-        resp.hdr.version != DEFUSED_PROTO_VERSION) {
-        fprintf(stderr, "bad response header\n");
-        return -EBADMSG;
-    }
-    if (resp.status == DEFUSED_ERR_SETNS_FAILED)
-        fprintf(stderr, "(setns failed, sys_errno=%d: %s)\n", resp.sys_errno,
-                strerror(resp.sys_errno));
-    return (int)resp.status;
-}
-
 /* Sends an unmount request for a bind mount that is intentionally not FUSE.
  * A service that can enter the client's namespace should therefore return
  * DEFUSED_ERR_NOT_A_FUSE_MOUNT; a service that cannot enter it should fail
@@ -171,41 +153,70 @@ static int send_non_fuse_umount_request(int sock) {
         return ret;
     }
 
-    struct defused_umount_req req = {
-        .hdr = {DEFUSED_PROTO_MAGIC, DEFUSED_PROTO_VERSION, DEFUSED_OP_UNMOUNT},
-    };
-    strncpy(req.name, "target", sizeof(req.name));
-
-    struct iovec iov = {.iov_base = &req, .iov_len = sizeof(req)};
-    union {
-        struct cmsghdr h;
-        char buf[CMSG_SPACE(sizeof(int))];
-    } cbuf;
-    struct msghdr msg = {
-        .msg_iov = &iov,
-        .msg_iovlen = 1,
-        .msg_control = cbuf.buf,
-        .msg_controllen = sizeof(cbuf.buf),
-    };
-    struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
-    c->cmsg_level = SOL_SOCKET;
-    c->cmsg_type = SCM_RIGHTS;
-    c->cmsg_len = CMSG_LEN(sizeof(int));
-    memcpy(CMSG_DATA(c), &parent_fd, sizeof(parent_fd));
-
-    if (sendmsg(sock, &msg, 0) < 0) {
-        int ret = -errno;
-        perror("sendmsg");
-        close(parent_fd);
-        umount2(target, MNT_DETACH);
-        rmdir(target);
-        rmdir(dir);
-        return ret;
+    sd_varlink *link = NULL;
+    sd_json_variant *reply = NULL;
+    const char *error_id = NULL;
+    int status = -EBADMSG;
+    int ret = sd_varlink_connect_fd(&link, sock);
+    if (ret < 0) {
+        status = ret;
+        goto out;
     }
+    sock = -1;
+    ret = sd_varlink_set_allow_fd_passing_input(link, true);
+    if (ret < 0) {
+        status = ret;
+        goto out;
+    }
+    ret = sd_varlink_set_allow_fd_passing_output(link, true);
+    if (ret < 0) {
+        status = ret;
+        goto out;
+    }
+    ret = sd_varlink_push_fd(link, parent_fd);
+    if (ret < 0) {
+        status = ret;
+        goto out;
+    }
+    ret = sd_varlink_callbo(
+        link, DEFUSED_VARLINK_METHOD_UNMOUNT, &reply, &error_id,
+        SD_JSON_BUILD_PAIR_UNSIGNED("parentFileDescriptor", 0),
+        SD_JSON_BUILD_PAIR_STRING("name", "target"),
+        SD_JSON_BUILD_PAIR_BOOLEAN("lazy", true));
+    if (ret < 0) {
+        status = ret;
+        goto out;
+    }
+    if (error_id != NULL)
+        goto out;
 
+    struct service_response {
+        uint32_t status;
+        int32_t sys_errno;
+    } parsed = {};
+    static const sd_json_dispatch_field dispatch_table[] = {
+        {"status", SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uint32,
+         offsetof(struct service_response, status), SD_JSON_MANDATORY},
+        {"sysErrno", SD_JSON_VARIANT_INTEGER, sd_json_dispatch_int32,
+         offsetof(struct service_response, sys_errno), SD_JSON_MANDATORY},
+        {},
+    };
+    ret = sd_json_dispatch(reply, dispatch_table, 0, &parsed);
+    if (ret < 0) {
+        status = ret;
+        goto out;
+    }
+    if (parsed.status == DEFUSED_ERR_SETNS_FAILED)
+        fprintf(stderr, "(setns failed, sys_errno=%d: %s)\n", parsed.sys_errno,
+                strerror(parsed.sys_errno));
+    status = (int)parsed.status;
+
+out:
+    sd_json_variant_unref(reply);
+    sd_varlink_flush_close_unref(link);
+    if (sock >= 0)
+        close(sock);
     close(parent_fd);
-    int status = recv_response_status(sock);
-
     umount2(target, MNT_DETACH);
     rmdir(target);
     rmdir(dir);
@@ -229,7 +240,7 @@ static int listen_addr(struct sockaddr_un *sa, socklen_t *len,
     if (ret < 0)
         return ret;
 
-    int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd == -1 || bind(fd, (struct sockaddr *)sa, *len) == -1 ||
         listen(fd, 1) == -1) {
         perror("listen");
@@ -239,7 +250,7 @@ static int listen_addr(struct sockaddr_un *sa, socklen_t *len,
 }
 
 static int connect_addr(const struct sockaddr_un *sa, socklen_t len) {
-    int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd == -1 || connect(fd, (const struct sockaddr *)sa, len) == -1) {
         perror("connect");
         return -errno;

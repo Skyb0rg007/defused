@@ -11,7 +11,7 @@
  * After the mount occurs, the the opened /dev/fuse file descriptor will be
  * sent to that file descriptor via SCM_RIGHTS (along with a single zero byte).
  *
- * All option parsing happens here, as the server uses a binary protocol.
+ * FUSE option parsing happens here; the service wire protocol is Varlink.
  */
 #define _GNU_SOURCE
 #include "defused.h"
@@ -25,11 +25,14 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <systemd/sd-json.h>
+#include <systemd/sd-varlink.h>
 #include <unistd.h>
 
 #include <errno.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdnoreturn.h>
@@ -95,10 +98,11 @@ static int do_unmount(const char *mnt, bool lazy)
     __attribute__((__nonnull__(1)));
 static int wait_and_auto_unmount(int cfd, const char *mnt)
     __attribute__((__nonnull__(2), __warn_unused_result__));
-static int connect_service(void) __attribute__((__warn_unused_result__));
-static int transact(const union defused_req *req, size_t req_len,
-                    const int *fds, size_t fd_count, struct defused_resp *resp)
-    __attribute__((__nonnull__(1, 3, 5), __warn_unused_result__));
+static int connect_service(sd_varlink **ret)
+    __attribute__((__nonnull__(1), __warn_unused_result__));
+static int transact(uint32_t op, const union defused_req *req, const int *fds,
+                    size_t fd_count, struct defused_resp *resp)
+    __attribute__((__nonnull__(2, 3, 5), __warn_unused_result__));
 static void print_service_error(uint32_t op, const char *mnt,
                                 const struct defused_resp *resp)
     __attribute__((__nonnull__(2, 3)));
@@ -234,9 +238,6 @@ out:
 
 static int do_mount(const char *mnt, const char *opts, int cfd) {
     union defused_req u = {0};
-    u.mount.hdr.magic = DEFUSED_PROTO_MAGIC;
-    u.mount.hdr.version = DEFUSED_PROTO_VERSION;
-    u.mount.hdr.op = DEFUSED_OP_MOUNT;
     int ret = parse_mount_opts(opts, &u.mount);
     if (ret < 0)
         return ret;
@@ -266,7 +267,7 @@ static int do_mount(const char *mnt, const char *opts, int cfd) {
 
     struct defused_resp resp = {0};
     int fds[] = {fuse_fd, mnt_fd};
-    int res = transact(&u, sizeof(u.mount), fds, 2, &resp);
+    int res = transact(DEFUSED_OP_MOUNT, &u, fds, 2, &resp);
     if (res < 0) {
         ret = res;
         goto out;
@@ -333,15 +334,12 @@ static int do_unmount(const char *mnt, bool lazy) {
         goto out;
     }
 
-    union defused_req u = {
-        .umount = {.hdr = {DEFUSED_PROTO_MAGIC, DEFUSED_PROTO_VERSION,
-                           DEFUSED_OP_UNMOUNT},
-                   .lazy = lazy}};
+    union defused_req u = {.umount = {.lazy = lazy}};
     (void)strlcpy(u.umount.name, name, sizeof(u.umount.name));
 
     struct defused_resp resp = {0};
     int fds[] = {parent_fd};
-    int res = transact(&u, sizeof(u.umount), fds, 1, &resp);
+    int res = transact(DEFUSED_OP_UNMOUNT, &u, fds, 1, &resp);
     if (res < 0) {
         ret = res;
         goto out;
@@ -393,91 +391,99 @@ static int wait_and_auto_unmount(int cfd, const char *mnt) {
     return do_unmount(mnt, true);
 }
 
-static int connect_service(void) {
+static int connect_service(sd_varlink **ret) {
     const char *path = getenv("DEFUSED_SOCKET");
     if (path == NULL || *path == '\0')
         path = DEFUSED_SOCKET_PATH;
 
-    struct sockaddr_un sa = {0};
-    sa.sun_family = AF_UNIX;
-    if (strlen(path) >= sizeof(sa.sun_path)) {
-        fprintf(stderr, "%s: socket path too long: %s\n", progname, path);
-        return -ENAMETOOLONG;
-    }
-    (void)strlcpy(sa.sun_path, path, sizeof(sa.sun_path));
-
-    int ret = 0;
-    int sock = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
-    if (sock == -1) {
-        ret = -errno;
-        fprintf(stderr, "%s: socket: %s\n", progname, strerror(errno));
-        return ret;
-    }
-    if (connect(sock, (struct sockaddr *)&sa, sizeof(sa)) == -1) {
-        ret = -errno;
+    sd_varlink *link = NULL;
+    int r = sd_varlink_connect_address(&link, path);
+    if (r < 0) {
         fprintf(stderr, "%s: cannot connect to the defused service at %s: %s\n",
-                progname, path, strerror(errno));
-        goto out_close;
+                progname, path, strerror(-r));
+        return r;
     }
-    return sock;
-
-out_close:
-    close(sock);
-    return ret;
+    r = sd_varlink_set_allow_fd_passing_input(link, true);
+    if (r < 0)
+        goto fail;
+    r = sd_varlink_set_allow_fd_passing_output(link, true);
+    if (r < 0)
+        goto fail;
+    *ret = link;
+    return 0;
+fail:
+    sd_varlink_close_unref(link);
+    return r;
 }
 
 /* One request/response with the service */
-static int transact(const union defused_req *req, size_t req_len,
-                    const int *fds, size_t fd_count,
-                    struct defused_resp *resp) {
+static int transact(uint32_t op, const union defused_req *req, const int *fds,
+                    size_t fd_count, struct defused_resp *resp) {
     if (fd_count > 2)
         return -EINVAL;
 
-    int sock = connect_service();
-    if (sock < 0)
-        return sock;
-    int ret = 0;
+    sd_varlink *link = NULL;
+    int ret = connect_service(&link);
+    if (ret < 0)
+        return ret;
 
-    union {
-        struct cmsghdr hdr;
-        char buf[CMSG_SPACE(2 * sizeof(int))];
-    } cbuf;
-    struct iovec iov = {.iov_base = (void *)req, .iov_len = req_len};
-    struct msghdr msg = {
-        .msg_iov = &iov,
-        .msg_iovlen = 1,
-    };
-    if (fd_count > 0) {
-        msg.msg_control = cbuf.buf;
-        msg.msg_controllen = CMSG_SPACE(fd_count * sizeof(int));
-        struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
-        c->cmsg_level = SOL_SOCKET;
-        c->cmsg_type = SCM_RIGHTS;
-        c->cmsg_len = CMSG_LEN(fd_count * sizeof(int));
-        memcpy(CMSG_DATA(c), fds, fd_count * sizeof(int));
+    for (size_t i = 0; i < fd_count; i++) {
+        ret = sd_varlink_push_dup_fd(link, fds[i]);
+        if (ret < 0)
+            goto out_close;
     }
 
-    if (sendmsg(sock, &msg, MSG_NOSIGNAL) == -1) {
-        ret = -errno;
-        fprintf(stderr,
-                "%s: failed to send request to the defused service: %s\n",
-                progname, strerror(errno));
-        goto out_close;
-    }
-
-    ssize_t n = recv(sock, resp, sizeof(*resp), 0);
-    ret = n < 0 ? -errno : 0;
-    if (n != (ssize_t)sizeof(*resp) || resp->hdr.magic != DEFUSED_PROTO_MAGIC ||
-        resp->hdr.version != DEFUSED_PROTO_VERSION) {
+    sd_json_variant *reply = NULL;
+    const char *error_id = NULL;
+    if (op == DEFUSED_OP_MOUNT)
+        ret = sd_varlink_callbo(
+            link, DEFUSED_VARLINK_METHOD_MOUNT, &reply, &error_id,
+            SD_JSON_BUILD_PAIR_UNSIGNED("fuseFileDescriptor", 0),
+            SD_JSON_BUILD_PAIR_UNSIGNED("mountpointFileDescriptor", 1),
+            SD_JSON_BUILD_PAIR_UNSIGNED("mountFlags", req->mount.mount_flags),
+            SD_JSON_BUILD_PAIR_UNSIGNED("maxRead", req->mount.max_read),
+            SD_JSON_BUILD_PAIR_UNSIGNED("blockSize", req->mount.blksize),
+            SD_JSON_BUILD_PAIR_STRING("fsName", req->mount.fsname),
+            SD_JSON_BUILD_PAIR_STRING("subtype", req->mount.subtype));
+    else if (op == DEFUSED_OP_UNMOUNT)
+        ret = sd_varlink_callbo(
+            link, DEFUSED_VARLINK_METHOD_UNMOUNT, &reply, &error_id,
+            SD_JSON_BUILD_PAIR_UNSIGNED("parentFileDescriptor", 0),
+            SD_JSON_BUILD_PAIR_STRING("name", req->umount.name),
+            SD_JSON_BUILD_PAIR_BOOLEAN("lazy", req->umount.lazy != 0));
+    else
+        ret = -EINVAL;
+    if (ret < 0)
+        goto out_unref_reply;
+    if (error_id != NULL) {
         fprintf(stderr, "%s: unexpected reply from the defused service\n",
                 progname);
-        ret = ret < 0 ? ret : -EBADMSG;
-        goto out_close;
+        ret = -EBADMSG;
+        goto out_unref_reply;
     }
+
+    struct service_response {
+        uint32_t status;
+        int32_t sys_errno;
+    } parsed = {};
+    static const sd_json_dispatch_field dispatch_table[] = {
+        {"status", SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uint32,
+         offsetof(struct service_response, status), SD_JSON_MANDATORY},
+        {"sysErrno", SD_JSON_VARIANT_INTEGER, sd_json_dispatch_int32,
+         offsetof(struct service_response, sys_errno), SD_JSON_MANDATORY},
+        {},
+    };
+    ret = sd_json_dispatch(reply, dispatch_table, 0, &parsed);
+    if (ret < 0)
+        goto out_unref_reply;
+    resp->status = parsed.status;
+    resp->sys_errno = parsed.sys_errno;
     ret = 0;
 
+out_unref_reply:
+    sd_json_variant_unref(reply);
 out_close:
-    close(sock);
+    sd_varlink_flush_close_unref(link);
     return ret;
 }
 

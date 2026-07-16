@@ -3,11 +3,11 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * Wire protocol for setting up FUSE mounts.
+ * Varlink protocol for setting up FUSE mounts.
  *
- * The protocol consists of a single request/response with fixed-size structs,
- * sent over a local Unix domain socket (using SEQPACKET for easy framing).
- * All fields are host-byte-order.
+ * The protocol consists of a single request/response over a local Unix stream
+ * socket. Framing, JSON parsing, and fd association are delegated to
+ * libsystemd's sd-varlink implementation.
  * The default socket path is /run/defused/defused.sock, but can be overridden
  * with the DEFUSED_SOCKET environment variable.
  *
@@ -16,19 +16,20 @@
  * mount or umount operations.
  */
 
-#ifndef DEFUSED_PROTO_H
-#define DEFUSED_PROTO_H
+#ifndef DEFUSED_H
+#define DEFUSED_H
 
 #include <stdint.h>
+#include <systemd/sd-varlink-idl.h>
 
 #define DEFUSED_SOCKET_PATH "/run/defused/defused.sock"
 
-#define DEFUSED_PROTO_MAGIC UINT32_C(0x44465531) /* "DFU1" */
-#define DEFUSED_PROTO_VERSION 1u
+#define DEFUSED_VARLINK_INTERFACE "website.soss.defused"
+#define DEFUSED_VARLINK_METHOD_MOUNT "website.soss.defused.Mount"
+#define DEFUSED_VARLINK_METHOD_UNMOUNT "website.soss.defused.Unmount"
 
 /* The operation to perform */
 enum defused_op {
-    DEFUSED_OP_RESPONSE = 0,
     DEFUSED_OP_MOUNT = 1,
     DEFUSED_OP_UNMOUNT = 2,
 };
@@ -43,13 +44,6 @@ enum defused_status {
     DEFUSED_ERR_MOUNT_FAILED = 5,
     DEFUSED_ERR_UNMOUNT_FAILED = 6,
     DEFUSED_ERR_SETNS_FAILED = 7,
-};
-
-/* Every request and response starts with this */
-struct defused_hdr {
-    uint32_t magic;
-    uint32_t version;
-    uint32_t op;
 };
 
 /* Max length of fsname and subtype */
@@ -89,10 +83,8 @@ enum defused_mount_flag {
      DEFUSED_FUSE_DEFAULT_PERMISSIONS)
 
 /*
- * Request a FUSE mount.
- * The client sends a message with this struct along with two file descriptors.
- *
- * The ancillary data is, in order:
+ * Request a FUSE mount. The Varlink call carries two file descriptors,
+ * referenced from the JSON payload by fd index:
  *
  *  1. A file descriptor opened from /dev/fuse
  *  2. A file descriptor opened to the destination mountpoint directory or
@@ -103,8 +95,6 @@ enum defused_mount_flag {
  * The
  */
 struct defused_mount_req {
-    /* op = DEFUSED_OP_MOUNT */
-    struct defused_hdr hdr;
     /* enum defused_mount_flag bits */
     uint32_t mount_flags;
     /* maximum read size, 0 for unset */
@@ -116,18 +106,14 @@ struct defused_mount_req {
 };
 
 /*
- * Request a FUSE unmount.
- * The client sends a message with this struct along with a file descriptor.
- *
- * The ancillary data is a file descriptor for the *parent* directory of the
- * mount to tear down.
+ * Request a FUSE unmount. The Varlink call carries one file descriptor for the
+ * *parent* directory of the mount to tear down, referenced from the JSON
+ * payload by fd index.
  *
  * The service will unmount the FUSE filesystem mounted with the given name
  * in the directory passed via file descriptor.
  */
 struct defused_umount_req {
-    /* op = DEFUSED_OP_UNMOUNT */
-    struct defused_hdr hdr;
     /* set nonzero to perform a lazy unmount (MNT_DETACH) */
     uint32_t lazy;
     /* basename of the mountpoint */
@@ -135,19 +121,18 @@ struct defused_umount_req {
 };
 
 union defused_req {
-    struct defused_hdr hdr;
     struct defused_mount_req mount;
     struct defused_umount_req umount;
 };
 
 /* Responses to mount or unmount requests */
 struct defused_resp {
-    /* op = DEFUSED_OP_RESPONSE */
-    struct defused_hdr hdr;
     /* enum defused_status */
     uint32_t status;
     /* errno from mount setup/umount2(), when relevant */
     int32_t sys_errno;
 };
 
-#endif /* DEFUSED_PROTO_H */
+extern const sd_varlink_interface vl_interface_website_soss_defused;
+
+#endif /* DEFUSED_H */

@@ -7,7 +7,7 @@
  * behalf of unprivileged users.
  *
  * This program is designed to be called via systemd Accept=yes
- * socket activation, on a AF_UNIX SOCK_SEQPACKET socket.
+ * socket activation, on an AF_UNIX SOCK_STREAM Varlink socket.
  * The process exits after processing the operation.
  */
 #define _GNU_SOURCE
@@ -20,6 +20,7 @@
 #include <sched.h>
 #include <seccomp.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +32,9 @@
 #include <sys/vfs.h>
 #include <systemd/sd-bus.h>
 #include <systemd/sd-daemon.h>
+#include <systemd/sd-event.h>
+#include <systemd/sd-json.h>
+#include <systemd/sd-varlink.h>
 #include <unistd.h>
 
 /* polkit action ids checked before creating/tearing down a FUSE mount; see
@@ -55,10 +59,18 @@ static const struct {
     {DEFUSED_FUSE_ALLOW_OTHER, "allow_other"},
 };
 
-static int recv_request(int sock, union defused_req *req, ssize_t *out_len,
-                        int fds[2], int *out_fd_count, struct ucred *cred)
-    __attribute__((__nonnull__(2, 3, 5, 6), __warn_unused_result__));
-static int send_response(int sock, uint32_t status, int sys_errno, int fd);
+struct request_context {
+    int sock;
+    int proc_fd;
+};
+
+static int reply_response(sd_varlink *link, uint32_t status, int sys_errno);
+static int varlink_mount(sd_varlink *link, sd_json_variant *parameters,
+                         sd_varlink_method_flags_t flags, void *userdata)
+    __attribute__((__nonnull__(1, 4), __warn_unused_result__));
+static int varlink_unmount(sd_varlink *link, sd_json_variant *parameters,
+                           sd_varlink_method_flags_t flags, void *userdata)
+    __attribute__((__nonnull__(1, 4), __warn_unused_result__));
 static const char *status_name(uint32_t status)
     __attribute__((__const__, __warn_unused_result__));
 static int join_peer_mnt_ns(int sock, enum defused_op op)
@@ -82,12 +94,14 @@ static int mount_fuse_new_api(const struct defused_mount_req *req, int mnt_fd,
                               int dev_fd, const struct stat *st,
                               const struct ucred *cred)
     __attribute__((__nonnull__(1, 4, 5), __warn_unused_result__));
-static int handle_mount(int sock, const struct defused_mount_req *req,
-                        int mnt_fd, int dev_fd, const struct ucred *cred)
-    __attribute__((__nonnull__(2, 5), __warn_unused_result__));
-static int handle_umount(int sock, const struct defused_umount_req *req,
-                         int parent_fd, int proc_fd, const struct ucred *cred)
-    __attribute__((__nonnull__(2, 5), __warn_unused_result__));
+static int handle_mount(sd_varlink *link, int sock,
+                        const struct defused_mount_req *req, int mnt_fd,
+                        int dev_fd, const struct ucred *cred)
+    __attribute__((__nonnull__(1, 3, 6), __warn_unused_result__));
+static int handle_umount(sd_varlink *link, int sock,
+                         const struct defused_umount_req *req, int parent_fd,
+                         int proc_fd, const struct ucred *cred)
+    __attribute__((__nonnull__(1, 3, 6), __warn_unused_result__));
 static void usage(const char *prog) __attribute__((__nonnull__(1)));
 static int parse_args(int argc, char *argv[])
     __attribute__((__nonnull__(2), __warn_unused_result__));
@@ -112,8 +126,6 @@ int main(int argc, char *argv[]) {
     if (ret < 0)
         return EXIT_FAILURE;
 
-    int client_fd_count = 0;
-
     /* Keep a handle to the service's procfs before entering the client's
      * mount namespace. */
     int proc_fd = open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -121,60 +133,72 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "defused: failed to open /proc: %s\n", strerror(errno));
         goto out;
     }
-    union defused_req req;
-    struct ucred cred;
-    int client_fds[2] = {-1, -1};
-    ssize_t n = -1;
-    ret = recv_request(sock, &req, &n, client_fds, &client_fd_count, &cred);
+
+    sd_event *event = NULL;
+    sd_varlink_server *server = NULL;
+    ret = sd_event_new(&event);
     if (ret < 0) {
-        fprintf(stderr, "defused: failed to receive request: %s\n",
+        fprintf(stderr, "defused: failed to create event loop: %s\n",
                 strerror(-ret));
         goto out;
     }
-
-    if ((size_t)n < sizeof(req.hdr) || req.hdr.magic != DEFUSED_PROTO_MAGIC ||
-        req.hdr.version != DEFUSED_PROTO_VERSION) {
-        fprintf(stderr,
-                "defused: malformed request header (len=%zd, magic=%#x, "
-                "version=%u)\n",
-                n, (size_t)n >= sizeof(req.hdr) ? req.hdr.magic : 0,
-                (size_t)n >= sizeof(req.hdr) ? req.hdr.version : 0);
-        goto malformed;
+    ret = sd_varlink_server_new(&server,
+                                SD_VARLINK_SERVER_ALLOW_FD_PASSING_INPUT |
+                                    SD_VARLINK_SERVER_FD_PASSING_INPUT_STRICT |
+                                    SD_VARLINK_SERVER_INHERIT_USERDATA);
+    if (ret < 0) {
+        fprintf(stderr, "defused: failed to create Varlink server: %s\n",
+                strerror(-ret));
+        goto out;
+    }
+    ret = sd_varlink_server_add_interface(server,
+                                          &vl_interface_website_soss_defused);
+    if (ret < 0) {
+        fprintf(stderr, "defused: failed to add Varlink interface: %s\n",
+                strerror(-ret));
+        goto out_unref_server;
+    }
+    ret = sd_varlink_server_bind_method_many(
+        server, DEFUSED_VARLINK_METHOD_MOUNT, varlink_mount,
+        DEFUSED_VARLINK_METHOD_UNMOUNT, varlink_unmount);
+    if (ret < 0) {
+        fprintf(stderr, "defused: failed to bind Varlink methods: %s\n",
+                strerror(-ret));
+        goto out_unref_server;
     }
 
-    switch (req.hdr.op) {
-    case DEFUSED_OP_MOUNT:
-        if ((size_t)n != sizeof(req.mount) || client_fd_count != 2) {
-            fprintf(stderr,
-                    "defused: malformed mount request (len=%zd, fds=%d)\n", n,
-                    client_fd_count);
-            goto malformed;
-        }
-        ret =
-            handle_mount(sock, &req.mount, client_fds[1], client_fds[0], &cred);
-        break;
-    case DEFUSED_OP_UNMOUNT:
-        if ((size_t)n != sizeof(req.umount) || client_fd_count != 1) {
-            fprintf(stderr,
-                    "defused: malformed unmount request (len=%zd, fds=%d)\n", n,
-                    client_fd_count);
-            goto malformed;
-        }
-        ret = handle_umount(sock, &req.umount, client_fds[0], proc_fd, &cred);
-        break;
-    default:
-        fprintf(stderr, "defused: unknown request operation %u\n", req.hdr.op);
-        goto malformed;
+    struct request_context ctx = {.sock = sock, .proc_fd = proc_fd};
+    sd_varlink_server_set_userdata(server, &ctx);
+    ret = sd_varlink_server_set_exit_on_idle(server, true);
+    if (ret < 0) {
+        fprintf(stderr, "defused: failed to configure Varlink server: %s\n",
+                strerror(-ret));
+        goto out_unref_server;
+    }
+    ret = sd_varlink_server_attach_event(server, event, 0);
+    if (ret < 0) {
+        fprintf(stderr, "defused: failed to attach Varlink server: %s\n",
+                strerror(-ret));
+        goto out_unref_server;
+    }
+    ret = sd_varlink_server_add_connection(server, sock, NULL);
+    if (ret < 0) {
+        fprintf(stderr, "defused: failed to add Varlink connection: %s\n",
+                strerror(-ret));
+        goto out_unref_server;
+    }
+    sock = -1;
+    ret = sd_event_loop(event);
+    if (ret < 0) {
+        fprintf(stderr, "defused: Varlink server failed: %s\n", strerror(-ret));
+        goto out_unref_server;
     }
 
     exit_status = EXIT_SUCCESS;
-    goto out;
-
-malformed:
-    send_response(sock, DEFUSED_ERR_MALFORMED, 0, -1);
+out_unref_server:
+    sd_varlink_server_unref(server);
+    sd_event_unref(event);
 out:
-    for (int i = 0; i < client_fd_count; i++)
-        close(client_fds[i]);
     if (proc_fd >= 0)
         close(proc_fd);
     if (sock >= 0)
@@ -182,102 +206,151 @@ out:
     return exit_status;
 }
 
-/* Reads the one request message, up to two fds, and peer credentials */
-static int recv_request(int sock, union defused_req *req, ssize_t *out_len,
-                        int fds[2], int *out_fd_count, struct ucred *cred) {
-    struct iovec iov = {.iov_base = req, .iov_len = sizeof(*req)};
-    union {
-        struct cmsghdr hdr;
-        char
-            buf[CMSG_SPACE(2 * sizeof(int)) + CMSG_SPACE(sizeof(struct ucred))];
-    } cmsg_buf;
-
-    struct msghdr msg = {
-        .msg_iov = &iov,
-        .msg_iovlen = 1,
-        .msg_control = cmsg_buf.buf,
-        .msg_controllen = sizeof(cmsg_buf.buf),
-    };
-
-    fds[0] = -1;
-    fds[1] = -1;
-    *out_fd_count = 0;
-
-    socklen_t cred_len = sizeof(*cred);
-    if (getsockopt(sock, SOL_SOCKET, SO_PEERCRED, cred, &cred_len) == -1) {
-        fprintf(stderr, "defused: SO_PEERCRED failed: %s\n", strerror(errno));
-        return -errno;
-    }
-
-    ssize_t n = recvmsg(sock, &msg, MSG_CMSG_CLOEXEC);
-    if (n < 0) {
-        fprintf(stderr, "defused: recvmsg failed: %s\n", strerror(errno));
-        return -errno;
-    }
-    if (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) {
-        fprintf(stderr, "defused: request or ancillary data was truncated\n");
-        return -EMSGSIZE;
-    }
-
-    for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
-        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
-            if (c->cmsg_len < CMSG_LEN(0)) {
-                fprintf(stderr, "defused: malformed SCM_RIGHTS header\n");
-                return -EMSGSIZE;
-            }
-            size_t payload_len = c->cmsg_len - CMSG_LEN(0);
-            if (payload_len == 0 || payload_len % sizeof(int) != 0) {
-                fprintf(stderr, "defused: malformed SCM_RIGHTS payload\n");
-                return -EMSGSIZE;
-            }
-            size_t fd_count = payload_len / sizeof(int);
-            if (*out_fd_count + (int)fd_count > 2) {
-                int *extra = (int *)CMSG_DATA(c);
-                for (size_t i = 0; i < fd_count; i++)
-                    close(extra[i]);
-                fprintf(stderr, "defused: too many request file descriptors\n");
-                return -EMSGSIZE;
-            }
-            memcpy(&fds[*out_fd_count], CMSG_DATA(c), fd_count * sizeof(int));
-            *out_fd_count += (int)fd_count;
-        }
-    }
-
-    *out_len = n;
-    return 0;
+static int reply_response(sd_varlink *link, uint32_t status, int sys_errno) {
+    int ret =
+        sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_UNSIGNED("status", status),
+                           SD_JSON_BUILD_PAIR_INTEGER("sysErrno", sys_errno));
+    if (ret < 0)
+        fprintf(stderr, "defused: failed to send response %s: %s\n",
+                status_name(status), strerror(-ret));
+    return ret;
 }
 
-static int send_response(int sock, uint32_t status, int sys_errno, int fd) {
-    struct defused_resp resp = {
-        .hdr = {DEFUSED_PROTO_MAGIC, DEFUSED_PROTO_VERSION, 0},
-        .status = status,
-        .sys_errno = sys_errno,
+static int varlink_mount(sd_varlink *link, sd_json_variant *parameters,
+                         sd_varlink_method_flags_t flags, void *userdata) {
+    (void)flags;
+    struct request_context *ctx = userdata;
+    struct defused_mount_req req = {0};
+    int ret = 0;
+    int dev_fd = -1, mnt_fd = -1;
+
+    struct mount_parameters {
+        uint32_t fuse_fd_index;
+        uint32_t mnt_fd_index;
+        uint32_t mount_flags;
+        uint32_t max_read;
+        uint32_t blksize;
+        const char *fsname;
+        const char *subtype;
+    } parsed = {};
+    static const sd_json_dispatch_field dispatch_table[] = {
+        {"fuseFileDescriptor", SD_JSON_VARIANT_UNSIGNED,
+         sd_json_dispatch_uint32,
+         offsetof(struct mount_parameters, fuse_fd_index), SD_JSON_MANDATORY},
+        {"mountpointFileDescriptor", SD_JSON_VARIANT_UNSIGNED,
+         sd_json_dispatch_uint32,
+         offsetof(struct mount_parameters, mnt_fd_index), SD_JSON_MANDATORY},
+        {"mountFlags", SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uint32,
+         offsetof(struct mount_parameters, mount_flags), SD_JSON_MANDATORY},
+        {"maxRead", SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uint32,
+         offsetof(struct mount_parameters, max_read), SD_JSON_MANDATORY},
+        {"blockSize", SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uint32,
+         offsetof(struct mount_parameters, blksize), SD_JSON_MANDATORY},
+        {"fsName", SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string,
+         offsetof(struct mount_parameters, fsname),
+         SD_JSON_MANDATORY | SD_JSON_STRICT},
+        {"subtype", SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string,
+         offsetof(struct mount_parameters, subtype),
+         SD_JSON_MANDATORY | SD_JSON_STRICT},
+        {},
     };
-    struct iovec iov = {.iov_base = &resp, .iov_len = sizeof(resp)};
-    struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1};
 
-    if (fd >= 0) {
-        union {
-            struct cmsghdr hdr;
-            char buf[CMSG_SPACE(sizeof(int))];
-        } cmsg_buf;
+    ret = sd_varlink_dispatch(link, parameters, dispatch_table, &parsed);
+    if (ret != 0)
+        return ret;
+    req.mount_flags = parsed.mount_flags;
+    req.max_read = parsed.max_read;
+    req.blksize = parsed.blksize;
+    if (strlen(parsed.fsname) >= sizeof(req.fsname))
+        return sd_varlink_error_invalid_parameter_name(link, "fsName");
+    if (strlen(parsed.subtype) >= sizeof(req.subtype))
+        return sd_varlink_error_invalid_parameter_name(link, "subtype");
+    (void)strlcpy(req.fsname, parsed.fsname, sizeof(req.fsname));
+    (void)strlcpy(req.subtype, parsed.subtype, sizeof(req.subtype));
 
-        msg.msg_control = cmsg_buf.buf;
-        msg.msg_controllen = sizeof(cmsg_buf.buf);
-        struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
-        c->cmsg_level = SOL_SOCKET;
-        c->cmsg_type = SCM_RIGHTS;
-        c->cmsg_len = CMSG_LEN(sizeof(int));
-        memcpy(CMSG_DATA(c), &fd, sizeof(int));
+    if (sd_varlink_get_n_fds(link) != 2)
+        return sd_varlink_error_invalid_parameter_name(link,
+                                                       "fuseFileDescriptor");
+    dev_fd = sd_varlink_take_fd(link, parsed.fuse_fd_index);
+    mnt_fd = sd_varlink_take_fd(link, parsed.mnt_fd_index);
+    if (dev_fd < 0 || mnt_fd < 0) {
+        if (dev_fd >= 0)
+            close(dev_fd);
+        if (mnt_fd >= 0)
+            close(mnt_fd);
+        return sd_varlink_error_invalid_parameter_name(
+            link,
+            dev_fd < 0 ? "fuseFileDescriptor" : "mountpointFileDescriptor");
     }
 
-    /* Don't send a signal if the peer is gone, just return an error */
-    if (sendmsg(sock, &msg, MSG_NOSIGNAL) == -1) {
-        fprintf(stderr, "defused: failed to send response %s: %s\n",
-                status_name(status), strerror(errno));
-        return -errno;
-    }
-    return 0;
+    struct ucred cred;
+    socklen_t cred_len = sizeof(cred);
+    if (getsockopt(ctx->sock, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) ==
+        -1) {
+        ret = -errno;
+        fprintf(stderr, "defused: SO_PEERCRED failed: %s\n", strerror(errno));
+    } else
+        ret = handle_mount(link, ctx->sock, &req, mnt_fd, dev_fd, &cred);
+
+    close(dev_fd);
+    close(mnt_fd);
+    return ret;
+}
+
+static int varlink_unmount(sd_varlink *link, sd_json_variant *parameters,
+                           sd_varlink_method_flags_t flags, void *userdata) {
+    (void)flags;
+    struct request_context *ctx = userdata;
+    struct defused_umount_req req = {0};
+    int parent_fd = -1;
+    int ret = 0;
+
+    struct unmount_parameters {
+        uint32_t parent_fd_index;
+        const char *name;
+        int lazy;
+    } parsed = {};
+    static const sd_json_dispatch_field dispatch_table[] = {
+        {"parentFileDescriptor", SD_JSON_VARIANT_UNSIGNED,
+         sd_json_dispatch_uint32,
+         offsetof(struct unmount_parameters, parent_fd_index),
+         SD_JSON_MANDATORY},
+        {"name", SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string,
+         offsetof(struct unmount_parameters, name),
+         SD_JSON_MANDATORY | SD_JSON_STRICT},
+        {"lazy", SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_intbool,
+         offsetof(struct unmount_parameters, lazy), SD_JSON_MANDATORY},
+        {},
+    };
+
+    ret = sd_varlink_dispatch(link, parameters, dispatch_table, &parsed);
+    if (ret != 0)
+        return ret;
+    if (strlen(parsed.name) >= sizeof(req.name))
+        return sd_varlink_error_invalid_parameter_name(link, "name");
+    (void)strlcpy(req.name, parsed.name, sizeof(req.name));
+    req.lazy = parsed.lazy;
+
+    if (sd_varlink_get_n_fds(link) != 1)
+        return sd_varlink_error_invalid_parameter_name(link,
+                                                       "parentFileDescriptor");
+    parent_fd = sd_varlink_take_fd(link, parsed.parent_fd_index);
+    if (parent_fd < 0)
+        return sd_varlink_error_invalid_parameter_name(link,
+                                                       "parentFileDescriptor");
+
+    struct ucred cred;
+    socklen_t cred_len = sizeof(cred);
+    if (getsockopt(ctx->sock, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) ==
+        -1) {
+        ret = -errno;
+        fprintf(stderr, "defused: SO_PEERCRED failed: %s\n", strerror(errno));
+    } else
+        ret = handle_umount(link, ctx->sock, &req, parent_fd, ctx->proc_fd,
+                            &cred);
+
+    close(parent_fd);
+    return ret;
 }
 
 static const char *status_name(uint32_t status) {
@@ -743,8 +816,9 @@ out:
     return ret;
 }
 
-static int handle_mount(int sock, const struct defused_mount_req *req,
-                        int mnt_fd, int dev_fd, const struct ucred *cred) {
+static int handle_mount(sd_varlink *link, int sock,
+                        const struct defused_mount_req *req, int mnt_fd,
+                        int dev_fd, const struct ucred *cred) {
     uint32_t status;
     int sys_errno = 0;
     int ret = 0;
@@ -837,19 +911,20 @@ static int handle_mount(int sock, const struct defused_mount_req *req,
         goto fail;
     }
 
-    return send_response(sock, DEFUSED_OK, 0, -1);
+    return reply_response(link, DEFUSED_OK, 0);
 
 fail:
     fprintf(stderr,
             "defused: mount request failed with %s (ret=%d, errno=%d: %s)\n",
             status_name(status), ret, sys_errno,
             sys_errno ? strerror(sys_errno) : "none");
-    (void)send_response(sock, status, sys_errno, -1);
+    (void)reply_response(link, status, sys_errno);
     return ret;
 }
 
-static int handle_umount(int sock, const struct defused_umount_req *req,
-                         int parent_fd, int proc_fd, const struct ucred *cred) {
+static int handle_umount(sd_varlink *link, int sock,
+                         const struct defused_umount_req *req, int parent_fd,
+                         int proc_fd, const struct ucred *cred) {
     uint32_t status = DEFUSED_OK;
     int sys_errno = 0;
     int ret = 0;
@@ -960,7 +1035,7 @@ out:
             "defused: unmount request failed with %s (ret=%d, errno=%d: %s)\n",
             status_name(status), ret, sys_errno,
             sys_errno ? strerror(sys_errno) : "none");
-    int send_ret = send_response(sock, status, sys_errno, -1);
+    int send_ret = reply_response(link, status, sys_errno);
     if (ret == 0)
         ret = send_ret;
     return ret;
@@ -1015,7 +1090,23 @@ static int socket_activation_fd(int *out_fd) {
         return -EINVAL;
     }
 
-    *out_fd = SD_LISTEN_FDS_START;
+    int fd = SD_LISTEN_FDS_START;
+
+    int r = sd_is_socket_unix(fd, SOCK_STREAM, 0 /* not listening */, NULL, 0);
+    if (r < 0) {
+        fprintf(stderr, "defused: sd_is_socket_unix failed: %s\n",
+                strerror(-r));
+        return r;
+    }
+    if (r == 0) {
+        fprintf(stderr,
+                "defused: socket-activation fd is not a connected AF_UNIX "
+                "SOCK_STREAM socket (check ListenStream= in "
+                "the .socket unit)\n");
+        return -EINVAL;
+    }
+
+    *out_fd = fd;
     return 0;
 }
 

@@ -57,7 +57,7 @@ in
 
       socketConfig = {
         Accept = true;
-        ListenSequentialPacket = "/run/defused/defused.sock";
+        ListenStream = "/run/defused/defused.sock";
         RuntimeDirectory = "defused";
       };
     };

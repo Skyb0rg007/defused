@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * End-to-end test of the fusermount3 client against a fake defused
- * service, without root: it binds a SOCK_SEQPACKET listener at a temp
+ * service, without root: it binds a SOCK_STREAM listener at a temp
  * path (handed to the client via the DEFUSED_SOCKET env override), runs
  * the client, and checks both directions of the protocol:
  *
@@ -25,6 +25,7 @@
 #include <fcntl.h>
 #include <libgen.h>
 #include <limits.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,6 +33,9 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <systemd/sd-event.h>
+#include <systemd/sd-json.h>
+#include <systemd/sd-varlink.h>
 #include <unistd.h>
 
 static int failures;
@@ -44,75 +48,27 @@ static int failures;
         }                                                                      \
     } while (0)
 
-static int recv_with_fds(int sock, void *buf, size_t len, ssize_t *out_len,
-                         int *fds, size_t max_fds, size_t *out_fd_count) {
-    struct iovec iov = {.iov_base = buf, .iov_len = len};
-    union {
-        struct cmsghdr hdr;
-        char buf[CMSG_SPACE(2 * sizeof(int))];
-    } cbuf;
-    struct msghdr msg = {
-        .msg_iov = &iov,
-        .msg_iovlen = 1,
-        .msg_control = cbuf.buf,
-        .msg_controllen = sizeof(cbuf.buf),
-    };
-
-    for (size_t i = 0; i < max_fds; i++)
-        fds[i] = -1;
-    *out_fd_count = 0;
-    ssize_t n = recvmsg(sock, &msg, MSG_CMSG_CLOEXEC);
-    if (n < 0)
-        return -errno;
-    for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
-        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
-            if (c->cmsg_len < CMSG_LEN(0))
-                return -EMSGSIZE;
-            size_t payload_len = c->cmsg_len - CMSG_LEN(0);
-            size_t fd_count = payload_len / sizeof(int);
-            if (payload_len % sizeof(int) != 0 ||
-                *out_fd_count + fd_count > max_fds)
-                return -EMSGSIZE;
-            memcpy(&fds[*out_fd_count], CMSG_DATA(c), fd_count * sizeof(int));
-            *out_fd_count += fd_count;
-        }
-    }
-    *out_len = n;
-    return 0;
-}
-
 static int recv_with_fd(int sock, void *buf, size_t len, ssize_t *out_len,
                         int *out_fd) {
-    size_t fd_count = 0;
-    int ret = recv_with_fds(sock, buf, len, out_len, out_fd, 1, &fd_count);
-    if (ret < 0)
-        return ret;
-    return fd_count <= 1 ? 0 : -EMSGSIZE;
-}
-
-static int send_resp(int sock, uint32_t status, int fd) {
-    struct defused_resp resp = {
-        .hdr = {DEFUSED_PROTO_MAGIC, DEFUSED_PROTO_VERSION, 0},
-        .status = status,
-    };
-    struct iovec iov = {.iov_base = &resp, .iov_len = sizeof(resp)};
+    (void)len;
+    struct iovec iov = {.iov_base = buf, .iov_len = 1};
     union {
         struct cmsghdr hdr;
         char buf[CMSG_SPACE(sizeof(int))];
     } cbuf;
-    struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1};
-
-    if (fd >= 0) {
-        msg.msg_control = cbuf.buf;
-        msg.msg_controllen = sizeof(cbuf.buf);
-        struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
-        c->cmsg_level = SOL_SOCKET;
-        c->cmsg_type = SCM_RIGHTS;
-        c->cmsg_len = CMSG_LEN(sizeof(int));
-        memcpy(CMSG_DATA(c), &fd, sizeof(int));
-    }
-    if (sendmsg(sock, &msg, 0) != (ssize_t)sizeof(resp))
-        return errno ? -errno : -EIO;
+    struct msghdr msg = {.msg_iov = &iov,
+                         .msg_iovlen = 1,
+                         .msg_control = cbuf.buf,
+                         .msg_controllen = sizeof(cbuf.buf)};
+    *out_fd = -1;
+    ssize_t n = recvmsg(sock, &msg, MSG_CMSG_CLOEXEC);
+    if (n < 0)
+        return -errno;
+    for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c))
+        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS &&
+            c->cmsg_len == CMSG_LEN(sizeof(int)))
+            memcpy(out_fd, CMSG_DATA(c), sizeof(int));
+    *out_len = n;
     return 0;
 }
 
@@ -151,6 +107,155 @@ static int wait_exit_code(pid_t pid) {
     return WEXITSTATUS(wstatus);
 }
 
+static int reply_status(sd_varlink *link, uint32_t status) {
+    return sd_varlink_replybo(link,
+                              SD_JSON_BUILD_PAIR_UNSIGNED("status", status),
+                              SD_JSON_BUILD_PAIR_INTEGER("sysErrno", 0));
+}
+
+static int method_mount(sd_varlink *link, sd_json_variant *parameters,
+                        sd_varlink_method_flags_t flags, void *userdata) {
+    (void)flags;
+    (void)userdata;
+    struct mount_parameters {
+        uint32_t fuse_fd_index;
+        uint32_t mnt_fd_index;
+        uint32_t mount_flags;
+        uint32_t max_read;
+        uint32_t blksize;
+        const char *fsname;
+        const char *subtype;
+    } p = {};
+    static const sd_json_dispatch_field dispatch_table[] = {
+        {"fuseFileDescriptor", SD_JSON_VARIANT_UNSIGNED,
+         sd_json_dispatch_uint32,
+         offsetof(struct mount_parameters, fuse_fd_index), SD_JSON_MANDATORY},
+        {"mountpointFileDescriptor", SD_JSON_VARIANT_UNSIGNED,
+         sd_json_dispatch_uint32,
+         offsetof(struct mount_parameters, mnt_fd_index), SD_JSON_MANDATORY},
+        {"mountFlags", SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uint32,
+         offsetof(struct mount_parameters, mount_flags), SD_JSON_MANDATORY},
+        {"maxRead", SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uint32,
+         offsetof(struct mount_parameters, max_read), SD_JSON_MANDATORY},
+        {"blockSize", SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uint32,
+         offsetof(struct mount_parameters, blksize), SD_JSON_MANDATORY},
+        {"fsName", SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string,
+         offsetof(struct mount_parameters, fsname), SD_JSON_MANDATORY},
+        {"subtype", SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string,
+         offsetof(struct mount_parameters, subtype), SD_JSON_MANDATORY},
+        {},
+    };
+
+    CHECK(sd_varlink_dispatch(link, parameters, dispatch_table, &p) == 0);
+    CHECK(sd_varlink_get_n_fds(link) == 2);
+
+    uint32_t expected_flags =
+        DEFUSED_MOUNT_RDONLY | DEFUSED_MOUNT_NOEXEC | DEFUSED_MOUNT_ALLOW_DEV |
+        DEFUSED_MOUNT_SYNCHRONOUS | DEFUSED_MOUNT_DIRSYNC |
+        DEFUSED_FUSE_DEFAULT_PERMISSIONS;
+    CHECK(p.mount_flags == expected_flags);
+    CHECK(p.max_read == 4096);
+    CHECK(p.blksize == 0);
+    CHECK(strcmp(p.fsname, "test,fs") == 0);
+    CHECK(strcmp(p.subtype, "mem,fs") == 0);
+
+    int fuse_fd = sd_varlink_take_fd(link, p.fuse_fd_index);
+    CHECK(fuse_fd >= 0);
+    struct stat fuse_in_st;
+    CHECK(fstat(fuse_fd, &fuse_in_st) == 0 && S_ISCHR(fuse_in_st.st_mode));
+    close(fuse_fd);
+
+    int mnt_fd = sd_varlink_take_fd(link, p.mnt_fd_index);
+    CHECK(mnt_fd >= 0);
+    struct stat fd_st, dot_st;
+    CHECK(fstat(mnt_fd, &fd_st) == 0 && stat(".", &dot_st) == 0);
+    CHECK(S_ISDIR(fd_st.st_mode));
+    CHECK(fd_st.st_dev == dot_st.st_dev && fd_st.st_ino == dot_st.st_ino);
+    close(mnt_fd);
+
+    return reply_status(link, DEFUSED_OK);
+}
+
+static int method_unmount(sd_varlink *link, sd_json_variant *parameters,
+                          sd_varlink_method_flags_t flags, void *userdata) {
+    (void)flags;
+    const struct {
+        const char *parent;
+        const char *name;
+    } *expect = userdata;
+    struct unmount_parameters {
+        uint32_t parent_fd_index;
+        const char *name;
+        int lazy;
+    } p = {};
+    static const sd_json_dispatch_field dispatch_table[] = {
+        {"parentFileDescriptor", SD_JSON_VARIANT_UNSIGNED,
+         sd_json_dispatch_uint32,
+         offsetof(struct unmount_parameters, parent_fd_index),
+         SD_JSON_MANDATORY},
+        {"name", SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string,
+         offsetof(struct unmount_parameters, name), SD_JSON_MANDATORY},
+        {"lazy", SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_intbool,
+         offsetof(struct unmount_parameters, lazy), SD_JSON_MANDATORY},
+        {},
+    };
+
+    CHECK(sd_varlink_dispatch(link, parameters, dispatch_table, &p) == 0);
+    CHECK(sd_varlink_get_n_fds(link) == 1);
+    CHECK(p.lazy);
+    CHECK(strcmp(p.name, expect->name) == 0);
+    int parent_fd = sd_varlink_take_fd(link, p.parent_fd_index);
+    CHECK(parent_fd >= 0);
+    struct stat fd_st, parent_st;
+    CHECK(fstat(parent_fd, &fd_st) == 0 &&
+          stat(expect->parent, &parent_st) == 0);
+    CHECK(fd_st.st_dev == parent_st.st_dev && fd_st.st_ino == parent_st.st_ino);
+    close(parent_fd);
+    return reply_status(link, DEFUSED_ERR_NOT_A_FUSE_MOUNT);
+}
+
+static int serve_connection(int conn, sd_varlink_method_t method,
+                            void *userdata) {
+    sd_event *event = NULL;
+    sd_varlink_server *server = NULL;
+    int ret = sd_event_new(&event);
+    if (ret < 0)
+        return ret;
+    ret = sd_varlink_server_new(&server,
+                                SD_VARLINK_SERVER_ALLOW_FD_PASSING_INPUT |
+                                    SD_VARLINK_SERVER_INHERIT_USERDATA);
+    if (ret < 0)
+        goto out;
+    ret = sd_varlink_server_add_interface(server,
+                                          &vl_interface_website_soss_defused);
+    if (ret < 0)
+        goto out;
+    ret = sd_varlink_server_bind_method_many(
+        server, DEFUSED_VARLINK_METHOD_MOUNT, method,
+        DEFUSED_VARLINK_METHOD_UNMOUNT, method);
+    if (ret < 0)
+        goto out;
+    sd_varlink_server_set_userdata(server, userdata);
+    ret = sd_varlink_server_set_exit_on_idle(server, true);
+    if (ret < 0)
+        goto out;
+    ret = sd_varlink_server_attach_event(server, event, 0);
+    if (ret < 0)
+        goto out;
+    ret = sd_varlink_server_add_connection(server, conn, NULL);
+    if (ret < 0)
+        goto out;
+    conn = -1;
+    ret = sd_event_loop(event);
+
+out:
+    if (conn >= 0)
+        close(conn);
+    sd_varlink_server_unref(server);
+    sd_event_unref(event);
+    return ret;
+}
+
 static int test_mount(const char *client, int listen_fd) {
     int comm[2];
     CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, comm) == 0);
@@ -169,49 +274,13 @@ static int test_mount(const char *client, int listen_fd) {
     int conn = accept(listen_fd, NULL, NULL);
     CHECK(conn >= 0);
 
-    union defused_req req;
-    memset(&req, 0, sizeof(req));
-    int fds[2];
-    size_t fd_count = 0;
-    ssize_t n = -1;
-    CHECK(recv_with_fds(conn, &req, sizeof(req), &n, fds, 2, &fd_count) == 0);
-    CHECK(n == (ssize_t)sizeof(struct defused_mount_req));
-    CHECK(fd_count == 2);
-    CHECK(req.hdr.magic == DEFUSED_PROTO_MAGIC);
-    CHECK(req.hdr.version == DEFUSED_PROTO_VERSION);
-    CHECK(req.hdr.op == DEFUSED_OP_MOUNT);
-
-    /* "suid" is unsafe on defused's unprivileged path and is ignored. */
-    uint32_t expected_flags =
-        DEFUSED_MOUNT_RDONLY | DEFUSED_MOUNT_NOEXEC | DEFUSED_MOUNT_ALLOW_DEV |
-        DEFUSED_MOUNT_SYNCHRONOUS | DEFUSED_MOUNT_DIRSYNC |
-        DEFUSED_FUSE_DEFAULT_PERMISSIONS;
-    CHECK(req.mount.mount_flags == expected_flags);
-    CHECK(req.mount.max_read == 4096);
-    CHECK(req.mount.blksize == 0);
-    CHECK(strcmp(req.mount.fsname, "test,fs") == 0); /* backslash unescaped */
-    CHECK(strcmp(req.mount.subtype, "mem,fs") == 0);
-
-    CHECK(fds[0] >= 0);
-    struct stat fuse_in_st;
-    CHECK(fstat(fds[0], &fuse_in_st) == 0 && S_ISCHR(fuse_in_st.st_mode));
-    close(fds[0]);
-
-    int mnt_fd = fds[1];
-    CHECK(mnt_fd >= 0);
-    struct stat fd_st, dot_st;
-    CHECK(fstat(mnt_fd, &fd_st) == 0 && stat(".", &dot_st) == 0);
-    CHECK(S_ISDIR(fd_st.st_mode));
-    CHECK(fd_st.st_dev == dot_st.st_dev && fd_st.st_ino == dot_st.st_ino);
-    close(mnt_fd);
-
     /* Play the service's success path. The client already opened the device
      * fd it sent to the service, so the response carries no fd. */
-    CHECK(send_resp(conn, DEFUSED_OK, -1) == 0);
-    close(conn);
+    CHECK(serve_connection(conn, method_mount, NULL) == 0);
 
     char byte = 0x7f;
     int fuse_fd;
+    ssize_t n = -1;
     CHECK(recv_with_fd(comm[0], &byte, 1, &n, &fuse_fd) == 0);
     CHECK(n == 1);
     CHECK(byte == 0); /* libfuse's receive_fd() convention */
@@ -245,34 +314,18 @@ static int test_unmount(const char *client, int listen_fd) {
     int conn = accept(listen_fd, NULL, NULL);
     CHECK(conn >= 0);
 
-    union defused_req req;
-    memset(&req, 0, sizeof(req));
-    int parent_fd;
-    ssize_t n = -1;
-    CHECK(recv_with_fd(conn, &req, sizeof(req), &n, &parent_fd) == 0);
-    CHECK(n == (ssize_t)sizeof(struct defused_umount_req));
-    CHECK(req.hdr.magic == DEFUSED_PROTO_MAGIC);
-    CHECK(req.hdr.version == DEFUSED_PROTO_VERSION);
-    CHECK(req.hdr.op == DEFUSED_OP_UNMOUNT);
-    CHECK(req.umount.lazy != 0);
-    CHECK(strcmp(req.umount.name, expect_name) == 0);
-
     /* The received fd must be the *parent* directory, never the mountpoint
      * itself -- holding an fd open on the mount would make a non-lazy
      * umount2() see it as busy (that was the actual bug this test guards
      * against). */
-    CHECK(parent_fd >= 0);
-    struct stat fd_st, parent_st;
-    CHECK(fstat(parent_fd, &fd_st) == 0 &&
-          stat(expect_parent, &parent_st) == 0);
-    CHECK(fd_st.st_dev == parent_st.st_dev && fd_st.st_ino == parent_st.st_ino);
-    close(parent_fd);
+    /* An error status must surface as a nonzero exit. */
+    struct {
+        const char *parent;
+        const char *name;
+    } expect = {.parent = expect_parent, .name = expect_name};
+    CHECK(serve_connection(conn, method_unmount, &expect) == 0);
     free(dir_copy);
     free(base_copy);
-
-    /* An error status must surface as a nonzero exit. */
-    CHECK(send_resp(conn, DEFUSED_ERR_NOT_A_FUSE_MOUNT, -1) == 0);
-    close(conn);
 
     CHECK(wait_exit_code(pid) == 1);
     return failures ? -EINVAL : 0;
@@ -311,7 +364,7 @@ int main(int argc, char *argv[]) {
 
     struct sockaddr_un sa = {.sun_family = AF_UNIX};
     strcpy(sa.sun_path, sock_path);
-    int listen_fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    int listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (listen_fd < 0 || bind(listen_fd, (struct sockaddr *)&sa, sizeof(sa)) ||
         listen(listen_fd, 2)) {
         perror("listen socket");
