@@ -29,7 +29,31 @@
 #include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/vfs.h>
+#include <systemd/sd-bus.h>
+#include <systemd/sd-daemon.h>
 #include <unistd.h>
+
+/* polkit action ids checked before creating/tearing down a FUSE mount; see
+ * data/website.soss.defused.policy for their declared defaults. */
+#define DEFUSED_POLKIT_ACTION_MOUNT "website.soss.defused.mount"
+#define DEFUSED_POLKIT_ACTION_UNMOUNT "website.soss.defused.unmount"
+
+/* Mount flags reported to polkit by name in the "privileged-flags" detail
+ * (see check_polkit_authorized()), so a rule can tell which capabilities a
+ * mount request actually needs instead of only "is any capability used at
+ * all". A rule should treat any name it doesn't specifically recognize as
+ * requiring AUTH_ADMIN_KEEP -- examples/50-defused-mount-policy.rules does
+ * this by checking requested names against its own allowlist and falling
+ * back otherwise, so a rule written before a new privileged option existed
+ * denies it by default instead of silently granting it. Add future
+ * privileged options (suid, cuse, blkdev, ...) here as they're
+ * implemented. */
+static const struct {
+    uint32_t flag;
+    const char *name;
+} privileged_mount_flags[] = {
+    {DEFUSED_FUSE_ALLOW_OTHER, "allow_other"},
+};
 
 static int recv_request(int sock, union defused_req *req, ssize_t *out_len,
                         int fds[2], int *out_fd_count, struct ucred *cred)
@@ -43,6 +67,13 @@ static int install_seccomp(enum defused_op op)
     __attribute__((__warn_unused_result__));
 static int check_mount_policy(const struct defused_mount_req *req)
     __attribute__((__nonnull__(1), __warn_unused_result__));
+static int check_polkit_authorized(int sock, const struct ucred *cred,
+                                   const char *action_id, long current_mounts,
+                                   const char *privileged_flags)
+    __attribute__((__nonnull__(2, 3), __warn_unused_result__));
+static void format_privileged_flags(uint32_t mount_flags, char *buf,
+                                    size_t bufsz)
+    __attribute__((__nonnull__(2)));
 static int check_mountpoint_fstype(int mnt_fd)
     __attribute__((__warn_unused_result__));
 static int check_fuse_device_fd(int dev_fd)
@@ -68,9 +99,6 @@ static int fd_mnt_id(int proc_fd, int fd, long *out_id)
     __attribute__((__nonnull__(3), __warn_unused_result__));
 static int fuse_mount_owner(int proc_fd, long mnt_id, uid_t *out_uid)
     __attribute__((__nonnull__(3), __warn_unused_result__));
-
-static long cfg_mount_max = 1000;
-static bool cfg_user_allow_other = false;
 
 int main(int argc, char *argv[]) {
     int exit_status = EXIT_FAILURE;
@@ -186,7 +214,6 @@ static int recv_request(int sock, union defused_req *req, ssize_t *out_len,
         fprintf(stderr, "defused: recvmsg failed: %s\n", strerror(errno));
         return -errno;
     }
-    /* Ensure neither the message nor ancillary data were truncated */
     if (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) {
         fprintf(stderr, "defused: request or ancillary data was truncated\n");
         return -EMSGSIZE;
@@ -263,8 +290,6 @@ static const char *status_name(uint32_t status) {
         return "DEFUSED_ERR_BAD_OPTION";
     case DEFUSED_ERR_NOT_ALLOWED:
         return "DEFUSED_ERR_NOT_ALLOWED";
-    case DEFUSED_ERR_TOO_MANY_MOUNTS:
-        return "DEFUSED_ERR_TOO_MANY_MOUNTS";
     case DEFUSED_ERR_NOT_A_FUSE_MOUNT:
         return "DEFUSED_ERR_NOT_A_FUSE_MOUNT";
     case DEFUSED_ERR_MOUNT_FAILED:
@@ -369,15 +394,188 @@ out:
     return ret < 0 ? ret : 0;
 }
 
-/* Check the client's mount request against the configured policy */
+/* Check the client's mount request is well-formed. Policy questions like
+ * whether this caller may use allow_other are answered entirely by polkit
+ * (see check_polkit_authorized()); this only validates protocol shape. */
 static int check_mount_policy(const struct defused_mount_req *req) {
     if ((req->mount_flags & ~(uint32_t)DEFUSED_MOUNT_FLAGS_MASK) != 0)
         return -EINVAL;
 
-    if ((req->mount_flags & DEFUSED_FUSE_ALLOW_OTHER) && !cfg_user_allow_other)
-        return -EPERM;
-
     return 0;
+}
+
+/* Writes a comma-separated list of privileged_mount_flags[] names for the
+ * bits set in mount_flags into buf (empty string if none are set), for the
+ * "privileged-flags" polkit detail -- see privileged_mount_flags[]'s doc
+ * comment. buf is always NUL-terminated; names that wouldn't fit are
+ * silently dropped, which only matters if this table grows to carry far
+ * more (and far longer) names than it does today. */
+static void format_privileged_flags(uint32_t mount_flags, char *buf,
+                                    size_t bufsz) {
+    size_t len = 0;
+    buf[0] = '\0';
+
+    for (size_t i = 0;
+         i < sizeof(privileged_mount_flags) / sizeof(privileged_mount_flags[0]);
+         i++) {
+        if (!(mount_flags & privileged_mount_flags[i].flag))
+            continue;
+
+        const char *name = privileged_mount_flags[i].name;
+        size_t name_len = strlen(name);
+        size_t sep_len = len > 0 ? 1 : 0;
+        if (len + sep_len + name_len >= bufsz)
+            break;
+
+        if (sep_len)
+            buf[len++] = ',';
+        memcpy(buf + len, name, name_len);
+        len += name_len;
+        buf[len] = '\0';
+    }
+}
+
+/* Asks polkit whether the connecting process is allowed to perform
+ * action_id (one of the DEFUSED_POLKIT_ACTION_* ids). This is independent
+ * of (and in addition to) the ownership checks in handle_mount()/
+ * handle_umount(): ownership says the caller has the right to act on
+ * *this particular file or mount*, polkit says the caller is allowed to
+ * use defused for this operation, with these specific options, at all --
+ * and lets an administrator's policy (or a custom polkit rules.d script)
+ * decide that per uid/gid, interactively, or based on the details passed
+ * below.
+ *
+ * current_mounts and privileged_flags are mount-specific details (see
+ * below); pass current_mounts < 0 and/or privileged_flags NULL or "" to
+ * omit either, for actions/requests that have no use for them (unmount
+ * has no use for either; an ordinary mount request with no privileged
+ * options set has no use for privileged_flags).
+ *
+ * The subject's pid is conveyed to polkit as a pidfd obtained from this
+ * connection's SO_PEERPIDFD, not a bare pid, for the same TOCTOU reason
+ * join_peer_mnt_ns() uses SO_PEERPIDFD instead of the pid from
+ * SO_PEERCRED: a pid alone can be recycled between the credential check and
+ * whenever polkit gets around to looking at it, and a pidfd names one
+ * specific process no matter what.
+ *
+ * Fails closed: if polkit cannot be reached at all (e.g. not installed or
+ * not running), the operation is refused rather than silently falling back
+ * to the ownership check alone. */
+static int check_polkit_authorized(int sock, const struct ucred *cred,
+                                   const char *action_id, long current_mounts,
+                                   const char *privileged_flags) {
+    bool have_privileged_flags = privileged_flags && privileged_flags[0];
+    int pidfd = -1;
+    socklen_t pidfd_len = sizeof(pidfd);
+    if (getsockopt(sock, SOL_SOCKET, SO_PEERPIDFD, &pidfd, &pidfd_len) == -1) {
+        fprintf(stderr, "defused: SO_PEERPIDFD failed: %s\n", strerror(errno));
+        return -errno;
+    }
+
+    sd_bus *bus = NULL;
+    sd_bus_message *call = NULL;
+    sd_bus_message *reply = NULL;
+    sd_bus_error error = SD_BUS_ERROR_NULL;
+    int ret;
+
+    ret = sd_bus_open_system(&bus);
+    if (ret < 0) {
+        fprintf(stderr, "defused: failed to connect to the system bus: %s\n",
+                strerror(-ret));
+        goto out;
+    }
+
+    ret = sd_bus_message_new_method_call(
+        bus, &call, "org.freedesktop.PolicyKit1",
+        "/org/freedesktop/PolicyKit1/Authority",
+        "org.freedesktop.PolicyKit1.Authority", "CheckAuthorization");
+    if (ret < 0)
+        goto out;
+
+    /* subject: (sa{sv}) = ("unix-process", {"uid": <i>, "pidfd": <h>}).
+     * Passing both "uid" and "pidfd" (rather than "pid"/"start-time") makes
+     * polkit resolve the subject from the pidfd directly -- see
+     * polkit_subject_new_for_gvariant_invocation() in polkit's
+     * src/polkit/polkitsubject.c. */
+    ret = sd_bus_message_append(call, "(sa{sv})s", "unix-process", 2u, "uid",
+                                "i", (int32_t)cred->uid, "pidfd", "h", pidfd,
+                                action_id);
+    if (ret < 0)
+        goto out;
+
+    /* details: a{ss}. uid, gid, and pid are deliberately not included: a
+     * rule already gets those from the subject polkit itself constructs
+     * (subject.uid, subject.groups, subject.pid), no need to duplicate them
+     * here. current-mounts and privileged-flags (mount only, see above) are
+     * the only things a rule can't get any other way, and are each omitted
+     * entirely when the caller has nothing to say -- see
+     * examples/50-defused-mount-policy.rules for a rule that uses both. */
+    ret = sd_bus_message_open_container(call, 'a', "{ss}");
+    if (ret < 0)
+        goto out;
+    char mounts_buf[32];
+    if (current_mounts >= 0) {
+        snprintf(mounts_buf, sizeof(mounts_buf), "%ld", current_mounts);
+        ret = sd_bus_message_append(call, "{ss}", "current-mounts", mounts_buf);
+        if (ret < 0)
+            goto out;
+    }
+    if (have_privileged_flags) {
+        ret = sd_bus_message_append(call, "{ss}", "privileged-flags",
+                                    privileged_flags);
+        if (ret < 0)
+            goto out;
+    }
+    ret = sd_bus_message_close_container(call);
+    if (ret < 0)
+        goto out;
+
+    /* flags: CHECK_AUTHORIZATION_FLAGS_ALLOW_USER_INTERACTION (1), so that
+     * an agent in the caller's session can answer an AUTH_ADMIN_KEEP-style
+     * challenge instead of it failing outright. cancellation_id: unused, we
+     * never call CancelCheckAuthorization. */
+    ret = sd_bus_message_append(call, "us", (uint32_t)1, "");
+    if (ret < 0)
+        goto out;
+
+    ret = sd_bus_call(bus, call, 0, &error, &reply);
+    if (ret < 0) {
+        fprintf(stderr, "defused: polkit CheckAuthorization failed: %s\n",
+                error.message ? error.message : strerror(-ret));
+        goto out;
+    }
+
+    int is_authorized = 0;
+    int is_challenge = 0;
+    ret = sd_bus_message_enter_container(reply, 'r', "bba{ss}");
+    if (ret < 0)
+        goto out;
+    ret = sd_bus_message_read(reply, "bb", &is_authorized, &is_challenge);
+    if (ret < 0)
+        goto out;
+    ret = sd_bus_message_skip(reply, "a{ss}");
+    if (ret < 0)
+        goto out;
+    ret = sd_bus_message_exit_container(reply);
+    if (ret < 0)
+        goto out;
+
+    if (!is_authorized) {
+        fprintf(stderr, "defused: polkit denied %s to uid %u (challenge=%d)\n",
+                action_id, (unsigned)cred->uid, is_challenge);
+        ret = -EACCES;
+        goto out;
+    }
+    ret = 0;
+
+out:
+    sd_bus_error_free(&error);
+    sd_bus_message_unref(call);
+    sd_bus_message_unref(reply);
+    sd_bus_flush_close_unref(bus);
+    if (pidfd >= 0)
+        close(pidfd);
+    return ret;
 }
 
 static int check_mountpoint_fstype(int mnt_fd) {
@@ -579,8 +777,8 @@ static int handle_mount(int sock, const struct defused_mount_req *req,
         ret = -sys_errno;
         goto fail;
     }
-    /* Callers may only mount on writable mountpoints they own,
-     * and only over filesystems libfuse permits for unprivileged mounts. */
+    /* Ownership policy diverges from libfuse's setuid fusermount3 here --
+     * see doc/protocol.md. */
     if (st.st_uid != cred->uid || !(st.st_mode & S_IWUSR) ||
         (S_ISDIR(st.st_mode) && !(st.st_mode & S_IXUSR))) {
         status = DEFUSED_ERR_NOT_ALLOWED;
@@ -600,22 +798,29 @@ static int handle_mount(int sock, const struct defused_mount_req *req,
         goto fail;
     }
 
-    if (cfg_mount_max != -1) {
-        errno = 0;
-        int n = count_fuse_fs("defused");
+    /* Handed to polkit below so a rule can implement its own mount-count
+     * policy. */
+    errno = 0;
+    int current_mounts = count_fuse_fs("defused");
+    if (current_mounts < 0) {
+        int saved_errno = errno ? errno : EIO;
+        status = DEFUSED_ERR_MOUNT_FAILED;
+        sys_errno = saved_errno;
+        ret = -saved_errno;
+        goto fail;
+    }
 
-        if (n < 0) {
-            int saved_errno = errno ? errno : EIO;
-            status = DEFUSED_ERR_MOUNT_FAILED;
-            sys_errno = saved_errno;
-            ret = -saved_errno;
-            goto fail;
-        }
-        if (n >= cfg_mount_max) {
-            status = DEFUSED_ERR_TOO_MANY_MOUNTS;
-            ret = -EUSERS;
-            goto fail;
-        }
+    char privileged_flags[128];
+    format_privileged_flags(req->mount_flags, privileged_flags,
+                            sizeof(privileged_flags));
+
+    ret = check_polkit_authorized(sock, cred, DEFUSED_POLKIT_ACTION_MOUNT,
+                                  current_mounts, privileged_flags);
+    if (ret < 0) {
+        status =
+            ret == -EACCES ? DEFUSED_ERR_NOT_ALLOWED : DEFUSED_ERR_MOUNT_FAILED;
+        sys_errno = -ret;
+        goto fail;
     }
 
     ret = join_peer_mnt_ns(sock, DEFUSED_OP_MOUNT);
@@ -694,6 +899,20 @@ static int handle_umount(int sock, const struct defused_umount_req *req,
         goto out;
     }
 
+    /* Before join_peer_mnt_ns(): the seccomp filter it installs has no
+     * room for the syscalls talking to polkit over D-Bus needs. This asks
+     * only whether the caller may use unmount at all -- whether this
+     * specific mount is theirs to tear down is the ownership check below,
+     * which needs the caller's mount namespace and so can't move here. */
+    ret = check_polkit_authorized(sock, cred, DEFUSED_POLKIT_ACTION_UNMOUNT, -1,
+                                  NULL);
+    if (ret < 0) {
+        status = ret == -EACCES ? DEFUSED_ERR_NOT_ALLOWED
+                                : DEFUSED_ERR_UNMOUNT_FAILED;
+        sys_errno = -ret;
+        goto out;
+    }
+
     ret = join_peer_mnt_ns(sock, DEFUSED_OP_UNMOUNT);
     if (ret < 0) {
         status = DEFUSED_ERR_SETNS_FAILED;
@@ -701,8 +920,7 @@ static int handle_umount(int sock, const struct defused_umount_req *req,
         goto out;
     }
 
-    /* The fd's mount must actually be FUSE, and be recorded as mounted
-     * by this caller. Both facts come from the same mountinfo line. */
+    /* Both checks below come from the same /proc/self/mountinfo line. */
     uid_t owner;
     ret = fuse_mount_owner(proc_fd, mnt_id, &owner);
     if (ret < 0) {
@@ -715,7 +933,6 @@ static int handle_umount(int sock, const struct defused_umount_req *req,
         goto out;
     }
 
-    /* Unmount via procfs fd, parent file descriptor, and filename. */
     if (fchdir(proc_fd) == -1) {
         status = DEFUSED_ERR_UNMOUNT_FAILED;
         sys_errno = errno;
@@ -750,29 +967,19 @@ out:
 }
 
 static void usage(const char *prog) {
-    fprintf(
-        stderr,
-        "usage: %s [--mount-max=N] [--user-allow-other]\n"
-        "\n"
-        "Handles one mount/unmount request on the socket-activation fd (see\n"
-        "defused.h); meant to be spawned by systemd socket activation, one\n"
-        "process per connection. There is no config file -- these two\n"
-        "options are the command-line equivalents of fuse.conf's mount_max\n"
-        "and user_allow_other.\n"
-        "\n"
-        "  --mount-max=N       cap on simultaneous FUSE mounts; -1 disables\n"
-        "                      the limit (default: 1000)\n"
-        "  --user-allow-other  let callers pass -o allow_other (default: "
-        "off)\n",
-        prog);
+    fprintf(stderr,
+            "usage: %s\n"
+            "\n"
+            "Handles one mount/unmount request on the socket-activation fd\n"
+            "(see defused.h); meant to be spawned by systemd socket\n"
+            "activation, one process per connection. There are no options --\n"
+            "policy decisions are made per request by polkit; see\n"
+            "doc/protocol.md.\n",
+            prog);
 }
 
 static int parse_args(int argc, char *argv[]) {
-    enum { OPT_MOUNT_MAX = 256, OPT_USER_ALLOW_OTHER };
-
     static const struct option opts[] = {
-        {"mount-max", required_argument, NULL, OPT_MOUNT_MAX},
-        {"user-allow-other", no_argument, NULL, OPT_USER_ALLOW_OTHER},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -782,20 +989,6 @@ static int parse_args(int argc, char *argv[]) {
         if (c == -1)
             break;
         switch (c) {
-        case OPT_MOUNT_MAX: {
-            long v;
-
-            if (libfuse_strtol(optarg, &v) < 0 || (v < 0 && v != -1)) {
-                fprintf(stderr, "%s: invalid --mount-max value: %s\n", argv[0],
-                        optarg);
-                return -EINVAL;
-            }
-            cfg_mount_max = v;
-            break;
-        }
-        case OPT_USER_ALLOW_OTHER:
-            cfg_user_allow_other = true;
-            break;
         case 'h':
             usage(argv[0]);
             exit(0);
@@ -807,42 +1000,22 @@ static int parse_args(int argc, char *argv[]) {
     return 0;
 }
 
-#define SD_LISTEN_FDS_START 3
-
 /* Implements systemd socket activation */
 static int socket_activation_fd(int *out_fd) {
-    const char *pid_str = getenv("LISTEN_PID");
-    const char *fds_str = getenv("LISTEN_FDS");
-    if (!pid_str || !fds_str) {
-        fprintf(stderr, "defused: not socket-activated "
-                        "($LISTEN_PID/$LISTEN_FDS not set)\n");
-        return -EINVAL;
+    int n = sd_listen_fds(1 /* unset_environment */);
+    if (n < 0) {
+        fprintf(stderr, "defused: sd_listen_fds failed: %s\n", strerror(-n));
+        return n;
     }
-
-    long pid;
-    if (libfuse_strtol(pid_str, &pid) < 0 || pid != (long)getpid()) {
+    if (n != 1) {
         fprintf(stderr,
-                "defused: $LISTEN_PID (%s) doesn't match our pid (%d)\n",
-                pid_str, (int)getpid());
+                "defused: not socket-activated with exactly one fd (got "
+                "%d) -- $LISTEN_PID/$LISTEN_FDS not set or wrong?\n",
+                n);
         return -EINVAL;
     }
 
-    long nfds;
-    if (libfuse_strtol(fds_str, &nfds) < 0 || nfds != 1) {
-        fprintf(stderr,
-                "defused: expected exactly one socket-activation fd , got "
-                "$LISTEN_FDS=%s\n",
-                fds_str);
-        return -EINVAL;
-    }
-
-    unsetenv("LISTEN_PID");
-    unsetenv("LISTEN_FDS");
-    unsetenv("LISTEN_FDNAMES");
-
-    int fd = SD_LISTEN_FDS_START;
-    fcntl(fd, F_SETFD, FD_CLOEXEC);
-    *out_fd = fd;
+    *out_fd = SD_LISTEN_FDS_START;
     return 0;
 }
 

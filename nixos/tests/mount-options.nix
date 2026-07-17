@@ -14,13 +14,7 @@ in
 pkgs.testers.nixosTest {
   name = "defused-mount-options";
 
-  nodes.machine =
-    { ... }:
-    {
-      imports = [ common.baseNode ];
-
-      services.defused.extraArgs = [ "--user-allow-other" ];
-    };
+  nodes.machine = common.baseNode;
 
   testScript = ''
     start_all()

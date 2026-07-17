@@ -22,7 +22,6 @@ pkgs.testers.nixosTest {
       services.defused = {
         enable = true;
         package = package;
-        extraArgs = [ "--mount-max=77" ];
       };
 
       users.users.alice = {
@@ -44,10 +43,6 @@ pkgs.testers.nixosTest {
     machine.succeed(
         "grep '^ExecStart=' /etc/systemd/system/defused@.service | "
         "grep -F '${package}/lib/defused/defused'"
-    )
-    machine.succeed(
-        "grep '^ExecStart=' /etc/systemd/system/defused@.service | "
-        "grep -F -- '--mount-max=77'"
     )
 
     machine.succeed(

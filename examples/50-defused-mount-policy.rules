@@ -1,0 +1,52 @@
+// SPDX-FileCopyrightText: 2026 Skye Soss <skye@soss.website>
+//
+// SPDX-License-Identifier: MIT-0
+
+// Sample polkit rule for website.soss.defused.mount (see doc/protocol.md).
+//
+// The shipped default (data/website.soss.defused.policy) is
+// AUTH_ADMIN_KEEP for every request, which is safe but requires an
+// administrator to authenticate interactively for every single FUSE
+// mount. Install this file as e.g.
+// /etc/polkit-1/rules.d/50-defused-mount-policy.rules to instead grant
+// ordinary mounts automatically -- fewer than 100 concurrent FUSE mounts
+// for this caller, and using no privileged option this rule doesn't
+// explicitly recognize -- while still falling back to the interactive
+// AUTH_ADMIN_KEEP default for anything past that limit or that isn't
+// on the allowlist below.
+//
+// current-mounts and privileged-flags are details defused passes to
+// every CheckAuthorization call for the mount action; see
+// doc/protocol.md for the full list. privileged-flags is a
+// comma-separated list of the names of privileged mount options the
+// request actually sets (currently only "allow_other" exists), omitted
+// entirely when the request sets none. Checking it against an explicit
+// allowlist -- rather than trusting anything not specifically denied --
+// means a rule written before some future privileged option existed
+// still falls back to AUTH_ADMIN_KEEP for it instead of silently
+// granting it.
+polkit.addRule(function(action, subject) {
+    if (action.id != "website.soss.defused.mount")
+        return polkit.Result.NOT_HANDLED;
+
+    // Privileged options this rule is willing to grant automatically.
+    // Add a name here only once you've decided it's safe to hand out
+    // without interactive authentication under this rule's other
+    // conditions (e.g. "allow_other": add it here to also require the
+    // caller be in a particular group, not just under the mount limit).
+    var allowedPrivilegedFlags = [];
+
+    var privilegedFlags = action.lookup("privileged-flags");
+    if (privilegedFlags) {
+        var requested = privilegedFlags.split(",");
+        for (var i = 0; i < requested.length; i++) {
+            if (allowedPrivilegedFlags.indexOf(requested[i]) < 0)
+                return polkit.Result.AUTH_ADMIN_KEEP;
+        }
+    }
+
+    if (parseInt(action.lookup("current-mounts")) < 100)
+        return polkit.Result.YES;
+
+    return polkit.Result.AUTH_ADMIN_KEEP;
+});

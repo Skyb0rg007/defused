@@ -28,4 +28,8 @@
   file-mountpoint = import ./file-mountpoint.nix {
     inherit self pkgs system;
   };
+
+  polkit = import ./polkit.nix {
+    inherit self pkgs system;
+  };
 }

@@ -12,6 +12,7 @@ project(
 
 cc = meson.get_compiler('c')
 seccomp_dep = cc.find_library('seccomp', has_headers : ['seccomp.h'])
+systemd_dep = dependency('libsystemd')
 
 # XXX: Check for function availability
 common_c_args = ['-DHAVE_CLOSE_RANGE']
@@ -21,7 +22,7 @@ defused_exe = executable(
   'src/defused.c',
   'src/util.c',
   c_args : common_c_args,
-  dependencies : [seccomp_dep],
+  dependencies : [seccomp_dep, systemd_dep],
   install_dir : get_option('prefix') / 'lib/defused',
   install : true,
 )
@@ -32,6 +33,11 @@ fusermount3_exe = executable(
   'src/util.c',
   c_args : common_c_args + ['-DDEFUSED_VERSION="@0@"'.format(meson.project_version())],
   install : true,
+)
+
+install_data(
+  'data/website.soss.defused.policy',
+  install_dir : get_option('datadir') / 'polkit-1/actions',
 )
 
 ## Tests ##

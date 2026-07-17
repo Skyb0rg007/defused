@@ -30,11 +30,13 @@ in
       extraArgs = lib.mkOption {
         type = lib.types.listOf lib.types.str;
         default = [ ];
-        example = [
-          "--user-allow-other"
-          "--mount-max=500"
-        ];
-        description = "Additional command-line arguments passed to defused.";
+        description = ''
+          Additional command-line arguments passed to defused. defused
+          currently takes no flags beyond --help -- mount policy is decided
+          per request by polkit, see security.polkit.extraConfig and
+          examples/50-defused-mount-policy.rules. Kept for forward
+          compatibility.
+        '';
       };
     };
 
@@ -42,6 +44,11 @@ in
 
   config = lib.mkIf cfg.enable {
     environment.systemPackages = [ package ];
+
+    # defused asks polkit whether a client may create a FUSE mount at all
+    # (see doc/protocol.md); polkitd has to actually be running for that
+    # check to ever succeed, rather than fail closed.
+    security.polkit.enable = lib.mkDefault true;
 
     systemd.sockets.defused = {
       description = "defused FUSE mount service listening socket";
@@ -58,6 +65,8 @@ in
     systemd.services."defused@" = {
       description = "defused FUSE mount service";
       documentation = [ "https://github.com/Skyb0rg007/defused" ];
+      wants = [ "polkit.service" ];
+      after = [ "polkit.service" ];
 
       serviceConfig = {
         ExecStart = lib.escapeShellArgs ([ "${package}/lib/defused/defused" ] ++ cfg.extraArgs);

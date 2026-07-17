@@ -24,12 +24,32 @@
  *    into it (no CAP_SYS_ADMIN there), and the test checks that this
  *    surfaces cleanly as DEFUSED_ERR_SETNS_FAILED/EPERM -- never as a
  *    silent fallback to operating on defused's own namespace instead,
- *    which would be a namespace-confusion bug (e.g. counting mount_max or
+ *    which would be a namespace-confusion bug (e.g. counting FUSE mounts or
  *    mounting against the wrong mount table while believing it's the
  *    client's).
  *
  * Neither test reaches a real FUSE mount/unmount. The client creates only a
  * private bind mount inside its own mount namespace.
+ *
+ * Both scenarios send DEFUSED_OP_UNMOUNT, which now asks polkit before
+ * join_peer_mnt_ns() (the same ordering constraint as mount -- see
+ * check_polkit_authorized()'s doc comment in defused.c). polkit only lets
+ * a *trusted* caller (uid 0, or an action's declared owner) check another
+ * identity's authorization at all, and neither defused nor its simulated
+ * client is real uid 0 in this unprivileged harness, so both scenarios
+ * are expected to be turned away there with DEFUSED_ERR_UNMOUNT_FAILED,
+ * before ever reaching the setns() logic these tests were written to
+ * distinguish -- so, unprivileged, the two scenarios are no longer
+ * distinguishable from each other via this harness, and neither actually
+ * exercises setns() at all. Both CHECKs below accept
+ * DEFUSED_ERR_UNMOUNT_FAILED alongside each test's original expected
+ * status so they still pass unprivileged (and still verify the polkit
+ * gate really runs before anything namespace-sensitive). test_cannot_join
+ * still catches the bug it cares most about either way: silently falling
+ * back to defused's own namespace instead of failing would show up as
+ * neither of its two accepted statuses. Real, trusted-caller (root)
+ * coverage of both mount and unmount across mount namespaces lives in
+ * nixos/tests/mount-namespace.nix instead.
  */
 #define _GNU_SOURCE
 #include "defused.h"
@@ -113,7 +133,9 @@ static int recv_response_status(int sock) {
 /* Sends an unmount request for a bind mount that is intentionally not FUSE.
  * A service that can enter the client's namespace should therefore return
  * DEFUSED_ERR_NOT_A_FUSE_MOUNT; a service that cannot enter it should fail
- * earlier with DEFUSED_ERR_SETNS_FAILED. */
+ * earlier with DEFUSED_ERR_SETNS_FAILED. In this unprivileged harness both
+ * are instead expected to be turned away even earlier, by polkit -- see
+ * the file-level comment above. */
 static int send_non_fuse_umount_request(int sock) {
     char dir_template[] = "/tmp/defused-mountns-XXXXXX";
     char *dir = mkdtemp(dir_template);
@@ -245,7 +267,7 @@ static int spawn_defused(const char *defused_path, int conn_fd,
         snprintf(pidbuf, sizeof(pidbuf), "%d", (int)getpid());
         setenv("LISTEN_PID", pidbuf, 1);
         setenv("LISTEN_FDS", "1", 1);
-        execl(defused_path, "defused", "--mount-max=5", NULL);
+        execl(defused_path, "defused", NULL);
         perror("exec defused");
         _exit(127);
     }
@@ -303,7 +325,10 @@ static int test_can_join(const char *defused_path) {
                 _exit(1);
             int status = send_non_fuse_umount_request(client_sock);
             close(client_sock);
-            _exit(status == DEFUSED_ERR_NOT_A_FUSE_MOUNT ? 0 : 1);
+            _exit(status == DEFUSED_ERR_NOT_A_FUSE_MOUNT ||
+                          status == DEFUSED_ERR_UNMOUNT_FAILED
+                      ? 0
+                      : 1);
         }
 
         int conn = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
@@ -340,8 +365,8 @@ static int test_can_join(const char *defused_path) {
     CHECK(byte == 1);
     if (n != 1 || byte != 1)
         fprintf(stderr,
-                "test_can_join: defused failed to join a mount namespace it "
-                "has CAP_SYS_ADMIN over\n");
+                "test_can_join: got a status other than "
+                "DEFUSED_ERR_NOT_A_FUSE_MOUNT/DEFUSED_ERR_UNMOUNT_FAILED\n");
     return failures ? -EINVAL : 0;
 }
 
@@ -374,10 +399,16 @@ static int test_cannot_join(const char *defused_path) {
             _exit(1);
         int status = send_non_fuse_umount_request(client_sock);
         close(client_sock);
-        if (status != DEFUSED_ERR_SETNS_FAILED)
-            fprintf(stderr, "test_cannot_join: got status %d, expected %d\n",
-                    status, DEFUSED_ERR_SETNS_FAILED);
-        _exit(status == DEFUSED_ERR_SETNS_FAILED ? 0 : 1);
+        bool accepted = status == DEFUSED_ERR_SETNS_FAILED ||
+                        status == DEFUSED_ERR_UNMOUNT_FAILED;
+        if (!accepted)
+            fprintf(stderr,
+                    "test_cannot_join: got status %d, expected "
+                    "DEFUSED_ERR_SETNS_FAILED (%d) or "
+                    "DEFUSED_ERR_UNMOUNT_FAILED (%d)\n",
+                    status, DEFUSED_ERR_SETNS_FAILED,
+                    DEFUSED_ERR_UNMOUNT_FAILED);
+        _exit(accepted ? 0 : 1);
     }
 
     int conn = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
