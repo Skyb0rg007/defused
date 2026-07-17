@@ -214,7 +214,6 @@ static int recv_request(int sock, union defused_req *req, ssize_t *out_len,
         fprintf(stderr, "defused: recvmsg failed: %s\n", strerror(errno));
         return -errno;
     }
-    /* Ensure neither the message nor ancillary data were truncated */
     if (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) {
         fprintf(stderr, "defused: request or ancillary data was truncated\n");
         return -EMSGSIZE;
@@ -778,8 +777,8 @@ static int handle_mount(int sock, const struct defused_mount_req *req,
         ret = -sys_errno;
         goto fail;
     }
-    /* Callers may only mount on writable mountpoints they own,
-     * and only over filesystems libfuse permits for unprivileged mounts. */
+    /* Ownership policy diverges from libfuse's setuid fusermount3 here --
+     * see doc/protocol.md. */
     if (st.st_uid != cred->uid || !(st.st_mode & S_IWUSR) ||
         (S_ISDIR(st.st_mode) && !(st.st_mode & S_IXUSR))) {
         status = DEFUSED_ERR_NOT_ALLOWED;
@@ -921,8 +920,7 @@ static int handle_umount(int sock, const struct defused_umount_req *req,
         goto out;
     }
 
-    /* The fd's mount must actually be FUSE, and be recorded as mounted
-     * by this caller. Both facts come from the same mountinfo line. */
+    /* Both checks below come from the same /proc/self/mountinfo line. */
     uid_t owner;
     ret = fuse_mount_owner(proc_fd, mnt_id, &owner);
     if (ret < 0) {
@@ -935,7 +933,6 @@ static int handle_umount(int sock, const struct defused_umount_req *req,
         goto out;
     }
 
-    /* Unmount via procfs fd, parent file descriptor, and filename. */
     if (fchdir(proc_fd) == -1) {
         status = DEFUSED_ERR_UNMOUNT_FAILED;
         sys_errno = errno;
