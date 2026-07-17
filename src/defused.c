@@ -313,9 +313,9 @@ out:
  * Restrict ourselves before that to make sure nothing bad happens. */
 static int install_seccomp(enum defused_op op) {
     static const int allowed_syscalls[] = {
-        SCMP_SYS(read),  SCMP_SYS(write),      SCMP_SYS(close),
-        SCMP_SYS(fstat), SCMP_SYS(sendmsg),    SCMP_SYS(exit),
-        SCMP_SYS(fcntl), SCMP_SYS(exit_group), SCMP_SYS(setns),
+        SCMP_SYS(read),         SCMP_SYS(write),      SCMP_SYS(close),
+        SCMP_SYS(fstat),        SCMP_SYS(sendmsg),    SCMP_SYS(exit),
+        SCMP_SYS(fcntl),        SCMP_SYS(exit_group), SCMP_SYS(setns),
         SCMP_SYS(rt_sigreturn),
     };
     static const int mount_syscalls[] = {

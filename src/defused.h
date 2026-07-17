@@ -23,7 +23,7 @@
 
 #define DEFUSED_SOCKET_PATH "/run/defused/defused.sock"
 
-#define DEFUSED_PROTO_MAGIC   UINT32_C(0x44465531) /* "DFU1" */
+#define DEFUSED_PROTO_MAGIC UINT32_C(0x44465531) /* "DFU1" */
 #define DEFUSED_PROTO_VERSION 1u
 
 /* The operation to perform */
@@ -83,10 +83,10 @@ enum defused_mount_flag {
     DEFUSED_FUSE_DEFAULT_PERMISSIONS = 1u << 9,
 };
 #define DEFUSED_MOUNT_FLAGS_MASK                                               \
-    (DEFUSED_MOUNT_RDONLY | DEFUSED_MOUNT_ALLOW_DEV | DEFUSED_MOUNT_NOEXEC |  \
-     DEFUSED_MOUNT_NOATIME | DEFUSED_MOUNT_NODIRATIME |                       \
-     DEFUSED_MOUNT_NOSYMFOLLOW | DEFUSED_MOUNT_SYNCHRONOUS |                  \
-     DEFUSED_MOUNT_DIRSYNC | DEFUSED_FUSE_ALLOW_OTHER |                       \
+    (DEFUSED_MOUNT_RDONLY | DEFUSED_MOUNT_ALLOW_DEV | DEFUSED_MOUNT_NOEXEC |   \
+     DEFUSED_MOUNT_NOATIME | DEFUSED_MOUNT_NODIRATIME |                        \
+     DEFUSED_MOUNT_NOSYMFOLLOW | DEFUSED_MOUNT_SYNCHRONOUS |                   \
+     DEFUSED_MOUNT_DIRSYNC | DEFUSED_FUSE_ALLOW_OTHER |                        \
      DEFUSED_FUSE_DEFAULT_PERMISSIONS)
 
 /*
