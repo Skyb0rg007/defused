@@ -15,6 +15,9 @@ on:
       - 'flake.lock'
       - '.github/workflows/build-nix.yml'
 
+permissions:
+  contents: read
+
 jobs:
   build-nix:
     runs-on: ${{ matrix.os }}
