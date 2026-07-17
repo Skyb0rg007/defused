@@ -60,7 +60,6 @@ static const struct {
 
 struct request_context {
     int sock;
-    int proc_fd;
 };
 
 struct prepared_mount {
@@ -114,8 +113,8 @@ static int handle_mount(sd_varlink *link, int sock,
     __attribute__((__nonnull__(1, 3, 6), __warn_unused_result__));
 static int handle_umount(sd_varlink *link, int sock,
                          const struct defused_umount_req *req, int parent_fd,
-                         int proc_fd, const struct ucred *cred)
-    __attribute__((__nonnull__(1, 3, 6), __warn_unused_result__));
+                         const struct ucred *cred)
+    __attribute__((__nonnull__(1, 3, 5), __warn_unused_result__));
 static void usage(const char *prog) __attribute__((__nonnull__(1)));
 static int parse_args(int argc, char *argv[])
     __attribute__((__nonnull__(2), __warn_unused_result__));
@@ -135,14 +134,6 @@ int main(int argc, char *argv[]) {
     ret = socket_activation_fd(&sock);
     if (ret < 0)
         return EXIT_FAILURE;
-
-    /* Keep a handle to the service's procfs before entering the client's
-     * mount namespace. */
-    int proc_fd = open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (proc_fd == -1) {
-        fprintf(stderr, "defused: failed to open /proc: %s\n", strerror(errno));
-        goto out;
-    }
 
     sd_event *event = NULL;
     sd_varlink_server *server = NULL;
@@ -177,7 +168,7 @@ int main(int argc, char *argv[]) {
         goto out_unref_server;
     }
 
-    struct request_context ctx = {.sock = sock, .proc_fd = proc_fd};
+    struct request_context ctx = {.sock = sock};
     sd_varlink_server_set_userdata(server, &ctx);
     ret = sd_varlink_server_set_exit_on_idle(server, true);
     if (ret < 0) {
@@ -209,8 +200,6 @@ out_unref_server:
     sd_varlink_server_unref(server);
     sd_event_unref(event);
 out:
-    if (proc_fd >= 0)
-        close(proc_fd);
     if (sock >= 0)
         close(sock);
     return exit_status;
@@ -356,8 +345,7 @@ static int varlink_unmount(sd_varlink *link, sd_json_variant *parameters,
         ret = -errno;
         fprintf(stderr, "defused: SO_PEERCRED failed: %s\n", strerror(errno));
     } else
-        ret = handle_umount(link, ctx->sock, &req, parent_fd, ctx->proc_fd,
-                            &cred);
+        ret = handle_umount(link, ctx->sock, &req, parent_fd, &cred);
 
     close(parent_fd);
     return ret;
@@ -877,17 +865,28 @@ fail:
 
 static int handle_umount(sd_varlink *link, int sock,
                          const struct defused_umount_req *req, int parent_fd,
-                         int proc_fd, const struct ucred *cred) {
+                         const struct ucred *cred) {
     uint32_t status = DEFUSED_OK;
     int sys_errno = 0;
     int ret = 0;
     int mnt_fd = -1;
+    int proc_fd = -1;
 
     if (strnlen(req->name, DEFUSED_MAX_FILENAME) == DEFUSED_MAX_FILENAME ||
         req->name[0] == '\0' || strchr(req->name, '/') ||
         !strcmp(req->name, ".") || !strcmp(req->name, "..")) {
         status = DEFUSED_ERR_MALFORMED;
         ret = -EINVAL;
+        goto out;
+    }
+
+    /* Keep a handle to the service's procfs before entering the client's
+     * mount namespace. */
+    proc_fd = open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (proc_fd == -1) {
+        status = DEFUSED_ERR_UNMOUNT_FAILED;
+        sys_errno = errno;
+        ret = -errno;
         goto out;
     }
 
@@ -958,6 +957,8 @@ static int handle_umount(sd_varlink *link, int sock,
 out:
     if (mnt_fd >= 0)
         close(mnt_fd);
+    if (proc_fd >= 0)
+        close(proc_fd);
     if (ret < 0)
         fprintf(
             stderr,
