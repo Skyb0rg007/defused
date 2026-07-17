@@ -173,7 +173,7 @@ static int send_non_fuse_umount_request(int sock) {
         status = ret;
         goto out;
     }
-    ret = sd_varlink_push_fd(link, parent_fd);
+    ret = sd_varlink_push_dup_fd(link, parent_fd);
     if (ret < 0) {
         status = ret;
         goto out;

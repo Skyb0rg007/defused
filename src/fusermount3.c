@@ -456,8 +456,8 @@ static int transact(uint32_t op, const union defused_req *req, const int *fds,
     if (ret < 0)
         goto out_unref_reply;
     if (error_id != NULL) {
-        fprintf(stderr, "%s: unexpected reply from the defused service\n",
-                progname);
+        fprintf(stderr, "%s: defused service returned a Varlink error: %s\n",
+                progname, error_id);
         ret = -EBADMSG;
         goto out_unref_reply;
     }

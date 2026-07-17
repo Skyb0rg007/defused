@@ -71,10 +71,10 @@ static int send_mount_req(int sock, const struct defused_mount_req *req,
     ret = sd_varlink_set_allow_fd_passing_output(link, true);
     if (ret < 0)
         goto out;
-    ret = sd_varlink_push_fd(link, dev_fd);
+    ret = sd_varlink_push_dup_fd(link, dev_fd);
     if (ret < 0)
         goto out;
-    ret = sd_varlink_push_fd(link, mnt_fd);
+    ret = sd_varlink_push_dup_fd(link, mnt_fd);
     if (ret < 0)
         goto out;
 

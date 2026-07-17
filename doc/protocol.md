@@ -135,7 +135,7 @@ sysErrno: int
 | Value | Name | Meaning |
 | --- | --- | --- |
 | 0 | `DEFUSED_OK` | Success |
-| 1 | `DEFUSED_ERR_MALFORMED` | Bad Varlink fd indices, wrong fd count, or a request-level validation failure |
+| 1 | `DEFUSED_ERR_MALFORMED` | Request-level validation failure after Varlink parsing and fd binding |
 | 2 | `DEFUSED_ERR_BAD_OPTION` | `mountFlags` outside its allowed mask |
 | 3 | `DEFUSED_ERR_NOT_ALLOWED` | The mountpoint/mount is not the caller's to use, or polkit denied the operation |
 | 4 | `DEFUSED_ERR_NOT_A_FUSE_MOUNT` | Unmount target is not a FUSE mount |
@@ -143,9 +143,9 @@ sysErrno: int
 | 6 | `DEFUSED_ERR_UNMOUNT_FAILED` | `umount2(2)` failed, or polkit could not be reached; see `sysErrno` |
 | 7 | `DEFUSED_ERR_SETNS_FAILED` | Could not join the caller's mount namespace; see `sysErrno` |
 
-Varlink protocol-level problems, such as missing fields or wrong field types,
-are returned as standard Varlink errors by libsystemd rather than as a
-`defused_status`.
+Varlink protocol-level problems, such as missing fields, wrong field types, bad
+fd indices, or wrong fd count, are returned as standard Varlink errors by
+libsystemd rather than as a `defused_status`.
 
 ## Why Varlink
 
