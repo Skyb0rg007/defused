@@ -20,6 +20,7 @@ common_c_args = ['-DHAVE_CLOSE_RANGE']
 defused_exe = executable(
   'defused',
   'src/defused.c',
+  'src/defused-varlink.c',
   'src/util.c',
   c_args : common_c_args,
   dependencies : [seccomp_dep, systemd_dep],
@@ -30,8 +31,10 @@ defused_exe = executable(
 fusermount3_exe = executable(
   'fusermount3',
   'src/fusermount3.c',
+  'src/defused-varlink.c',
   'src/util.c',
   c_args : common_c_args + ['-DDEFUSED_VERSION="@0@"'.format(meson.project_version())],
+  dependencies : [systemd_dep],
   install : true,
 )
 
@@ -45,6 +48,8 @@ install_data(
 test_protocol_exe = executable(
   'test-protocol',
   'tests/test_protocol.c',
+  'src/defused-varlink.c',
+  dependencies : [systemd_dep],
   include_directories : include_directories('src'),
 )
 
@@ -53,6 +58,8 @@ test('protocol', test_protocol_exe, args : [defused_exe])
 test_client_exe = executable(
   'test-client',
   'tests/test_client.c',
+  'src/defused-varlink.c',
+  dependencies : [systemd_dep],
   include_directories : include_directories('src'),
 )
 
@@ -61,6 +68,8 @@ test('client', test_client_exe, args : [fusermount3_exe])
 test_mountns_exe = executable(
   'test-mountns',
   'tests/test_mountns.c',
+  'src/defused-varlink.c',
+  dependencies : [systemd_dep],
   include_directories : include_directories('src'),
 )
 
