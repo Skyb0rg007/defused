@@ -13,6 +13,10 @@
     inherit self pkgs system;
   };
 
+  daemon = import ./daemon.nix {
+    inherit self pkgs system;
+  };
+
   mount-namespace = import ./mount-namespace.nix {
     inherit self pkgs system;
   };
