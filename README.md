@@ -77,7 +77,14 @@ deny access to `/dev/fuse` or `/run/defused/defused.sock`.
 See [protocol.md](./doc/protocol.md) for more information on how defused
 works.
 
-## Nix binary cache
+## Installation
+
+### Nix
+
+`flake.nix` exposes a `defused` package and a NixOS module
+(`nixosModules.defused`) that sets up the systemd socket/service natively.
+Add this repository as a flake input and, for NixOS, enable
+`services.defused`.
 
 I am using cachix as a binary cache:
 
@@ -86,6 +93,34 @@ I am using cachix as a binary cache:
 extra-substituters = https://defused.cachix.org
 extra-trusted-public-keys = defused.cachix.org-1:/YD+2Bmle49JSliBhGRqTKpLYhvruoFyMPPU071YCAY=
 ```
+
+### .deb / .rpm
+
+Every `v*` tag is built into `.deb` and `.rpm` packages for x86_64 and
+aarch64, published as assets on the corresponding [GitHub
+release](https://github.com/Skyb0rg007/defused/releases). Install with your
+distribution's package manager, e.g.:
+
+```sh
+# Debian/Ubuntu
+$ sudo apt install ./defused_<version>_amd64.deb
+# Fedora
+$ sudo dnf install ./defused-<version>-1.x86_64.rpm
+```
+
+This installs the `units/defused.service`/`units/defused.socket` units and
+the polkit action, but doesn't enable or start the socket for you:
+
+```sh
+$ sudo systemctl enable --now defused.socket
+```
+
+See [protocol.md](./doc/protocol.md) for the default (interactive-only)
+polkit policy, and `examples/50-defused-mount-policy.rules` (installed under
+`/usr/share/doc/defused/examples`) for a less strict example rule.
+
+These packages can also be built locally with `nix build .#deb` /
+`nix build .#rpm`; see `packaging/nfpm.yaml`.
 
 ## Contributing
 
