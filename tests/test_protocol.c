@@ -13,6 +13,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -343,6 +344,132 @@ out_kill:
     return ret;
 }
 
+/* Must match DEFUSED_DAEMON_MAX_CONNECTIONS in src/defused.c: the number of
+ * concurrent connections test_daemon_connection_cap() needs to open to pin
+ * run_fork_daemon()'s live_children count at the cap. */
+#define TEST_DAEMON_MAX_CONNECTIONS 64
+
+/* Opens n connections to sock_path into slots[0..n), leaving each one open
+ * without sending a request, so every forked child stays alive blocked on
+ * read and live_children holds at n. The first connection goes through
+ * connect_daemon_socket() to ride out the daemon's startup race; the rest
+ * connect directly since the daemon is known to be up by then. On failure,
+ * closes whatever it already opened. */
+static int open_daemon_connections(const char *sock_path, int *slots, int n) {
+    slots[0] = connect_daemon_socket(sock_path);
+    if (slots[0] < 0)
+        return slots[0];
+
+    struct sockaddr_un sa = {.sun_family = AF_UNIX};
+    (void)strlcpy(sa.sun_path, sock_path, sizeof(sa.sun_path));
+    for (int i = 1; i < n; i++) {
+        int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (sock == -1 ||
+            connect(sock, (struct sockaddr *)&sa, sizeof(sa)) == -1) {
+            int ret = -errno;
+            perror("connect");
+            if (sock >= 0)
+                close(sock);
+            for (int j = 0; j < i; j++)
+                close(slots[j]);
+            return ret;
+        }
+        slots[i] = sock;
+    }
+    return 0;
+}
+
+/* Exercises the DEFUSED_DAEMON_MAX_CONNECTIONS cap in run_fork_daemon():
+ * opens exactly the cap's worth of connections and leaves them open without
+ * sending a request, so live_children sits at the cap. A further connection
+ * is then accepted by the kernel (connect() succeeds immediately, since
+ * that only requires room in the listen backlog) but should be closed by
+ * the daemon rather than handed to a forked child, so the client sees EOF
+ * without ever getting a response. Also checks the connections under the
+ * cap are untouched by the overflow. */
+static int test_daemon_connection_cap(const char *defused_path) {
+    char dir[] = "/tmp/defused-daemon-cap-test-XXXXXX";
+    if (mkdtemp(dir) == NULL) {
+        perror("mkdtemp");
+        return -errno;
+    }
+    char sock_path[sizeof(dir) + 16];
+    snprintf(sock_path, sizeof(sock_path), "%s/defused.sock", dir);
+
+    pid_t pid;
+    int ret = spawn_defused_daemon(defused_path, sock_path, &pid);
+    if (ret < 0) {
+        rmdir(dir);
+        return ret;
+    }
+
+    int slots[TEST_DAEMON_MAX_CONNECTIONS];
+    ret =
+        open_daemon_connections(sock_path, slots, TEST_DAEMON_MAX_CONNECTIONS);
+    if (ret < 0)
+        goto out_kill;
+
+    /* Give the single-threaded accept loop a moment to accept()/fork() all
+     * of the above before adding the connection meant to overflow the cap
+     * -- otherwise a slow accept loop could still have room left and
+     * legitimately accept it. */
+    usleep(200000);
+
+    struct sockaddr_un sa = {.sun_family = AF_UNIX};
+    (void)strlcpy(sa.sun_path, sock_path, sizeof(sa.sun_path));
+    int overflow = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (overflow == -1) {
+        ret = -errno;
+        perror("socket");
+        goto out_close;
+    }
+    if (connect(overflow, (struct sockaddr *)&sa, sizeof(sa)) == -1) {
+        ret = -errno;
+        perror("connect");
+        close(overflow);
+        goto out_close;
+    }
+
+    struct pollfd pfd = {.fd = overflow, .events = POLLIN};
+    ret = poll(&pfd, 1, 2000);
+    if (ret <= 0 || !(pfd.revents & (POLLIN | POLLHUP))) {
+        fprintf(stderr, "FAIL: overflow connection was not dropped\n");
+        ret = -EINVAL;
+        goto out_close_overflow;
+    }
+    char buf[1];
+    ssize_t n = recv(overflow, buf, sizeof(buf), 0);
+    if (n != 0) {
+        fprintf(stderr, "FAIL: expected EOF on overflow connection, got %zd\n",
+                n);
+        ret = -EINVAL;
+        goto out_close_overflow;
+    }
+
+    ret = 0;
+    for (int i = 0; i < TEST_DAEMON_MAX_CONNECTIONS; i++) {
+        struct pollfd p = {.fd = slots[i], .events = POLLIN};
+        if (poll(&p, 1, 0) > 0) {
+            fprintf(stderr, "FAIL: connection %d under the cap was dropped\n",
+                    i);
+            ret = -EINVAL;
+            break;
+        }
+    }
+
+out_close_overflow:
+    close(overflow);
+out_close:
+    for (int i = 0; i < TEST_DAEMON_MAX_CONNECTIONS; i++)
+        close(slots[i]);
+out_kill:
+    kill(pid, SIGTERM);
+    waitpid(pid, NULL, 0);
+    unlink(sock_path);
+    rmdir(dir);
+    return ret;
+}
+
 int main(int argc, char *argv[]) {
     if (argc != 2) {
         fprintf(stderr, "usage: %s /path/to/defused\n", argv[0]);
@@ -367,6 +494,9 @@ int main(int argc, char *argv[]) {
     }
 
     if (test_daemon_mode(argv[1]) != 0)
+        return 1;
+
+    if (test_daemon_connection_cap(argv[1]) != 0)
         return 1;
 
     return 0;
