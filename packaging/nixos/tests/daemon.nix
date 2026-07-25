@@ -78,8 +78,11 @@ pkgs.testers.nixosTest {
     )
 
     # --daemon binds the socket 0666 itself, unlike systemd's Accept=yes
-    # (mode 0644) -- see issue #3.
-    machine.succeed(
+    # (mode 0644) -- see issue #3. wait_until_succeeds rather than succeed:
+    # bind() and chmod() are separate syscalls in create_listening_socket(),
+    # so wait_for_file above can observe the socket a moment before its mode
+    # is updated.
+    machine.wait_until_succeeds(
         "stat -c '%a' /run/defused/defused.sock | grep -qx 666"
     )
 

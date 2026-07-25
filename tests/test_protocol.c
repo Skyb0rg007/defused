@@ -276,11 +276,60 @@ static int connect_daemon_socket(const char *sock_path) {
     return -ETIMEDOUT;
 }
 
+/* Connects to an already-running --daemon instance's socket at sock_path
+ * (retrying while it isn't up yet, see connect_daemon_socket()) and runs
+ * one mount request through it, failing unless the response status is
+ * exactly expect_status. */
+static int run_daemon_mount_req(const char *sock_path,
+                                const struct defused_mount_req *req,
+                                const char *path, uint32_t expect_status) {
+    int sock = connect_daemon_socket(sock_path);
+    if (sock < 0) {
+        fprintf(stderr, "FAIL: could not connect to daemon socket: %s\n",
+                strerror(-sock));
+        return sock;
+    }
+
+    int mnt_fd = open(path, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    int dev_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
+    if (mnt_fd < 0 || dev_fd < 0) {
+        int ret = -errno;
+        perror("open");
+        if (mnt_fd >= 0)
+            close(mnt_fd);
+        if (dev_fd >= 0)
+            close(dev_fd);
+        close(sock);
+        return ret;
+    }
+
+    struct defused_resp resp;
+    int ret = send_mount_req(sock, req, dev_fd, mnt_fd, &resp);
+    close(dev_fd);
+    close(mnt_fd);
+    close(sock);
+    if (ret < 0)
+        return ret;
+    if (resp.status != expect_status) {
+        fprintf(stderr, "FAIL: expected status %u, got %u\n", expect_status,
+                resp.status);
+        return -EINVAL;
+    }
+    return 0;
+}
+
 /* Exercises --daemon end to end: spawn the daemon against a scratch socket
  * path, connect to it like a real client would, and confirm a real Varlink
  * mount request round-trips through the forked-child connection handler.
  * Uses the same bad-mount-flags negative case as run_mount_req_expect()
- * above, since (as there) a real mount() needs root. */
+ * above, since (as there) a real mount() needs root.
+ *
+ * Drives two requests back-to-back, without waiting for the first child to
+ * be reaped before starting the second: a single request wouldn't tell us
+ * the daemon keeps accepting new connections after handling one (i.e. that
+ * it's really forking per connection, not a one-shot handler), and issuing
+ * them without a pause also exercises run_fork_daemon()'s live_children
+ * cap under light concurrency without tripping it. */
 static int test_daemon_mode(const char *defused_path) {
     char dir[] = "/tmp/defused-daemon-test-XXXXXX";
     if (mkdtemp(dir) == NULL) {
@@ -297,44 +346,15 @@ static int test_daemon_mode(const char *defused_path) {
         return ret;
     }
 
-    int sock = connect_daemon_socket(sock_path);
-    if (sock < 0) {
-        fprintf(stderr, "FAIL: could not connect to daemon socket: %s\n",
-                strerror(-sock));
-        ret = sock;
-        goto out_kill;
-    }
-
     struct defused_mount_req bad_opt = {
         .mount_flags = 1u << 31, /* never in DEFUSED_MOUNT_FLAGS_MASK */
     };
-    int mnt_fd = open(".", O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    int dev_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
-    if (mnt_fd < 0 || dev_fd < 0) {
-        ret = -errno;
-        perror("open");
-        if (mnt_fd >= 0)
-            close(mnt_fd);
-        if (dev_fd >= 0)
-            close(dev_fd);
-        close(sock);
-        goto out_kill;
-    }
-
-    struct defused_resp resp;
-    ret = send_mount_req(sock, &bad_opt, dev_fd, mnt_fd, &resp);
-    close(dev_fd);
-    close(mnt_fd);
-    close(sock);
+    ret =
+        run_daemon_mount_req(sock_path, &bad_opt, ".", DEFUSED_ERR_BAD_OPTION);
     if (ret < 0)
         goto out_kill;
-    if (resp.status != DEFUSED_ERR_BAD_OPTION) {
-        fprintf(stderr, "FAIL: expected status %u, got %u\n",
-                DEFUSED_ERR_BAD_OPTION, resp.status);
-        ret = -EINVAL;
-        goto out_kill;
-    }
-    ret = 0;
+    ret =
+        run_daemon_mount_req(sock_path, &bad_opt, ".", DEFUSED_ERR_BAD_OPTION);
 
 out_kill:
     kill(pid, SIGTERM);
