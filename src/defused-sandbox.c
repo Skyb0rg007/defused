@@ -8,8 +8,10 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <sched.h>
 #include <seccomp.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <sys/mount.h>
 #include <sys/syscall.h>
@@ -82,6 +84,42 @@ out:
 
 static int neg_errno(void) { return -errno; }
 
+/*
+ * Everything below install_seccomp() that can run after setns() uses these
+ * wrappers. syscall() has exactly the kernel entry named here, unlike a libc
+ * convenience function whose implementation may change underneath the
+ * seccomp allowlist.
+ */
+static int sandbox_setns(int fd, int nstype) {
+    return (int)syscall(SYS_setns, fd, nstype);
+}
+
+static int sandbox_move_mount(int from_fd, const char *from_path, int to_fd,
+                              const char *to_path, unsigned int flags) {
+    return (int)syscall(SYS_move_mount, from_fd, from_path, to_fd, to_path,
+                        flags);
+}
+
+static int sandbox_openat(int dirfd, const char *path, int flags) {
+    return (int)syscall(SYS_openat, dirfd, path, flags, 0);
+}
+
+static ssize_t sandbox_read(int fd, void *buf, size_t count) {
+    return (ssize_t)syscall(SYS_read, fd, buf, count);
+}
+
+static ssize_t sandbox_write(int fd, const void *buf, size_t count) {
+    return (ssize_t)syscall(SYS_write, fd, buf, count);
+}
+
+static int sandbox_close(int fd) { return (int)syscall(SYS_close, fd); }
+
+static int sandbox_fchdir(int fd) { return (int)syscall(SYS_fchdir, fd); }
+
+static int sandbox_umount2(const char *path, int flags) {
+    return (int)syscall(SYS_umount2, path, flags);
+}
+
 static void sandbox_exit(int status) {
     (void)syscall(SYS_exit_group, status);
     for (;;)
@@ -93,7 +131,9 @@ static void sandbox_finish(int out_fd, struct sandbox_result result) {
     size_t left = sizeof(result);
 
     while (left > 0) {
-        ssize_t n = write(out_fd, p, left);
+        ssize_t n = sandbox_write(out_fd, p, left);
+        if (n < 0 && errno == EINTR)
+            continue;
         if (n <= 0)
             break;
         p += (size_t)n;
@@ -103,72 +143,171 @@ static void sandbox_finish(int out_fd, struct sandbox_result result) {
     sandbox_exit(result.ret == 0 ? 0 : 1);
 }
 
-static int sandbox_prefix(const char *s, const char *prefix) {
-    while (*prefix) {
-        if (*s != *prefix)
-            return 0;
-        s++;
-        prefix++;
+enum mountinfo_state {
+    MOUNTINFO_ID,
+    MOUNTINFO_SKIP_LINE,
+    MOUNTINFO_BEFORE_SEPARATOR,
+    MOUNTINFO_FSTYPE,
+    MOUNTINFO_SOURCE,
+    MOUNTINFO_SUPER_OPTIONS,
+};
+
+struct mountinfo_parser {
+    enum mountinfo_state state;
+    long target_id;
+    unsigned long number;
+    bool have_number;
+    bool number_overflow;
+    unsigned int separator_progress;
+    char fstype_prefix[8];
+    size_t fstype_length;
+    size_t option_index;
+    bool option_matches_uid;
+    bool option_has_uid_digit;
+    bool option_uid_overflow;
+    unsigned long option_uid;
+    uid_t *out_uid;
+};
+
+static void mountinfo_reset_line(struct mountinfo_parser *parser) {
+    parser->state = MOUNTINFO_ID;
+    parser->number = 0;
+    parser->have_number = false;
+    parser->number_overflow = false;
+    parser->separator_progress = 0;
+}
+
+static void mountinfo_reset_option(struct mountinfo_parser *parser) {
+    parser->option_index = 0;
+    parser->option_matches_uid = true;
+    parser->option_has_uid_digit = false;
+    parser->option_uid_overflow = false;
+    parser->option_uid = 0;
+}
+
+static bool mountinfo_fstype_is_fuse(const struct mountinfo_parser *parser) {
+    const char *s = parser->fstype_prefix;
+    size_t len = parser->fstype_length;
+
+    if (len == 4 && s[0] == 'f' && s[1] == 'u' && s[2] == 's' && s[3] == 'e')
+        return true;
+    if (len >= 5 && s[0] == 'f' && s[1] == 'u' && s[2] == 's' && s[3] == 'e' &&
+        s[4] == '.')
+        return true;
+    if (len == 7 && s[0] == 'f' && s[1] == 'u' && s[2] == 's' && s[3] == 'e' &&
+        s[4] == 'b' && s[5] == 'l' && s[6] == 'k')
+        return true;
+    return len >= 8 && s[0] == 'f' && s[1] == 'u' && s[2] == 's' &&
+           s[3] == 'e' && s[4] == 'b' && s[5] == 'l' && s[6] == 'k' &&
+           s[7] == '.';
+}
+
+static int mountinfo_finish_option(struct mountinfo_parser *parser) {
+    if (parser->option_matches_uid && parser->option_index > 8 &&
+        parser->option_has_uid_digit && !parser->option_uid_overflow &&
+        parser->option_uid <= (unsigned long)((uid_t)-1)) {
+        *parser->out_uid = (uid_t)parser->option_uid;
+        return 1;
     }
-    return 1;
-}
 
-static int sandbox_parse_ulong(const char **p, unsigned long *out) {
-    const char *s = *p;
-    unsigned long v = 0;
-
-    if (*s < '0' || *s > '9')
-        return -EINVAL;
-
-    do {
-        v = v * 10 + (unsigned long)(*s - '0');
-        s++;
-    } while (*s >= '0' && *s <= '9');
-
-    *p = s;
-    *out = v;
+    mountinfo_reset_option(parser);
     return 0;
 }
 
-static const char *sandbox_find_sep(const char *line) {
-    for (const char *p = line; p[0] && p[1] && p[2]; p++)
-        if (p[0] == ' ' && p[1] == '-' && p[2] == ' ')
-            return p;
-    return NULL;
-}
+/*
+ * Consume one byte of mountinfo. This is deliberately streaming: mount paths
+ * and option lists are not bounded by this program, and truncating a line
+ * could turn a valid FUSE mount into a false authorization result.
+ *
+ * Returns 1 when the requested owner was found, 0 to continue, or -EINVAL
+ * when the requested mount exists but is not a well-formed FUSE entry.
+ */
+static int mountinfo_feed(struct mountinfo_parser *parser, char ch) {
+    static const char uid_prefix[] = "user_id=";
 
-static int sandbox_fstype_is_fuse(const char *p) {
-    if (sandbox_prefix(p, "fuse") &&
-        (p[4] == ' ' || p[4] == '.' || p[4] == '\0'))
-        return 1;
-    if (sandbox_prefix(p, "fuseblk") &&
-        (p[7] == ' ' || p[7] == '.' || p[7] == '\0'))
-        return 1;
-    return 0;
-}
+    switch (parser->state) {
+    case MOUNTINFO_ID:
+        if (ch >= '0' && ch <= '9') {
+            unsigned int digit = (unsigned int)(ch - '0');
+            parser->have_number = true;
+            if (parser->number > (ULONG_MAX - digit) / 10)
+                parser->number_overflow = true;
+            else
+                parser->number = parser->number * 10 + digit;
+            return 0;
+        }
+        if (ch == ' ' && parser->have_number && !parser->number_overflow &&
+            parser->number == (unsigned long)parser->target_id)
+            parser->state = MOUNTINFO_BEFORE_SEPARATOR;
+        else if (ch == '\n')
+            mountinfo_reset_line(parser);
+        else
+            parser->state = MOUNTINFO_SKIP_LINE;
+        return 0;
 
-static int sandbox_mountinfo_owner_line(const char *line, long mnt_id,
-                                        uid_t *out_uid) {
-    const char *p = line;
-    unsigned long id;
-    if (sandbox_parse_ulong(&p, &id) < 0 || (long)id != mnt_id)
-        return -ENOENT;
+    case MOUNTINFO_SKIP_LINE:
+        if (ch == '\n')
+            mountinfo_reset_line(parser);
+        return 0;
 
-    const char *sep = sandbox_find_sep(line);
-    if (!sep)
-        return -ENOENT;
-    p = sep + 3;
-    if (!sandbox_fstype_is_fuse(p))
-        return -EINVAL;
-
-    for (; *p; p++) {
-        if (!sandbox_prefix(p, "user_id="))
-            continue;
-        p += 8;
-        unsigned long uid;
-        if (sandbox_parse_ulong(&p, &uid) < 0)
+    case MOUNTINFO_BEFORE_SEPARATOR:
+        if (ch == '\n')
             return -EINVAL;
-        *out_uid = (uid_t)uid;
+        if (parser->separator_progress == 0)
+            parser->separator_progress = ch == ' ' ? 1 : 0;
+        else if (parser->separator_progress == 1)
+            parser->separator_progress = ch == '-' ? 2 : (ch == ' ' ? 1 : 0);
+        else if (ch == ' ') {
+            parser->state = MOUNTINFO_FSTYPE;
+            parser->fstype_length = 0;
+        } else
+            parser->separator_progress = 0;
+        return 0;
+
+    case MOUNTINFO_FSTYPE:
+        if (ch == '\n')
+            return -EINVAL;
+        if (ch == ' ') {
+            if (!mountinfo_fstype_is_fuse(parser))
+                return -EINVAL;
+            parser->state = MOUNTINFO_SOURCE;
+            return 0;
+        }
+        if (parser->fstype_length < sizeof(parser->fstype_prefix))
+            parser->fstype_prefix[parser->fstype_length] = ch;
+        parser->fstype_length++;
+        return 0;
+
+    case MOUNTINFO_SOURCE:
+        if (ch == '\n')
+            return -EINVAL;
+        if (ch == ' ') {
+            parser->state = MOUNTINFO_SUPER_OPTIONS;
+            mountinfo_reset_option(parser);
+        }
+        return 0;
+
+    case MOUNTINFO_SUPER_OPTIONS:
+        if (ch == ',' || ch == ' ' || ch == '\n') {
+            int ret = mountinfo_finish_option(parser);
+            if (ret != 0)
+                return ret;
+            return ch == ',' ? 0 : -EINVAL;
+        }
+
+        if (parser->option_index < sizeof(uid_prefix) - 1) {
+            if (ch != uid_prefix[parser->option_index])
+                parser->option_matches_uid = false;
+        } else if (ch >= '0' && ch <= '9') {
+            unsigned int digit = (unsigned int)(ch - '0');
+            parser->option_has_uid_digit = true;
+            if (parser->option_uid > (ULONG_MAX - digit) / 10)
+                parser->option_uid_overflow = true;
+            else
+                parser->option_uid = parser->option_uid * 10 + digit;
+        } else
+            parser->option_matches_uid = false;
+        parser->option_index++;
         return 0;
     }
 
@@ -176,17 +315,20 @@ static int sandbox_mountinfo_owner_line(const char *line, long mnt_id,
 }
 
 static int sandbox_fuse_mount_owner(int proc_fd, long mnt_id, uid_t *out_uid) {
-    int fd = openat(proc_fd, "self/mountinfo", O_RDONLY | O_CLOEXEC);
+    int fd = sandbox_openat(proc_fd, "self/mountinfo", O_RDONLY | O_CLOEXEC);
     if (fd == -1)
         return neg_errno();
 
-    char buf[1024];
-    char line[1024];
-    size_t line_len = 0;
-    int ret = -ENOENT;
+    struct mountinfo_parser parser = {
+        .target_id = mnt_id,
+        .out_uid = out_uid,
+    };
+    mountinfo_reset_line(&parser);
 
+    char buf[4096];
+    int ret = -ENOENT;
     for (;;) {
-        ssize_t n = read(fd, buf, sizeof(buf));
+        ssize_t n = sandbox_read(fd, buf, sizeof(buf));
         if (n < 0) {
             ret = neg_errno();
             break;
@@ -194,37 +336,33 @@ static int sandbox_fuse_mount_owner(int proc_fd, long mnt_id, uid_t *out_uid) {
         if (n == 0)
             break;
 
-        for (long i = 0; i < n; i++) {
-            char ch = buf[i];
-            if (ch != '\n' && line_len + 1 < sizeof(line)) {
-                line[line_len++] = ch;
-                continue;
-            }
-
-            line[line_len] = '\0';
-            ret = sandbox_mountinfo_owner_line(line, mnt_id, out_uid);
-            if (ret != -ENOENT)
+        for (ssize_t i = 0; i < n; i++) {
+            ret = mountinfo_feed(&parser, buf[i]);
+            if (ret != 0) {
+                if (ret > 0)
+                    ret = 0;
                 goto out;
-            line_len = 0;
+            }
         }
     }
 
-    if (ret == -ENOENT && line_len > 0) {
-        line[line_len] = '\0';
-        ret = sandbox_mountinfo_owner_line(line, mnt_id, out_uid);
+    if (ret == -ENOENT && parser.state != MOUNTINFO_ID) {
+        ret = mountinfo_feed(&parser, '\n');
+        if (ret > 0)
+            ret = 0;
     }
 
 out:
-    close(fd);
+    (void)sandbox_close(fd);
     return ret;
 }
 
 static int sandbox_umount_by_proc_path(int proc_fd, const char *proc_path,
                                        int flags) {
-    if (fchdir(proc_fd) == -1)
+    if (sandbox_fchdir(proc_fd) == -1)
         return neg_errno();
 
-    if (umount2(proc_path, flags) == -1)
+    if (sandbox_umount2(proc_path, flags) == -1)
         return neg_errno();
     return 0;
 }
@@ -286,7 +424,7 @@ int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd, uint32_t *status,
             sandbox_finish(pipefd[1], result);
         }
 
-        if (setns(pidfd, CLONE_NEWNS) == -1) {
+        if (sandbox_setns(pidfd, CLONE_NEWNS) == -1) {
             ret = neg_errno();
             struct sandbox_result result = {
                 .status = DEFUSED_ERR_SETNS_FAILED,
@@ -296,8 +434,9 @@ int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd, uint32_t *status,
             sandbox_finish(pipefd[1], result);
         }
 
-        if (move_mount(mountfd, "", mnt_fd, "",
-                       MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH) == -1)
+        if (sandbox_move_mount(mountfd, "", mnt_fd, "",
+                               MOVE_MOUNT_F_EMPTY_PATH |
+                                   MOVE_MOUNT_T_EMPTY_PATH) == -1)
             ret = neg_errno();
         else
             ret = 0;
@@ -366,7 +505,7 @@ int defused_sandbox_unmount(int pidfd, int proc_fd, int parent_fd,
             sandbox_finish(pipefd[1], result);
         }
 
-        if (setns(pidfd, CLONE_NEWNS) == -1) {
+        if (sandbox_setns(pidfd, CLONE_NEWNS) == -1) {
             ret = neg_errno();
             struct sandbox_result result = {
                 .status = DEFUSED_ERR_SETNS_FAILED,
@@ -430,3 +569,27 @@ int defused_sandbox_unmount(int pidfd, int proc_fd, int parent_fd,
     *sys_errno = result.sys_errno;
     return result.ret;
 }
+
+#ifdef DEFUSED_TEST
+int defused_test_install_seccomp(enum defused_op op) {
+    return install_seccomp(op);
+}
+
+int defused_test_mountinfo_owner(const char *line, long mnt_id,
+                                 uid_t *out_uid) {
+    struct mountinfo_parser parser = {
+        .target_id = mnt_id,
+        .out_uid = out_uid,
+    };
+    mountinfo_reset_line(&parser);
+
+    for (const char *p = line; *p; p++) {
+        int ret = mountinfo_feed(&parser, *p);
+        if (ret != 0)
+            return ret > 0 ? 0 : ret;
+    }
+
+    int ret = mountinfo_feed(&parser, '\n');
+    return ret > 0 ? 0 : ret == 0 ? -ENOENT : ret;
+}
+#endif

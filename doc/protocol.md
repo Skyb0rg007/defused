@@ -166,6 +166,15 @@ The service uses `SO_PEERPIDFD` on the accepted socket to identify the
 connecting process and joins that process's mount namespace before the
 mount/umount operation.
 
+The main service process never enters the client-controlled namespace. After
+validating and authorizing the request, it forks a short-lived child that
+installs an enforcing seccomp filter and then joins the namespace. For mounts,
+the parent creates a detached FUSE mount first, leaving the child only
+`setns()` and `move_mount()`. For unmounts, the child can additionally read the
+trusted procfs file descriptor opened by the parent and call `umount2()`. The
+post-`setns()` code uses explicit syscall wrappers so the filter's allowlist
+fully describes its possible kernel interface.
+
 ## Why unmount passes a parent-directory fd
 
 Passing an fd on the mountpoint itself makes non-lazy `umount2()` see an

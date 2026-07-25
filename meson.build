@@ -17,14 +17,22 @@ systemd_dep = dependency('libsystemd')
 # XXX: Check for function availability
 common_c_args = ['-DHAVE_CLOSE_RANGE']
 
+sandbox_lib = static_library(
+  'defused-sandbox',
+  'src/defused-sandbox.c',
+  c_args : ['-ffreestanding'],
+  dependencies : [seccomp_dep],
+  install : false,
+)
+
 defused_exe = executable(
   'defused',
   'src/defused.c',
-  'src/defused-sandbox.c',
   'src/defused-varlink.c',
   'src/util.c',
   c_args : common_c_args,
   dependencies : [seccomp_dep, systemd_dep],
+  link_with : sandbox_lib,
   install_dir : get_option('prefix') / 'lib/defused',
   install : true,
 )
@@ -75,3 +83,14 @@ test_mountns_exe = executable(
 )
 
 test('mountns', test_mountns_exe, args : [defused_exe])
+
+test_sandbox_exe = executable(
+  'test-sandbox',
+  'tests/test_sandbox.c',
+  'src/defused-sandbox.c',
+  c_args : ['-DDEFUSED_TEST', '-ffreestanding'],
+  dependencies : [seccomp_dep],
+  include_directories : include_directories('src'),
+)
+
+test('sandbox', test_sandbox_exe)
