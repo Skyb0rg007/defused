@@ -31,6 +31,7 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/vfs.h>
+#include <sys/wait.h>
 #include <systemd/sd-bus.h>
 #include <systemd/sd-daemon.h>
 #include <systemd/sd-event.h>
@@ -126,6 +127,7 @@ static int socket_activation_fd(int *out_fd)
     __attribute__((__nonnull__(1), __warn_unused_result__));
 static int handle_connection(int sock) __attribute__((__warn_unused_result__));
 static int run_fork_daemon(void) __attribute__((__warn_unused_result__));
+static void sigchld_handler(int sig);
 static int create_listening_socket(void)
     __attribute__((__warn_unused_result__));
 static int bind_unix_socket(int fd, const struct sockaddr_un *sa,
@@ -137,6 +139,15 @@ static int fd_mnt_id(int proc_fd, int fd, long *out_id)
     __attribute__((__nonnull__(3), __warn_unused_result__));
 
 static bool cfg_daemon = false;
+
+/* Cap on concurrent --daemon children, so that a mode-0666 socket doesn't
+ * let an unprivileged local user exhaust the process table/memory by
+ * hammering accept() -- systemd's own Accept=yes has MaxConnections= for
+ * the same reason. Not configurable: this is a fixed backstop, not a
+ * policy knob. */
+#define DEFUSED_DAEMON_MAX_CONNECTIONS 64
+
+static volatile sig_atomic_t live_children = 0;
 
 int main(int argc, char *argv[]) {
     int ret = parse_args(argc, argv);
@@ -1023,20 +1034,35 @@ static int parse_args(int argc, char *argv[]) {
     return 0;
 }
 
+/* Reaps every exited child on each SIGCHLD delivery, decrementing
+ * live_children so the accept loop below knows how many are still
+ * outstanding. Async-signal-safe: only waitpid() and arithmetic on a
+ * volatile sig_atomic_t. */
+static void sigchld_handler(int sig) {
+    (void)sig;
+    int saved_errno = errno;
+    while (waitpid(-1, NULL, WNOHANG) > 0)
+        live_children--;
+    errno = saved_errno;
+}
+
 /* Accepts connections on a self-created listening socket and forks a child
  * to run handle_connection() on each one, for setups without systemd
- * Accept=yes socket activation (see --daemon in usage()). */
+ * Accept=yes socket activation (see --daemon in usage()). Caps concurrent
+ * children at DEFUSED_DAEMON_MAX_CONNECTIONS; connections past the cap are
+ * accepted and immediately closed rather than left queued in the backlog,
+ * so a client sees a dropped connection (a retryable failure) instead of
+ * hanging. */
 static int run_fork_daemon(void) {
     int listen_fd = create_listening_socket();
     if (listen_fd < 0)
         return listen_fd;
 
-    /* Auto-reap children without a wait() loop; SA_RESTART so accept4()
-     * below doesn't need special-casing beyond the EINTR from other
-     * signals. */
+    /* SA_RESTART so accept4() below doesn't need special-casing beyond the
+     * EINTR from other signals. */
     struct sigaction sa = {
-        .sa_handler = SIG_DFL,
-        .sa_flags = SA_NOCLDWAIT | SA_RESTART,
+        .sa_handler = sigchld_handler,
+        .sa_flags = SA_RESTART,
     };
     sigemptyset(&sa.sa_mask);
     if (sigaction(SIGCHLD, &sa, NULL) == -1) {
@@ -1066,6 +1092,11 @@ static int run_fork_daemon(void) {
             return ret;
         }
 
+        if (live_children >= DEFUSED_DAEMON_MAX_CONNECTIONS) {
+            close(conn);
+            continue;
+        }
+
         pid_t pid = fork();
         if (pid == -1) {
             fprintf(stderr, "defused: fork: %s\n", strerror(errno));
@@ -1076,6 +1107,7 @@ static int run_fork_daemon(void) {
             close(listen_fd);
             _exit(handle_connection(conn));
         }
+        live_children++;
         close(conn);
     }
 }
