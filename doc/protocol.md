@@ -23,6 +23,14 @@ using libsystemd's `sd-varlink` implementation.
 - **Server-side activation**: the service socket unit uses `Accept=yes`,
   and `defused` receives the already-`accept()`-ed connection through the
   standard systemd `$LISTEN_PID`/`$LISTEN_FDS` protocol (`sd_listen_fds(3)`).
+  The socket is created by systemd at its default `SocketMode=`, 0666.
+- **`--daemon` activation**: for systems without systemd as service
+  manager, `defused --daemon` creates and binds the Varlink socket itself
+  (still at `DEFUSED_SOCKET_PATH` by default, also mode 0666), then forks
+  a child per accepted connection to run the same one-call-per-connection
+  handling as the `Accept=yes` path. Since both modes leave the socket
+  world-writable, authorization is enforced per request by polkit either
+  way -- the socket's mode is not itself the access control.
 
 The service handles one Varlink method call and exits when the connection goes
 idle. Message framing, JSON parsing, method dispatch, parameter type checking,

@@ -13,11 +13,13 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <systemd/sd-json.h>
 #include <systemd/sd-varlink.h>
@@ -229,6 +231,118 @@ static int test_polkit_gate(const char *defused_path) {
     return 0;
 }
 
+/* Spawns `defused --daemon`, pointed at sock_path via $DEFUSED_SOCKET
+ * instead of the real /run/defused/defused.sock, mirroring how
+ * nixos/tests/daemon.nix exercises the same knob for non-systemd setups. */
+static int spawn_defused_daemon(const char *defused_path, const char *sock_path,
+                                pid_t *out_pid) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        setenv("DEFUSED_SOCKET", sock_path, 1);
+        execl(defused_path, "defused", "--daemon", NULL);
+        perror("exec");
+        _exit(127);
+    }
+    if (pid < 0)
+        return -errno;
+
+    *out_pid = pid;
+    return 0;
+}
+
+/* Connects to a listening AF_UNIX SOCK_STREAM socket at sock_path, retrying
+ * while the daemon hasn't created it yet (ENOENT) or hasn't called listen()
+ * yet (ECONNREFUSED). */
+static int connect_daemon_socket(const char *sock_path) {
+    struct sockaddr_un sa = {.sun_family = AF_UNIX};
+    if (strlen(sock_path) >= sizeof(sa.sun_path))
+        return -ENAMETOOLONG;
+    (void)strlcpy(sa.sun_path, sock_path, sizeof(sa.sun_path));
+
+    for (int i = 0; i < 100; i++) {
+        int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (sock == -1)
+            return -errno;
+        if (connect(sock, (struct sockaddr *)&sa, sizeof(sa)) == 0)
+            return sock;
+
+        int saved_errno = errno;
+        close(sock);
+        if (saved_errno != ENOENT && saved_errno != ECONNREFUSED)
+            return -saved_errno;
+        usleep(10000);
+    }
+    return -ETIMEDOUT;
+}
+
+/* Exercises --daemon end to end: spawn the daemon against a scratch socket
+ * path, connect to it like a real client would, and confirm a real Varlink
+ * mount request round-trips through the forked-child connection handler.
+ * Uses the same bad-mount-flags negative case as run_mount_req_expect()
+ * above, since (as there) a real mount() needs root. */
+static int test_daemon_mode(const char *defused_path) {
+    char dir[] = "/tmp/defused-daemon-test-XXXXXX";
+    if (mkdtemp(dir) == NULL) {
+        perror("mkdtemp");
+        return -errno;
+    }
+    char sock_path[sizeof(dir) + 16];
+    snprintf(sock_path, sizeof(sock_path), "%s/defused.sock", dir);
+
+    pid_t pid;
+    int ret = spawn_defused_daemon(defused_path, sock_path, &pid);
+    if (ret < 0) {
+        rmdir(dir);
+        return ret;
+    }
+
+    int sock = connect_daemon_socket(sock_path);
+    if (sock < 0) {
+        fprintf(stderr, "FAIL: could not connect to daemon socket: %s\n",
+                strerror(-sock));
+        ret = sock;
+        goto out_kill;
+    }
+
+    struct defused_mount_req bad_opt = {
+        .mount_flags = 1u << 31, /* never in DEFUSED_MOUNT_FLAGS_MASK */
+    };
+    int mnt_fd = open(".", O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    int dev_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
+    if (mnt_fd < 0 || dev_fd < 0) {
+        ret = -errno;
+        perror("open");
+        if (mnt_fd >= 0)
+            close(mnt_fd);
+        if (dev_fd >= 0)
+            close(dev_fd);
+        close(sock);
+        goto out_kill;
+    }
+
+    struct defused_resp resp;
+    ret = send_mount_req(sock, &bad_opt, dev_fd, mnt_fd, &resp);
+    close(dev_fd);
+    close(mnt_fd);
+    close(sock);
+    if (ret < 0)
+        goto out_kill;
+    if (resp.status != DEFUSED_ERR_BAD_OPTION) {
+        fprintf(stderr, "FAIL: expected status %u, got %u\n",
+                DEFUSED_ERR_BAD_OPTION, resp.status);
+        ret = -EINVAL;
+        goto out_kill;
+    }
+    ret = 0;
+
+out_kill:
+    kill(pid, SIGTERM);
+    waitpid(pid, NULL, 0);
+    unlink(sock_path);
+    rmdir(dir);
+    return ret;
+}
+
 int main(int argc, char *argv[]) {
     if (argc != 2) {
         fprintf(stderr, "usage: %s /path/to/defused\n", argv[0]);
@@ -251,6 +365,9 @@ int main(int argc, char *argv[]) {
         if (test_polkit_gate(argv[1]) != 0)
             return 1;
     }
+
+    if (test_daemon_mode(argv[1]) != 0)
+        return 1;
 
     return 0;
 }
