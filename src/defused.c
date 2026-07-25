@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -28,6 +29,7 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <sys/vfs.h>
 #include <systemd/sd-bus.h>
 #include <systemd/sd-daemon.h>
@@ -122,20 +124,44 @@ static int parse_args(int argc, char *argv[])
     __attribute__((__nonnull__(2), __warn_unused_result__));
 static int socket_activation_fd(int *out_fd)
     __attribute__((__nonnull__(1), __warn_unused_result__));
+static int handle_connection(int sock) __attribute__((__warn_unused_result__));
+static int run_fork_daemon(void) __attribute__((__warn_unused_result__));
+static int create_listening_socket(void)
+    __attribute__((__warn_unused_result__));
+static int bind_unix_socket(int fd, const struct sockaddr_un *sa,
+                            socklen_t sa_len, const char *path)
+    __attribute__((__nonnull__(2, 4), __warn_unused_result__));
+static int mkdir_parent(const char *path)
+    __attribute__((__nonnull__(1), __warn_unused_result__));
 static int fd_mnt_id(int proc_fd, int fd, long *out_id)
     __attribute__((__nonnull__(3), __warn_unused_result__));
 
-int main(int argc, char *argv[]) {
-    int exit_status = EXIT_FAILURE;
+static bool cfg_daemon = false;
 
+int main(int argc, char *argv[]) {
     int ret = parse_args(argc, argv);
     if (ret < 0)
         return EXIT_FAILURE;
+
+    if (cfg_daemon)
+        return run_fork_daemon() == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 
     int sock = -1;
     ret = socket_activation_fd(&sock);
     if (ret < 0)
         return EXIT_FAILURE;
+
+    return handle_connection(sock);
+}
+
+/* Handles a single already-connected Varlink socket to completion (one
+ * mount/unmount request), then closes it. Used both for the
+ * systemd-Accept=yes case in main() (sock is the handed-off connection) and
+ * for each forked child in run_fork_daemon() (sock is the accepted
+ * connection). */
+static int handle_connection(int sock) {
+    int exit_status = EXIT_FAILURE;
+    int ret;
 
     sd_event *event = NULL;
     sd_varlink_server *server = NULL;
@@ -952,19 +978,28 @@ out:
 }
 
 static void usage(const char *prog) {
-    fprintf(stderr,
-            "usage: %s\n"
-            "\n"
-            "Handles one mount/unmount request on the socket-activation fd\n"
-            "(see defused_proto.h); meant to be spawned by systemd socket\n"
-            "activation, one process per connection. There are no options --\n"
-            "policy decisions are made per request by polkit; see\n"
-            "doc/protocol.md.\n",
-            prog);
+    fprintf(
+        stderr,
+        "usage: %s [--daemon]\n"
+        "\n"
+        "By default, handles one mount/unmount request on the\n"
+        "socket-activation fd (see defused_proto.h); meant to be spawned by\n"
+        "systemd socket activation, one process per connection. With\n"
+        "--daemon, creates the defused Varlink socket itself and forks a\n"
+        "child to handle each accepted connection, for non-systemd\n"
+        "setups. There are no policy options -- policy decisions are\n"
+        "made per request by polkit; see doc/protocol.md.\n"
+        "\n"
+        "  --daemon  listen on $DEFUSED_SOCKET (or the default socket\n"
+        "            path) and fork a child for each connection\n",
+        prog);
 }
 
 static int parse_args(int argc, char *argv[]) {
+    enum { OPT_DAEMON = 256 };
+
     static const struct option opts[] = {
+        {"daemon", no_argument, NULL, OPT_DAEMON},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -974,6 +1009,9 @@ static int parse_args(int argc, char *argv[]) {
         if (c == -1)
             break;
         switch (c) {
+        case OPT_DAEMON:
+            cfg_daemon = true;
+            break;
         case 'h':
             usage(argv[0]);
             exit(0);
@@ -981,6 +1019,187 @@ static int parse_args(int argc, char *argv[]) {
             usage(argv[0]);
             return -EINVAL;
         }
+    }
+    return 0;
+}
+
+/* Accepts connections on a self-created listening socket and forks a child
+ * to run handle_connection() on each one, for setups without systemd
+ * Accept=yes socket activation (see --daemon in usage()). */
+static int run_fork_daemon(void) {
+    int listen_fd = create_listening_socket();
+    if (listen_fd < 0)
+        return listen_fd;
+
+    /* Auto-reap children without a wait() loop; SA_RESTART so accept4()
+     * below doesn't need special-casing beyond the EINTR from other
+     * signals. */
+    struct sigaction sa = {
+        .sa_handler = SIG_DFL,
+        .sa_flags = SA_NOCLDWAIT | SA_RESTART,
+    };
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGCHLD, &sa, NULL) == -1) {
+        int ret = -errno;
+        fprintf(stderr, "defused: sigaction(SIGCHLD): %s\n", strerror(errno));
+        close(listen_fd);
+        return ret;
+    }
+
+    for (;;) {
+        int conn = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
+        if (conn == -1) {
+            /* EINTR is routine (SA_RESTART still lets other signals
+             * interrupt); EMFILE/ENFILE/ECONNABORTED are transient resource
+             * or peer-abort conditions that can recur near the connection
+             * cap, so log and keep listening rather than tearing down the
+             * whole daemon over them. Anything else is unexpected. */
+            if (errno == EINTR)
+                continue;
+            if (errno == EMFILE || errno == ENFILE || errno == ECONNABORTED) {
+                fprintf(stderr, "defused: accept4: %s\n", strerror(errno));
+                continue;
+            }
+            int ret = -errno;
+            fprintf(stderr, "defused: accept4: %s\n", strerror(errno));
+            close(listen_fd);
+            return ret;
+        }
+
+        pid_t pid = fork();
+        if (pid == -1) {
+            fprintf(stderr, "defused: fork: %s\n", strerror(errno));
+            close(conn);
+            continue;
+        }
+        if (pid == 0) {
+            close(listen_fd);
+            _exit(handle_connection(conn));
+        }
+        close(conn);
+    }
+}
+
+/* Creates, binds, and listens on the AF_UNIX SOCK_STREAM Varlink socket at
+ * $DEFUSED_SOCKET (or DEFUSED_SOCKET_PATH), mode 0666 so non-root, non-
+ * systemd callers can reach it -- see the --daemon usage() text. */
+static int create_listening_socket(void) {
+    const char *path = getenv("DEFUSED_SOCKET");
+    if (path == NULL || *path == '\0')
+        path = DEFUSED_SOCKET_PATH;
+
+    struct sockaddr_un sa = {.sun_family = AF_UNIX};
+    if (strlen(path) >= sizeof(sa.sun_path)) {
+        fprintf(stderr, "defused: socket path too long: %s\n", path);
+        return -ENAMETOOLONG;
+    }
+    (void)strlcpy(sa.sun_path, path, sizeof(sa.sun_path));
+
+    int ret = mkdir_parent(path);
+    if (ret < 0)
+        return ret;
+
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd == -1) {
+        ret = -errno;
+        fprintf(stderr, "defused: socket: %s\n", strerror(errno));
+        return ret;
+    }
+
+    ret = bind_unix_socket(fd, &sa, sizeof(sa), path);
+    if (ret < 0)
+        goto out_close;
+
+    if (chmod(path, 0666) == -1) {
+        ret = -errno;
+        fprintf(stderr, "defused: chmod(%s): %s\n", path, strerror(errno));
+        goto out_unlink;
+    }
+
+    if (listen(fd, SOMAXCONN) == -1) {
+        ret = -errno;
+        fprintf(stderr, "defused: listen(%s): %s\n", path, strerror(errno));
+        goto out_unlink;
+    }
+
+    return fd;
+
+out_unlink:
+    unlink(path);
+out_close:
+    close(fd);
+    return ret;
+}
+
+/* bind(2), handling the case where path already exists: if it's a live
+ * socket someone is listening on, that's a genuine conflict; if connecting
+ * to it fails with ECONNREFUSED, it's a stale socket left behind by a
+ * previous run and can be unlinked and rebound. */
+static int bind_unix_socket(int fd, const struct sockaddr_un *sa,
+                            socklen_t sa_len, const char *path) {
+    if (bind(fd, (const struct sockaddr *)sa, sa_len) == 0)
+        return 0;
+    if (errno != EADDRINUSE) {
+        int ret = -errno;
+        fprintf(stderr, "defused: bind(%s): %s\n", path, strerror(errno));
+        return ret;
+    }
+
+    int probe = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (probe == -1) {
+        int ret = -errno;
+        fprintf(stderr, "defused: socket probe: %s\n", strerror(errno));
+        return ret;
+    }
+
+    int ret = 0;
+    if (connect(probe, (const struct sockaddr *)sa, sa_len) == 0) {
+        fprintf(stderr, "defused: socket already in use: %s\n", path);
+        ret = -EADDRINUSE;
+        goto out;
+    }
+    if (errno != ECONNREFUSED) {
+        ret = -errno;
+        fprintf(stderr, "defused: cannot connect to existing socket %s: %s\n",
+                path, strerror(errno));
+        goto out;
+    }
+
+    if (unlink(path) == -1) {
+        ret = -errno;
+        fprintf(stderr, "defused: unlink stale socket %s: %s\n", path,
+                strerror(errno));
+        goto out;
+    }
+    if (bind(fd, (const struct sockaddr *)sa, sa_len) == -1) {
+        ret = -errno;
+        fprintf(stderr, "defused: bind(%s): %s\n", path, strerror(errno));
+        goto out;
+    }
+
+out:
+    close(probe);
+    return ret;
+}
+
+/* Creates the parent directory of path (mode 0755) if it doesn't already
+ * exist, so --daemon doesn't depend on systemd's RuntimeDirectory=. */
+static int mkdir_parent(const char *path) {
+    char dir[sizeof(((struct sockaddr_un *)0)->sun_path)];
+    size_t len = strlen(path);
+    if (len >= sizeof(dir))
+        return -ENAMETOOLONG;
+    memcpy(dir, path, len + 1);
+
+    char *slash = strrchr(dir, '/');
+    if (!slash || slash == dir)
+        return 0;
+    *slash = '\0';
+
+    if (mkdir(dir, 0755) == -1 && errno != EEXIST) {
+        int ret = -errno;
+        fprintf(stderr, "defused: mkdir(%s): %s\n", dir, strerror(errno));
+        return ret;
     }
     return 0;
 }

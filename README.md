@@ -42,8 +42,12 @@ This project provides the following:
 
 The system service is written to use systemd socket activation with
 `Accept=yes`.
-On systems without systemd as service manager or and for testing,
-you can run the service with `systemd-socket-activate`.
+For testing under systemd, you can instead run the service with
+`systemd-socket-activate`.
+On systems without systemd as service manager, run `defused --daemon`
+instead: it creates the Varlink socket itself and forks a child to handle
+each accepted connection, so it doesn't depend on systemd socket
+activation at all.
 
 Root callers are delegated directly to libfuse's `fusermount3`, since they do
 not need the unprivileged service path. Meson resolves that helper to an
