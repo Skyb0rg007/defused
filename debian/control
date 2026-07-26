@@ -1,0 +1,29 @@
+Source: defused
+Section: admin
+Priority: optional
+Maintainer: Skye Soss <skye@soss.website>
+Build-Depends: debhelper-compat (= 13),
+               meson,
+               ninja-build,
+               pkg-config,
+               libseccomp-dev,
+               libsystemd-dev
+Standards-Version: 4.7.2
+Homepage: https://github.com/Skyb0rg007/defused
+Rules-Requires-Root: no
+
+Package: defused
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, policykit-1
+Description: setuid-less replacement for fusermount3
+ defused replaces libfuse's setuid-root fusermount3 helper with a
+ socket-activated system service (listening on
+ /run/defused/defused.sock) plus a fusermount3-compatible client
+ binary that talks to it over a Unix domain socket.
+ .
+ Because the setuid-root binary is gone, FUSE mounts keep working
+ under the no_new_privileges process flag used by sandboxing
+ techniques such as seccomp-bpf and landlock, and the privilege to
+ mount FUSE filesystems can be granted per-sandbox by bind-mounting
+ the socket into a container's namespace instead of relying on
+ /usr/bin placement.

@@ -7,3 +7,17 @@ path = [
 ]
 SPDX-License-Identifier = "GPL-2.0-or-later"
 SPDX-FileCopyrightText = "2026 Skye Soss <skye@soss.website>"
+
+[[annotations]]
+# debian/control, debian/changelog, and debian/source/format are parsed
+# verbatim by dpkg tooling (deb822 / dpkg-parsechangelog / a literal format
+# string), so they can't carry an inline SPDX header without breaking that
+# parsing -- annotate them here instead, same as flake.lock above.
+path = [
+    "debian/control",
+    "debian/changelog",
+    "debian/source/format",
+    "debian/copyright",
+]
+SPDX-License-Identifier = "GPL-2.0-or-later"
+SPDX-FileCopyrightText = "2026 Skye Soss <skye@soss.website>"

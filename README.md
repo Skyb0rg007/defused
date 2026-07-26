@@ -110,20 +110,15 @@ extra-trusted-public-keys = defused.cachix.org-1:/YD+2Bmle49JSliBhGRqTKpLYhvruoF
 Every `v*` tag is built into `.deb` and `.rpm` packages for x86_64 and
 aarch64, published as assets on the corresponding [GitHub
 release](https://github.com/Skyb0rg007/defused/releases). These are built
-with Nix (`nix build .#deb` / `nix build .#rpm`, see `packaging/nfpm.yaml`)
-and have their dynamic linker/rpath patched to use the target distro's own
-paths, but the binaries are still *linked* against nixpkgs' glibc symbol
-versions. In particular they require **glibc >= 2.38** (`strlcpy` and the
-`__isoc23_*` symbols are the newest ones actually used), which in practice
-means:
+natively per-distro (`debhelper`/`dpkg-buildpackage` for `.deb`, `rpmbuild`
+for `.rpm`, see `debian/` and `packaging/defused.spec`) rather than with Nix,
+so they're linked against the target distro's own glibc/libseccomp/libsystemd
+instead of nixpkgs'.
 
-- Debian 13 (trixie) or newer -- Debian 12 (bookworm) ships glibc 2.36 and
-  will not work.
-- Ubuntu 24.04 or newer -- Ubuntu 22.04 ships glibc 2.35 and will not work.
-- Fedora 39 or newer -- Fedora 38 ships glibc 2.37 and will not work.
-
-If you're on an older distribution, use the Nix package instead, which
-carries its own glibc.
+Note that defused's Varlink usage currently needs a fairly recent
+**libsystemd >= 258**, which as of this writing means a current Fedora
+release or Ubuntu 26.04+; older LTS/stable releases (Debian 12/13, Ubuntu
+24.04) don't ship a new enough libsystemd yet.
 
 Install with your distribution's package manager, e.g.:
 
@@ -145,8 +140,18 @@ See [protocol.md](./doc/protocol.md) for the default (interactive-only)
 polkit policy, and `examples/50-defused-mount-policy.rules` (installed under
 `/usr/share/doc/defused/examples`) for a less strict example rule.
 
-These packages can also be built locally with `nix build .#deb` /
-`nix build .#rpm`; see `packaging/nfpm.yaml`.
+These packages can also be built locally:
+
+```sh
+# .deb, from the repo root
+$ dpkg-buildpackage -us -uc -b
+
+# .rpm: set up an rpmbuild tree, generate the source tarball
+# packaging/defused.spec expects, then build
+$ rpmdev-setuptree
+$ git archive --prefix=defused-0.1/ -o ~/rpmbuild/SOURCES/defused-0.1.tar.gz HEAD
+$ rpmbuild -ba packaging/defused.spec
+```
 
 ## Contributing
 
