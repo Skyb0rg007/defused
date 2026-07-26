@@ -40,6 +40,15 @@
         x86_64-linux = "amd64";
         aarch64-linux = "arm64";
       };
+
+      # The dynamic linker path a real (non-Nix) distro's glibc actually
+      # installs itself at, keyed by Nix system string. defusedFhs's
+      # binaries get patched to point here instead of their build-time
+      # /nix/store interpreter -- see defusedFhs below.
+      glibcInterpreterBySystem = {
+        x86_64-linux = "/lib64/ld-linux-x86-64.so.2";
+        aarch64-linux = "/lib/ld-linux-aarch64.so.1";
+      };
     in
     {
       nixosModules = {
@@ -68,6 +77,7 @@
                 nativeBuildInputs = [
                   pkgs.dpkg
                   pkgs.rpm
+                  pkgs.cpio
                 ];
               }
               ''
@@ -93,6 +103,26 @@
                 grep -qF /usr/lib/systemd/system/defused.service rpm-contents.txt
                 grep -qF /usr/lib/systemd/system/defused.socket rpm-contents.txt
                 grep -qF /usr/share/polkit-1/actions/website.soss.defused.policy rpm-contents.txt
+
+                # Guard against the packaged binaries embedding a Nix store
+                # path (e.g. an unpatched PT_INTERP/RUNPATH) -- those don't
+                # exist off-NixOS, so a real install of the .deb/.rpm would
+                # be unable to execute at all. See defusedFhs in flake.nix.
+                echo "== scanning extracted .deb for /nix/store references =="
+                mkdir -p extracted-deb
+                dpkg-deb -x ${self.packages.${system}.deb} extracted-deb
+                if grep -rlaF /nix/store extracted-deb; then
+                  echo "ERROR: /nix/store reference(s) found in .deb contents (see above)" >&2
+                  exit 1
+                fi
+
+                echo "== scanning extracted .rpm for /nix/store references =="
+                mkdir -p extracted-rpm
+                rpm2cpio ${self.packages.${system}.rpm} | cpio -idm --quiet -D extracted-rpm
+                if grep -rlaF /nix/store extracted-rpm; then
+                  echo "ERROR: /nix/store reference(s) found in .rpm contents (see above)" >&2
+                  exit 1
+                fi
 
                 touch $out
               '';
@@ -120,6 +150,10 @@
             ];
           };
 
+          glibcInterpreter =
+            glibcInterpreterBySystem.${system}
+              or (throw "flake.nix: no glibc interpreter mapping for system ${system}");
+
           # A /usr-prefixed build of defused, staged into $out as a destdir
           # tree (rather than $out itself acting as the install prefix) --
           # .deb/.rpm packages need the on-disk layout to match
@@ -135,10 +169,27 @@
           # scatter files under $out instead of staging a coherent /usr tree
           # under DESTDIR. So this drives meson directly instead of going
           # through that hook.
+          #
+          # nixpkgs' gcc-wrapper/dynamic linker always bakes Nix store paths
+          # into the built binaries (PT_INTERP + RUNPATH) regardless of how
+          # the configure/build/install phases are driven -- that's
+          # orthogonal to the -Dprefix issue above and isn't something any
+          # combination of meson flags fixes. Off-Nix systems don't have
+          # that interpreter path, so the binaries would fail to execute at
+          # all. patchelf the two binaries in postInstall to point at the
+          # target distro's real dynamic linker and drop the Nix store
+          # RUNPATH, so they fall back to the standard system library search
+          # path (where the target distro's own libseccomp/libsystemd --
+          # already declared as nfpm runtime deps -- will be found).
+          #
+          # This does NOT make the binaries portable to arbitrarily old
+          # distros: they're still linked against nixpkgs' glibc symbol
+          # versions. See README.md's Installation section for the actual
+          # minimum distro versions this implies.
           defusedFhs = pkgs.stdenv.mkDerivation {
             pname = "defused-fhs";
             inherit version src;
-            nativeBuildInputs = defused.nativeBuildInputs;
+            nativeBuildInputs = defused.nativeBuildInputs ++ [ pkgs.patchelf ];
             buildInputs = defused.buildInputs;
 
             configurePhase = ''
@@ -156,6 +207,9 @@
             installPhase = ''
               runHook preInstall
               DESTDIR="$out" meson install -C build --no-rebuild
+              for exe in "$out/usr/bin/fusermount3" "$out/usr/lib/defused/defused"; do
+                patchelf --set-interpreter '${glibcInterpreter}' --remove-rpath "$exe"
+              done
               runHook postInstall
             '';
           };

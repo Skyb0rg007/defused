@@ -31,19 +31,48 @@ description: |
   system service plus a fusermount3-compatible client, so FUSE mounting
   works under the no_new_privileges process flag.
 
+# Explicit file_info on every entry: the source tree's modes are whatever
+# the Nix build happened to produce (e.g. read-only, non-0755 binaries), not
+# conventional package modes, so normalize to root:root with the usual
+# 0755-executable / 0644-everything-else split rather than passing that
+# through as-is.
 contents:
   - src: usr/lib/defused/defused
     dst: /usr/lib/defused/defused
+    file_info:
+      mode: 0755
+      owner: root
+      group: root
   - src: usr/bin/fusermount3
     dst: /usr/bin/fusermount3
+    file_info:
+      mode: 0755
+      owner: root
+      group: root
   - src: usr/share/polkit-1/actions/website.soss.defused.policy
     dst: /usr/share/polkit-1/actions/website.soss.defused.policy
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
   - src: usr/lib/systemd/system/defused.service
     dst: /usr/lib/systemd/system/defused.service
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
   - src: usr/lib/systemd/system/defused.socket
     dst: /usr/lib/systemd/system/defused.socket
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
   - src: usr/share/doc/defused/examples/50-defused-mount-policy.rules
     dst: /usr/share/doc/defused/examples/50-defused-mount-policy.rules
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
 
 overrides:
   deb:
