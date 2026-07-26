@@ -133,8 +133,6 @@ static int create_listening_socket(void)
 static int bind_unix_socket(int fd, const struct sockaddr_un *sa,
                             socklen_t sa_len, const char *path)
     __attribute__((__nonnull__(2, 4), __warn_unused_result__));
-static int mkdir_parent(const char *path)
-    __attribute__((__nonnull__(1), __warn_unused_result__));
 static int fd_mnt_id(int proc_fd, int fd, long *out_id)
     __attribute__((__nonnull__(3), __warn_unused_result__));
 
@@ -1127,18 +1125,13 @@ static int create_listening_socket(void) {
     }
     (void)strlcpy(sa.sun_path, path, sizeof(sa.sun_path));
 
-    int ret = mkdir_parent(path);
-    if (ret < 0)
-        return ret;
-
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd == -1) {
-        ret = -errno;
         fprintf(stderr, "defused: socket: %s\n", strerror(errno));
-        return ret;
+        return -errno;
     }
 
-    ret = bind_unix_socket(fd, &sa, sizeof(sa), path);
+    int ret = bind_unix_socket(fd, &sa, sizeof(sa), path);
     if (ret < 0)
         goto out_close;
 
@@ -1212,28 +1205,6 @@ static int bind_unix_socket(int fd, const struct sockaddr_un *sa,
 out:
     close(probe);
     return ret;
-}
-
-/* Creates the parent directory of path (mode 0755) if it doesn't already
- * exist, so --daemon doesn't depend on systemd's RuntimeDirectory=. */
-static int mkdir_parent(const char *path) {
-    char dir[sizeof(((struct sockaddr_un *)0)->sun_path)];
-    size_t len = strlen(path);
-    if (len >= sizeof(dir))
-        return -ENAMETOOLONG;
-    memcpy(dir, path, len + 1);
-
-    char *slash = strrchr(dir, '/');
-    if (!slash || slash == dir)
-        return 0;
-    *slash = '\0';
-
-    if (mkdir(dir, 0755) == -1 && errno != EEXIST) {
-        int ret = -errno;
-        fprintf(stderr, "defused: mkdir(%s): %s\n", dir, strerror(errno));
-        return ret;
-    }
-    return 0;
 }
 
 /* Implements systemd socket activation */
