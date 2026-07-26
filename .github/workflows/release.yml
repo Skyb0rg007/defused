@@ -17,7 +17,7 @@ jobs:
   # Built via debhelper/dpkg-buildpackage (see debian/) rather than directly
   # on the ubuntu-latest/ubuntu-24.04-arm runner's own userland: those
   # runners are currently Ubuntu 24.04, whose libsystemd-dev (255) predates
-  # the sd-varlink-idl.h API src/defused.h uses. Confirmed by actually
+  # the sd-varlink-idl.h API src/defused_proto.h uses. Confirmed by actually
   # building: dpkg-shlibdeps against a real build emits
   # "libsystemd0 (>= 258~rc1)", which 24.04 can't satisfy. Ubuntu 26.04 (LTS,
   # systemd 259) can, so build inside an Ubuntu 26.04 container on top of

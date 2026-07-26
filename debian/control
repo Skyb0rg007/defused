@@ -16,7 +16,7 @@ Package: defused
 Architecture: any
 # libsystemd0 (>= 258) is also implied by ${shlibs:Depends} (dpkg-shlibdeps
 # picks up the real per-symbol floor from the built binaries, e.g.
-# "libsystemd0 (>= 258~rc1)"), but src/defused.h's Varlink usage needing a
+# "libsystemd0 (>= 258~rc1)"), but src/defused_proto.h's Varlink usage needing a
 # systemd this recent is significant enough -- current Debian stable and
 # Ubuntu LTS don't ship it yet -- to also spell out explicitly here rather
 # than leave it implicit in a build-time-computed substvar. See README.md's
