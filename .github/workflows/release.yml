@@ -14,39 +14,98 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  # Built via debhelper/dpkg-buildpackage (see debian/) rather than directly
+  # on the ubuntu-latest/ubuntu-24.04-arm runner's own userland: those
+  # runners are currently Ubuntu 24.04, whose libsystemd-dev (255) predates
+  # the sd-varlink-idl.h API src/defused.h uses. Confirmed by actually
+  # building: dpkg-shlibdeps against a real build emits
+  # "libsystemd0 (>= 258~rc1)", which 24.04 can't satisfy. Ubuntu 26.04 (LTS,
+  # systemd 259) can, so build inside an Ubuntu 26.04 container on top of
+  # those same runners instead -- Docker pulls the image matching the host's
+  # native architecture, so this works unemulated on both matrix legs.
+  #
+  # ubuntu:26.04 as of this writing; bump the digest as needed.
+  deb:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm]
+    container:
+      image: ubuntu@sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb
     steps:
+      # git/ca-certificates first: actions/checkout (next step) needs git,
+      # and the container image doesn't include it.
+      - name: Install build dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git ca-certificates \
+            build-essential debhelper devscripts meson ninja-build \
+            pkg-config libseccomp-dev libsystemd-dev
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342
-        with:
-          nix_path: nixpkgs=channel:nixos-unstable
-          extra_nix_config: 'system-features = benchmark big-parallel nixos-test uid-range kvm'
-      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71
-        with:
-          name: defused
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-      - name: Build .deb and .rpm packages
+      - name: Build .deb
+        run: dpkg-buildpackage -us -uc -b
+      - name: Collect .deb
         run: |
           mkdir -p dist
-          deb=$(nix build .#deb --no-link --print-out-paths)
-          rpm=$(nix build .#rpm --no-link --print-out-paths)
-          cp -L "$deb" "dist/$(basename "$deb").deb"
-          cp -L "$rpm" "dist/$(basename "$rpm").rpm"
+          cp "$(dirname "$GITHUB_WORKSPACE")"/defused_*.deb dist/
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: packages-${{ matrix.os }}
-          path: dist/*
+          name: deb-${{ matrix.os }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+  # GitHub's hosted runners aren't Fedora, so run rpmbuild inside a Fedora
+  # container instead -- this works fine on both the ubuntu-latest (x86_64)
+  # and ubuntu-24.04-arm (native aarch64 hardware, not emulated) matrix legs,
+  # since Docker pulls the image matching the host's native architecture.
+  # Also happens to sidestep the same libsystemd-version issue as the .deb
+  # job above: Fedora 44 ships systemd 259.
+  #
+  # fedora:44 (current stable) as of this writing; bump the digest as
+  # releases roll forward.
+  rpm:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    container:
+      image: fedora@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install -y \
+            git \
+            rpm-build rpmdevtools meson ninja-build gcc \
+            pkgconf-pkg-config systemd-devel libseccomp-devel systemd-rpm-macros
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Build .rpm
+        run: |
+          set -eu
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          version=$(grep -oP "version\s*:\s*'\K[0-9]+\.[0-9]+(\.[0-9]+)?" meson.build)
+          rpmdev-setuptree
+          git archive --prefix="defused-$version/" -o ~/rpmbuild/SOURCES/"defused-$version.tar.gz" HEAD
+          cp packaging/defused.spec ~/rpmbuild/SPECS/
+          rpmbuild -ba ~/rpmbuild/SPECS/defused.spec
+      - name: Collect .rpm
+        run: |
+          mkdir -p dist
+          find ~/rpmbuild/RPMS -name 'defused-*.rpm' \
+            ! -name '*debuginfo*' ! -name '*debugsource*' \
+            -exec cp {} dist/ \;
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: rpm-${{ matrix.os }}
+          path: dist/*.rpm
           if-no-files-found: error
 
   # Only actually publish a release when this ran off a `v*` tag push --
-  # workflow_dispatch (e.g. to smoke-test the build job above) has no such
+  # workflow_dispatch (e.g. to smoke-test the build jobs above) has no such
   # tag to attach a release to.
   release:
-    needs: build
+    needs: [deb, rpm]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
@@ -55,7 +114,6 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           path: dist
-          pattern: packages-*
           merge-multiple: true
       - name: Create release and upload assets
         env:
