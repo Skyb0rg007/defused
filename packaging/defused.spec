@@ -26,7 +26,7 @@ BuildRequires:  systemd-rpm-macros
 Requires:       polkit
 # rpmbuild's automatic Requires generator also picks up the real per-symbol
 # floor from the built binaries (e.g. "libsystemd.so.0(LIBSYSTEMD_258)"), but
-# src/defused.h's Varlink usage needing a systemd this recent is significant
+# src/defused_proto.h's Varlink usage needing a systemd this recent is significant
 # enough -- current Fedora satisfies it, but current Debian stable and
 # Ubuntu LTS don't -- to also spell out explicitly here. systemd-libs is the
 # Fedora package that owns libsystemd.so.0 (confirmed via
