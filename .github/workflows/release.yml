@@ -44,6 +44,13 @@ jobs:
             build-essential debhelper devscripts meson ninja-build \
             pkg-config libseccomp-dev libsystemd-dev
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      # meson.build's version, packaging/defused.spec's Version:, and
+      # debian/changelog's top entry are three independently hand-maintained
+      # copies of the same number (see check-version-consistency.sh). Fail
+      # loudly here rather than have a version bump in one of them surface
+      # later as a confusing tarball-not-found/rpmbuild error in the rpm job.
+      - name: Check package version consistency
+        run: ./.github/scripts/check-version-consistency.sh
       - name: Build .deb
         run: dpkg-buildpackage -us -uc -b
       - name: Collect .deb
@@ -80,6 +87,15 @@ jobs:
             rpm-build rpmdevtools meson ninja-build gcc \
             pkgconf-pkg-config systemd-devel libseccomp-devel systemd-rpm-macros
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      # meson.build's version, packaging/defused.spec's Version:, and
+      # debian/changelog's top entry are three independently hand-maintained
+      # copies of the same number (see check-version-consistency.sh). A drift
+      # here specifically breaks this job: rpmbuild's Source0 looks for
+      # %{name}-%{version}.tar.gz using the spec's own Version:, so a tarball
+      # named from meson.build's (different) version fails as a confusing
+      # file-not-found error. Fail loudly and clearly instead.
+      - name: Check package version consistency
+        run: ./.github/scripts/check-version-consistency.sh
       - name: Build .rpm
         run: |
           set -eu

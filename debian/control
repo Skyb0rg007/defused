@@ -21,7 +21,13 @@ Architecture: any
 # Ubuntu LTS don't ship it yet -- to also spell out explicitly here rather
 # than leave it implicit in a build-time-computed substvar. See README.md's
 # Installation section.
-Depends: ${shlibs:Depends}, ${misc:Depends}, libsystemd0 (>= 258), policykit-1
+#
+# polkitd, not the older policykit-1 name: current Debian (trixie) dropped
+# policykit-1 as an installable package entirely, and current Ubuntu (26.04)
+# did the same -- verified with `apt-cache policy policykit-1 polkitd` in
+# both. Every distro new enough to satisfy the libsystemd floor above also
+# has polkitd.
+Depends: ${shlibs:Depends}, ${misc:Depends}, libsystemd0 (>= 258), polkitd
 Description: setuid-less replacement for fusermount3
  defused replaces libfuse's setuid-root fusermount3 helper with a
  socket-activated system service (listening on

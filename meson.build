@@ -78,15 +78,19 @@ install_data(
 # NB: the systemd unit's ExecStart= is hardcoded to /usr/lib/defused/defused,
 # so packages including these units must be configured with -Dprefix=/usr for
 # the installed executable_dir above to actually match.
+#
+# defused@.service is a template unit: defused.socket's Accept=yes means
+# systemd instantiates one defused@<connection>.service per connection
+# rather than running a single persistent defused.service.
 install_data(
-  'units/defused.service',
-  'units/defused.socket',
+  'packaging/systemd/defused@.service',
+  'packaging/systemd/defused.socket',
   install_dir : systemd_system_unit_dir,
 )
 
 # Reference/example only -- not installed as a live policy, see doc/protocol.md.
 install_data(
-  'examples/50-defused-mount-policy.rules',
+  'packaging/polkit/examples/50-defused-mount-policy.rules',
   install_dir : get_option('datadir') / 'doc' / meson.project_name() / 'examples',
 )
 

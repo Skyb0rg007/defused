@@ -128,16 +128,17 @@ $ sudo apt install ./defused_<version>_amd64.deb
 $ sudo dnf install ./defused-<version>-1.x86_64.rpm
 ```
 
-This installs the `units/defused.service`/`units/defused.socket` units and
-the polkit action, but doesn't enable or start the socket for you:
+This installs the `defused@.service`/`defused.socket` units and the polkit
+action, but doesn't enable or start the socket for you:
 
 ```sh
 $ sudo systemctl enable --now defused.socket
 ```
 
 See [protocol.md](./doc/protocol.md) for the default (interactive-only)
-polkit policy, and `examples/50-defused-mount-policy.rules` (installed under
-`/usr/share/doc/defused/examples`) for a less strict example rule.
+polkit policy, and `packaging/polkit/examples/50-defused-mount-policy.rules`
+(installed under `/usr/share/doc/defused/examples`) for a less strict
+example rule.
 
 These packages can also be built locally:
 
