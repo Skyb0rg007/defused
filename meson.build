@@ -15,6 +15,24 @@ seccomp_dep = cc.find_library('seccomp', has_headers : ['seccomp.h'])
 systemd_dep = dependency('libsystemd')
 libfuse_fusermount3 = find_program(get_option('libfuse_fusermount3'))
 
+# Separate from the libsystemd link dependency above: the "systemd" pkg-config
+# module (shipped by the systemd package itself, e.g. libsystemd-dev on
+# Debian or systemd-devel on Fedora) exposes install-path variables like
+# systemdsystemunitdir but its .pc file hardcodes ${prefix} to wherever that
+# systemd package happens to live (e.g. a Nix store path under nixpkgs)
+# rather than deriving it from this project's own -Dprefix. Overriding
+# "prefix" explicitly makes the unit directory follow our own --prefix like
+# every other install_dir in this file.
+systemd_pc_dep = dependency('systemd', required : false)
+if systemd_pc_dep.found()
+  systemd_system_unit_dir = systemd_pc_dep.get_variable(
+    pkgconfig : 'systemdsystemunitdir',
+    pkgconfig_define : ['prefix', get_option('prefix')],
+  )
+else
+  systemd_system_unit_dir = get_option('prefix') / 'lib/systemd/system'
+endif
+
 # XXX: Check for function availability
 common_c_args = ['-DHAVE_CLOSE_RANGE']
 fusermount3_c_args = common_c_args + [
@@ -55,6 +73,25 @@ fusermount3_exe = executable(
 install_data(
   'packaging/polkit/website.soss.defused.policy',
   install_dir : get_option('datadir') / 'polkit-1/actions',
+)
+
+# NB: the systemd unit's ExecStart= is hardcoded to /usr/lib/defused/defused,
+# so packages including these units must be configured with -Dprefix=/usr for
+# the installed executable_dir above to actually match.
+#
+# defused@.service is a template unit: defused.socket's Accept=yes means
+# systemd instantiates one defused@<connection>.service per connection
+# rather than running a single persistent defused.service.
+install_data(
+  'packaging/systemd/defused@.service',
+  'packaging/systemd/defused.socket',
+  install_dir : systemd_system_unit_dir,
+)
+
+# Reference/example only -- not installed as a live policy, see doc/protocol.md.
+install_data(
+  'packaging/polkit/examples/50-defused-mount-policy.rules',
+  install_dir : get_option('datadir') / 'doc' / meson.project_name() / 'examples',
 )
 
 ## Tests ##

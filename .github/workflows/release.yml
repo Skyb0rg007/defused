@@ -1,0 +1,143 @@
+# SPDX-FileCopyrightText: 2026 Skye Soss <skye@soss.website>
+#
+# SPDX-License-Identifier: MIT-0
+
+name: Release
+
+on:
+  workflow_dispatch: ~
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  # Built via debhelper/dpkg-buildpackage (see debian/) rather than directly
+  # on the ubuntu-latest/ubuntu-24.04-arm runner's own userland: those
+  # runners are currently Ubuntu 24.04, whose libsystemd-dev (255) predates
+  # the sd-varlink-idl.h API src/defused_proto.h uses. Confirmed by actually
+  # building: dpkg-shlibdeps against a real build emits
+  # "libsystemd0 (>= 258~rc1)", which 24.04 can't satisfy. Ubuntu 26.04 (LTS,
+  # systemd 259) can, so build inside an Ubuntu 26.04 container on top of
+  # those same runners instead -- Docker pulls the image matching the host's
+  # native architecture, so this works unemulated on both matrix legs.
+  #
+  # ubuntu:26.04 as of this writing; bump the digest as needed.
+  deb:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    container:
+      image: ubuntu@sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb
+    steps:
+      # git/ca-certificates first: actions/checkout (next step) needs git,
+      # and the container image doesn't include it.
+      - name: Install build dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git ca-certificates \
+            build-essential debhelper devscripts meson ninja-build \
+            pkg-config libseccomp-dev libsystemd-dev
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      # meson.build's version, packaging/defused.spec's Version:, and
+      # debian/changelog's top entry are three independently hand-maintained
+      # copies of the same number (see check-version-consistency.sh). Fail
+      # loudly here rather than have a version bump in one of them surface
+      # later as a confusing tarball-not-found/rpmbuild error in the rpm job.
+      - name: Check package version consistency
+        run: ./.github/scripts/check-version-consistency.sh
+      - name: Build .deb
+        run: dpkg-buildpackage -us -uc -b
+      - name: Collect .deb
+        run: |
+          mkdir -p dist
+          cp "$(dirname "$GITHUB_WORKSPACE")"/defused_*.deb dist/
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: deb-${{ matrix.os }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+  # GitHub's hosted runners aren't Fedora, so run rpmbuild inside a Fedora
+  # container instead -- this works fine on both the ubuntu-latest (x86_64)
+  # and ubuntu-24.04-arm (native aarch64 hardware, not emulated) matrix legs,
+  # since Docker pulls the image matching the host's native architecture.
+  # Also happens to sidestep the same libsystemd-version issue as the .deb
+  # job above: Fedora 44 ships systemd 259.
+  #
+  # fedora:44 (current stable) as of this writing; bump the digest as
+  # releases roll forward.
+  rpm:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    container:
+      image: fedora@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install -y \
+            git \
+            rpm-build rpmdevtools meson ninja-build gcc \
+            pkgconf-pkg-config systemd-devel libseccomp-devel systemd-rpm-macros
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      # meson.build's version, packaging/defused.spec's Version:, and
+      # debian/changelog's top entry are three independently hand-maintained
+      # copies of the same number (see check-version-consistency.sh). A drift
+      # here specifically breaks this job: rpmbuild's Source0 looks for
+      # %{name}-%{version}.tar.gz using the spec's own Version:, so a tarball
+      # named from meson.build's (different) version fails as a confusing
+      # file-not-found error. Fail loudly and clearly instead.
+      - name: Check package version consistency
+        run: ./.github/scripts/check-version-consistency.sh
+      - name: Build .rpm
+        run: |
+          set -eu
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          version=$(grep -oP "version\s*:\s*'\K[0-9]+\.[0-9]+(\.[0-9]+)?" meson.build)
+          rpmdev-setuptree
+          git archive --prefix="defused-$version/" -o ~/rpmbuild/SOURCES/"defused-$version.tar.gz" HEAD
+          cp packaging/defused.spec ~/rpmbuild/SPECS/
+          rpmbuild -ba ~/rpmbuild/SPECS/defused.spec
+      - name: Collect .rpm
+        run: |
+          mkdir -p dist
+          find ~/rpmbuild/RPMS -name 'defused-*.rpm' \
+            ! -name '*debuginfo*' ! -name '*debugsource*' \
+            -exec cp {} dist/ \;
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: rpm-${{ matrix.os }}
+          path: dist/*.rpm
+          if-no-files-found: error
+
+  # Only actually publish a release when this ran off a `v*` tag push --
+  # workflow_dispatch (e.g. to smoke-test the build jobs above) has no such
+  # tag to attach a release to.
+  release:
+    needs: [deb, rpm]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "$TAG" \
+            --generate-notes \
+            dist/*

@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: 2026 Skye Soss <skye@soss.website>
+#
+# SPDX-License-Identifier: MIT-0
+
+[Unit]
+Description=defused FUSE mount service (%i)
+Documentation=https://github.com/Skyb0rg007/defused
+Wants=polkit.service
+After=polkit.service
+
+[Service]
+ExecStart=/usr/lib/defused/defused
+
+# No [Install] section: this is a template unit instantiated per-connection
+# by defused.socket's Accept=yes -- it's never enabled/started directly, so
+# there's nothing for [Install] to attach to. Enable/start defused.socket
+# instead (see its own [Install] section).
