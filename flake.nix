@@ -195,7 +195,10 @@
           defusedFhs = pkgs.stdenv.mkDerivation {
             pname = "defused-fhs";
             inherit version src;
-            nativeBuildInputs = defused.nativeBuildInputs ++ [ pkgs.patchelf ];
+            nativeBuildInputs = defused.nativeBuildInputs ++ [
+              pkgs.patchelf
+              pkgs.python3
+            ];
             buildInputs = defused.buildInputs;
 
             configurePhase = ''
@@ -211,12 +214,31 @@
             '';
 
             installPhase = ''
-              runHook preInstall
-              DESTDIR="$out" meson install -C build --no-rebuild
-              for exe in "$out/usr/bin/fusermount3" "$out/usr/lib/defused/defused"; do
-                patchelf --set-interpreter '${glibcInterpreter}' --remove-rpath "$exe"
-              done
-              runHook postInstall
+                            runHook preInstall
+                            DESTDIR="$out" meson install -C build --no-rebuild
+                            for exe in "$out/usr/bin/fusermount3" "$out/usr/lib/defused/defused"; do
+                              # patchelf --remove-rpath only unlinks the DT_RUNPATH tag;
+                              # the bytes of the old rpath string physically remain in
+                              # the file's now-unreferenced .dynstr tail, so grep-based
+                              # scans (see checks.<system>.packaging) would still flag
+                              # a Nix store reference even after the tag is gone.
+                              # Capture the old value first and overwrite those bytes
+                              # in place (same length, so no file offsets shift).
+                              oldRpath=$(patchelf --print-rpath "$exe")
+                              patchelf --set-interpreter '${glibcInterpreter}' --remove-rpath "$exe"
+                              if [ -n "$oldRpath" ]; then
+                                python3 -c '
+              import sys
+              path, old = sys.argv[1], sys.argv[2].encode()
+              with open(path, "rb") as f:
+                  data = f.read()
+              data = data.replace(old, b"X" * len(old))
+              with open(path, "wb") as f:
+                  f.write(data)
+              ' "$exe" "$oldRpath"
+                              fi
+                            done
+                            runHook postInstall
             '';
           };
 
