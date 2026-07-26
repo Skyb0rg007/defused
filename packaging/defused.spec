@@ -71,7 +71,7 @@ instead of relying on /usr/bin placement.
 %{_bindir}/fusermount3
 %dir %{_prefix}/lib/defused
 %{_prefix}/lib/defused/defused
-%{_unitdir}/defused.service
+%{_unitdir}/defused@.service
 %{_unitdir}/defused.socket
 %{_datadir}/polkit-1/actions/website.soss.defused.policy
 %dir %{_datadir}/doc/%{name}/examples
