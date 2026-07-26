@@ -102,24 +102,27 @@ parent directory. `parentFileDescriptor` is the index of that fd, normally `0`.
 `name` is the mountpoint's basename within that directory.
 
 The service opens `name` under the parent fd to identify the target via its
-`fdinfo` `mnt_id`, compare that with the parent fd's `mnt_id`, and look up the
-matching `/proc/self/mountinfo` line, then closes the target fd before doing
-anything further. The target must be a mountpoint under the parent, not just a
-regular directory inside the same mount, so the target and parent mount IDs must
-differ (`DEFUSED_ERR_NOT_A_FUSE_MOUNT` otherwise).
+`fdinfo` `mnt_id` and compares that with the parent fd's `mnt_id`. It retains
+that target fd through authorization. The target must be a mountpoint under the
+parent, not just a regular directory inside the same mount, so the target and
+parent mount IDs must differ
+(`DEFUSED_ERR_NOT_A_FUSE_MOUNT` otherwise).
 
 The service then asks polkit whether the caller is permitted to call
 `website.soss.defused.unmount`: a denial maps to `DEFUSED_ERR_NOT_ALLOWED`,
 while being unable to reach polkit at all fails with
 `DEFUSED_ERR_UNMOUNT_FAILED`. After joining the caller's mount namespace, the
-target lookup must also show the mount as a FUSE mount
+the target's `mnt_id` must also identify a FUSE mount in
+`/proc/self/mountinfo`
 (`DEFUSED_ERR_NOT_A_FUSE_MOUNT` otherwise), and its `user_id=` superblock
 option must match the caller's uid (`DEFUSED_ERR_NOT_ALLOWED` otherwise).
 The polkit check only answers whether the caller may use unmount at all,
 and thus the default policy is to always allow.
 
-If `lazy` is true, the service uses `MNT_DETACH`; otherwise it performs a
-non-lazy unmount.
+The service unmounts through the retained target fd's trusted
+`/proc/self/fd/<fd>` link, so a concurrent rename or replacement of `name`
+cannot redirect the final operation to a different mount. If `lazy` is true,
+the service uses `MNT_DETACH`; otherwise it performs a non-lazy unmount.
 
 ## Response Status
 
