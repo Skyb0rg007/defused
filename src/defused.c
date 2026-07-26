@@ -917,9 +917,6 @@ static int handle_umount(sd_varlink *link, int sock,
         sys_errno = -ret;
         goto out;
     }
-    close(mnt_fd);
-    mnt_fd = -1;
-
     if (mnt_id == parent_mnt_id) {
         status = DEFUSED_ERR_NOT_A_FUSE_MOUNT;
         ret = -EINVAL;
@@ -948,7 +945,7 @@ static int handle_umount(sd_varlink *link, int sock,
         goto out;
     }
 
-    ret = defused_sandbox_unmount(pidfd, proc_fd, parent_fd, req, mnt_id,
+    ret = defused_sandbox_unmount(pidfd, proc_fd, mnt_fd, req->lazy, mnt_id,
                                   cred->uid, &status, &sys_errno);
     close(pidfd);
     if (ret < 0)

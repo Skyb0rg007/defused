@@ -47,7 +47,8 @@ static int read_full(int fd, void *buf, size_t size) {
     return 0;
 }
 
-static void test_filter_denies_unlisted_syscall(enum defused_op op) {
+static void test_filter_syscall(enum defused_op op, long syscall_number,
+                                int expected_errno) {
     int pipefd[2];
     int ret = pipe2(pipefd, O_CLOEXEC);
     CHECK(ret == 0);
@@ -68,7 +69,7 @@ static void test_filter_denies_unlisted_syscall(enum defused_op op) {
             .install_ret = defused_test_install_seccomp(op),
         };
         errno = 0;
-        result.syscall_ret = syscall(SYS_getpid);
+        result.syscall_ret = syscall(syscall_number, -1, NULL, 0, 0, 0, 0);
         result.sys_errno = errno;
         (void)syscall(SYS_write, pipefd[1], &result, sizeof(result));
         (void)syscall(SYS_exit_group, 0);
@@ -87,7 +88,7 @@ static void test_filter_denies_unlisted_syscall(enum defused_op op) {
     CHECK(WEXITSTATUS(status) == 0);
     CHECK(result.install_ret == 0);
     CHECK(result.syscall_ret == -1);
-    CHECK(result.sys_errno == EPERM);
+    CHECK(result.sys_errno == expected_errno);
 }
 
 static void test_mountinfo_parser(void) {
@@ -147,8 +148,12 @@ static void test_long_mountinfo_line(void) {
 }
 
 int main(void) {
-    test_filter_denies_unlisted_syscall(DEFUSED_OP_MOUNT);
-    test_filter_denies_unlisted_syscall(DEFUSED_OP_UNMOUNT);
+    test_filter_syscall(DEFUSED_OP_MOUNT, SYS_getpid, EPERM);
+    test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_getpid, EPERM);
+    test_filter_syscall(DEFUSED_OP_MOUNT, SYS_read, EPERM);
+    test_filter_syscall(DEFUSED_OP_MOUNT, SYS_close, EPERM);
+    test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_read, EBADF);
+    test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_close, EBADF);
     test_mountinfo_parser();
     test_long_mountinfo_line();
     return failures ? 1 : 0;

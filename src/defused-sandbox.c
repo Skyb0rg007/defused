@@ -28,17 +28,15 @@ struct sandbox_result {
  * Restrict ourselves before that to make sure nothing bad happens. */
 static int install_seccomp(enum defused_op op) {
     static const int allowed_syscalls[] = {
-        SCMP_SYS(read),         SCMP_SYS(write),      SCMP_SYS(close),
-        SCMP_SYS(exit),         SCMP_SYS(exit_group), SCMP_SYS(setns),
-        SCMP_SYS(rt_sigreturn),
+        SCMP_SYS(write), SCMP_SYS(exit),         SCMP_SYS(exit_group),
+        SCMP_SYS(setns), SCMP_SYS(rt_sigreturn),
     };
     static const int mount_syscalls[] = {
         SCMP_SYS(move_mount),
     };
     static const int unmount_syscalls[] = {
-        SCMP_SYS(fchdir),
-        SCMP_SYS(umount2),
-        SCMP_SYS(openat),
+        SCMP_SYS(read),    SCMP_SYS(close),  SCMP_SYS(fchdir),
+        SCMP_SYS(umount2), SCMP_SYS(openat),
     };
 
     scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_ERRNO(EPERM));
@@ -120,13 +118,14 @@ static int sandbox_umount2(const char *path, int flags) {
     return (int)syscall(SYS_umount2, path, flags);
 }
 
-static void sandbox_exit(int status) {
+static __attribute__((__noreturn__)) void sandbox_exit(int status) {
     (void)syscall(SYS_exit_group, status);
     for (;;)
         (void)syscall(SYS_exit, status);
 }
 
-static void sandbox_finish(int out_fd, struct sandbox_result result) {
+static __attribute__((__noreturn__)) void
+sandbox_finish(int out_fd, struct sandbox_result result) {
     const char *p = (const char *)&result;
     size_t left = sizeof(result);
 
@@ -473,12 +472,11 @@ int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd, uint32_t *status,
     return result.ret;
 }
 
-int defused_sandbox_unmount(int pidfd, int proc_fd, int parent_fd,
-                            const struct defused_umount_req *req, long mnt_id,
-                            uid_t uid, uint32_t *status, int *sys_errno) {
-    char proc_path[32 + DEFUSED_MAX_FILENAME];
-    snprintf(proc_path, sizeof(proc_path), "self/fd/%d/%s", parent_fd,
-             req->name);
+int defused_sandbox_unmount(int pidfd, int proc_fd, int mnt_fd, bool lazy,
+                            long mnt_id, uid_t uid, uint32_t *status,
+                            int *sys_errno) {
+    char proc_path[32];
+    snprintf(proc_path, sizeof(proc_path), "self/fd/%d", mnt_fd);
 
     int pipefd[2];
     if (pipe2(pipefd, O_CLOEXEC) == -1)
@@ -535,8 +533,15 @@ int defused_sandbox_unmount(int pidfd, int proc_fd, int parent_fd,
             sandbox_finish(pipefd[1], result);
         }
 
-        ret = sandbox_umount_by_proc_path(
-            proc_fd, proc_path, (req->lazy ? MNT_DETACH : 0) | UMOUNT_NOFOLLOW);
+        /*
+         * Resolve the mount through the O_PATH fd that supplied mnt_id above,
+         * rather than looking up the client-controlled parent/name pair
+         * again after authorization. proc_fd refers to the service's trusted
+         * procfs, so following this magic link cannot redirect the unmount to
+         * a different client-selected path.
+         */
+        ret = sandbox_umount_by_proc_path(proc_fd, proc_path,
+                                          lazy ? MNT_DETACH : 0);
         struct sandbox_result result = {
             .status = ret < 0 ? DEFUSED_ERR_UNMOUNT_FAILED : DEFUSED_OK,
             .sys_errno = ret < 0 ? -ret : 0,
