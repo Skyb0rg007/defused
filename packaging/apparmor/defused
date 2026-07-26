@@ -1,0 +1,40 @@
+# SPDX-FileCopyrightText: 2026 Skye Soss <skye@soss.website>
+#
+# SPDX-License-Identifier: MIT-0
+
+abi <abi/4.0>,
+
+include <tunables/global>
+
+profile defused /usr/lib/defused/defused flags=(attach_disconnected) {
+  include <abstractions/base>
+  include <abstractions/dbus-strict>
+
+  capability dac_read_search,
+  capability sys_admin,
+  capability sys_chroot,
+  capability sys_ptrace,
+
+  network unix stream,
+
+  dbus send
+    bus=system
+    path=/org/freedesktop/PolicyKit1/Authority
+    interface=org.freedesktop.PolicyKit1.Authority
+    member=CheckAuthorization
+    peer=(name=org.freedesktop.PolicyKit1),
+  dbus receive
+    bus=system
+    peer=(name=org.freedesktop.PolicyKit1),
+
+  /proc/ r,
+  /proc/@{pid}/fdinfo/* r,
+  /proc/@{pid}/mountinfo r,
+
+  # The client passes already-open mountpoint and parent directory fds.
+  # Permit metadata lookups through those delegated descriptors.
+  /** r,
+
+  mount,
+  umount,
+}
