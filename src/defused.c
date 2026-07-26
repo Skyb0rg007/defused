@@ -37,7 +37,7 @@
 #include <unistd.h>
 
 /* polkit action ids checked before creating/tearing down a FUSE mount; see
- * data/website.soss.defused.policy for their declared defaults. */
+ * packaging/polkit/website.soss.defused.policy for their declared defaults. */
 #define DEFUSED_POLKIT_ACTION_MOUNT "website.soss.defused.mount"
 #define DEFUSED_POLKIT_ACTION_UNMOUNT "website.soss.defused.unmount"
 
@@ -45,12 +45,12 @@
  * (see check_polkit_authorized()), so a rule can tell which capabilities a
  * mount request actually needs instead of only "is any capability used at
  * all". A rule should treat any name it doesn't specifically recognize as
- * requiring AUTH_ADMIN_KEEP -- examples/50-defused-mount-policy.rules does
- * this by checking requested names against its own allowlist and falling
- * back otherwise, so a rule written before a new privileged option existed
- * denies it by default instead of silently granting it. Add future
- * privileged options (suid, cuse, blkdev, ...) here as they're
- * implemented. */
+ * requiring AUTH_ADMIN_KEEP --
+ * packaging/polkit/examples/50-defused-mount-policy.rules does this by checking
+ * requested names against its own allowlist and falling back otherwise, so a
+ * rule written before a new privileged option existed denies it by default
+ * instead of silently granting it. Add future privileged options (suid, cuse,
+ * blkdev, ...) here as they're implemented. */
 static const struct {
     uint32_t flag;
     const char *name;
@@ -88,6 +88,8 @@ static int varlink_unmount(sd_varlink *link, sd_json_variant *parameters,
 static const char *status_name(uint32_t status)
     __attribute__((__const__, __warn_unused_result__));
 static int peer_pidfd(int sock) __attribute__((__warn_unused_result__));
+static int get_peer_cred(int sock, struct ucred *cred)
+    __attribute__((__nonnull__(2), __warn_unused_result__));
 static int check_mount_policy(const struct defused_mount_req *req)
     __attribute__((__nonnull__(1), __warn_unused_result__));
 static int check_polkit_authorized(int sock, const struct ucred *cred,
@@ -283,12 +285,8 @@ static int varlink_mount(sd_varlink *link, sd_json_variant *parameters,
     }
 
     struct ucred cred;
-    socklen_t cred_len = sizeof(cred);
-    if (getsockopt(ctx->sock, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) ==
-        -1) {
-        ret = -errno;
-        fprintf(stderr, "defused: SO_PEERCRED failed: %s\n", strerror(errno));
-    } else
+    ret = get_peer_cred(ctx->sock, &cred);
+    if (ret == 0)
         ret = handle_mount(link, ctx->sock, &req, mnt_fd, dev_fd, &cred);
 
     close(dev_fd);
@@ -339,12 +337,8 @@ static int varlink_unmount(sd_varlink *link, sd_json_variant *parameters,
                                                        "parentFileDescriptor");
 
     struct ucred cred;
-    socklen_t cred_len = sizeof(cred);
-    if (getsockopt(ctx->sock, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) ==
-        -1) {
-        ret = -errno;
-        fprintf(stderr, "defused: SO_PEERCRED failed: %s\n", strerror(errno));
-    } else
+    ret = get_peer_cred(ctx->sock, &cred);
+    if (ret == 0)
         ret = handle_umount(link, ctx->sock, &req, parent_fd, &cred);
 
     close(parent_fd);
@@ -382,6 +376,15 @@ static int peer_pidfd(int sock) {
         return -errno;
     }
     return pidfd;
+}
+
+static int get_peer_cred(int sock, struct ucred *cred) {
+    socklen_t len = sizeof(*cred);
+    if (getsockopt(sock, SOL_SOCKET, SO_PEERCRED, cred, &len) == -1) {
+        fprintf(stderr, "defused: SO_PEERCRED failed: %s\n", strerror(errno));
+        return -errno;
+    }
+    return 0;
 }
 
 static int neg_errno(void) { return -errno; }
@@ -469,12 +472,9 @@ static int check_polkit_authorized(int sock, const struct ucred *cred,
                                    const char *action_id, long current_mounts,
                                    const char *privileged_flags) {
     bool have_privileged_flags = privileged_flags && privileged_flags[0];
-    int pidfd = -1;
-    socklen_t pidfd_len = sizeof(pidfd);
-    if (getsockopt(sock, SOL_SOCKET, SO_PEERPIDFD, &pidfd, &pidfd_len) == -1) {
-        fprintf(stderr, "defused: SO_PEERPIDFD failed: %s\n", strerror(errno));
-        return -errno;
-    }
+    int pidfd = peer_pidfd(sock);
+    if (pidfd < 0)
+        return pidfd;
 
     sd_bus *bus = NULL;
     sd_bus_message *call = NULL;
@@ -513,7 +513,8 @@ static int check_polkit_authorized(int sock, const struct ucred *cred,
      * here. current-mounts and privileged-flags (mount only, see above) are
      * the only things a rule can't get any other way, and are each omitted
      * entirely when the caller has nothing to say -- see
-     * examples/50-defused-mount-policy.rules for a rule that uses both. */
+     * packaging/polkit/examples/50-defused-mount-policy.rules for a rule that
+     * uses both. */
     ret = sd_bus_message_open_container(call, 'a', "{ss}");
     if (ret < 0)
         goto out;
@@ -655,60 +656,42 @@ static int create_detached_mount(const struct prepared_mount *mnt) {
     int mountfd = -1;
     int ret = 0;
 
-    if (mnt->have_subtype) {
-        ret = mount_fsconfig_string(fsfd, "subtype", mnt->type + 5);
+    const struct {
+        const char *key;
+        const char *value;
+        bool present;
+    } strings[] = {
+        {"subtype", mnt->type + 5, mnt->have_subtype},
+        {"source", mnt->source, true},
+        {"fd", mnt->fd, true},
+        {"rootmode", mnt->rootmode, true},
+        {"user_id", mnt->user_id, true},
+        {"group_id", mnt->group_id, true},
+        {"max_read", mnt->max_read, mnt->have_max_read},
+        {"blksize", mnt->blksize, mnt->have_blksize},
+    };
+    for (size_t i = 0; i < sizeof(strings) / sizeof(strings[0]); i++) {
+        if (!strings[i].present)
+            continue;
+        ret = mount_fsconfig_string(fsfd, strings[i].key, strings[i].value);
         if (ret < 0)
             goto out;
     }
 
-    ret = mount_fsconfig_string(fsfd, "source", mnt->source);
-    if (ret < 0)
-        goto out;
-    ret = mount_fsconfig_string(fsfd, "fd", mnt->fd);
-    if (ret < 0)
-        goto out;
-    ret = mount_fsconfig_string(fsfd, "rootmode", mnt->rootmode);
-    if (ret < 0)
-        goto out;
-    ret = mount_fsconfig_string(fsfd, "user_id", mnt->user_id);
-    if (ret < 0)
-        goto out;
-    ret = mount_fsconfig_string(fsfd, "group_id", mnt->group_id);
-    if (ret < 0)
-        goto out;
-
-    if (mnt->flags & DEFUSED_FUSE_ALLOW_OTHER) {
-        ret = mount_fsconfig_flag(fsfd, "allow_other");
-        if (ret < 0)
-            goto out;
-    }
-    if (mnt->flags & DEFUSED_FUSE_DEFAULT_PERMISSIONS) {
-        ret = mount_fsconfig_flag(fsfd, "default_permissions");
-        if (ret < 0)
-            goto out;
-    }
-    if (mnt->have_max_read) {
-        ret = mount_fsconfig_string(fsfd, "max_read", mnt->max_read);
-        if (ret < 0)
-            goto out;
-    }
-    if (mnt->have_blksize) {
-        ret = mount_fsconfig_string(fsfd, "blksize", mnt->blksize);
-        if (ret < 0)
-            goto out;
-    }
-    if (mnt->flags & DEFUSED_MOUNT_RDONLY) {
-        ret = mount_fsconfig_flag(fsfd, "ro");
-        if (ret < 0)
-            goto out;
-    }
-    if (mnt->flags & DEFUSED_MOUNT_SYNCHRONOUS) {
-        ret = mount_fsconfig_flag(fsfd, "sync");
-        if (ret < 0)
-            goto out;
-    }
-    if (mnt->flags & DEFUSED_MOUNT_DIRSYNC) {
-        ret = mount_fsconfig_flag(fsfd, "dirsync");
+    const struct {
+        const char *key;
+        bool present;
+    } flags[] = {
+        {"allow_other", mnt->flags & DEFUSED_FUSE_ALLOW_OTHER},
+        {"default_permissions", mnt->flags & DEFUSED_FUSE_DEFAULT_PERMISSIONS},
+        {"ro", mnt->flags & DEFUSED_MOUNT_RDONLY},
+        {"sync", mnt->flags & DEFUSED_MOUNT_SYNCHRONOUS},
+        {"dirsync", mnt->flags & DEFUSED_MOUNT_DIRSYNC},
+    };
+    for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
+        if (!flags[i].present)
+            continue;
+        ret = mount_fsconfig_flag(fsfd, flags[i].key);
         if (ret < 0)
             goto out;
     }

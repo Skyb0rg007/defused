@@ -49,7 +49,7 @@
  * back to defused's own namespace instead of failing would show up as
  * neither of its two accepted statuses. Real, trusted-caller (root)
  * coverage of both mount and unmount across mount namespaces lives in
- * nixos/tests/mount-namespace.nix instead.
+ * packaging/nixos/tests/mount-namespace.nix instead.
  */
 #define _GNU_SOURCE
 #include "defused_proto.h"
