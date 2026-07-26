@@ -38,7 +38,7 @@ pkgs.testers.nixosTest {
     # that challenge, so every mount must be refused.
     denied = plainNode;
 
-    # Installs the actual shipped example rule (examples/
+    # Installs the actual shipped example rule (polkit/examples/
     # 50-defused-mount-policy.rules) rather than an ad-hoc one, so this test
     # also proves that specific file is correct, not just that *some* rule
     # using current-mounts can grant the base mount action.
@@ -47,7 +47,7 @@ pkgs.testers.nixosTest {
       {
         imports = [ plainNode ];
         environment.etc."polkit-1/rules.d/50-defused-mount-policy.rules".source =
-          ../../examples/50-defused-mount-policy.rules;
+          ../../polkit/examples/50-defused-mount-policy.rules;
       };
 
     # A rule that explicitly adds "allow_other" to its allowlist, unlike

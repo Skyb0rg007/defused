@@ -124,8 +124,17 @@ static __attribute__((__noreturn__)) void sandbox_exit(int status) {
         (void)syscall(SYS_exit, status);
 }
 
+/* Sends the sandboxed child's result back to the parent over out_fd and
+ * exits; sys_errno is taken as given rather than derived from ret, since
+ * some statuses (e.g. DEFUSED_ERR_NOT_ALLOWED) deliberately don't surface a
+ * syscall errno. */
 static __attribute__((__noreturn__)) void
-sandbox_finish(int out_fd, struct sandbox_result result) {
+sandbox_done(int out_fd, uint32_t status, int sys_errno, int ret) {
+    struct sandbox_result result = {
+        .status = status,
+        .sys_errno = sys_errno,
+        .ret = ret,
+    };
     const char *p = (const char *)&result;
     size_t left = sizeof(result);
 
@@ -139,7 +148,7 @@ sandbox_finish(int out_fd, struct sandbox_result result) {
         left -= (size_t)n;
     }
 
-    sandbox_exit(result.ret == 0 ? 0 : 1);
+    sandbox_exit(ret == 0 ? 0 : 1);
 }
 
 enum mountinfo_state {
@@ -396,9 +405,10 @@ static int wait_sandbox(pid_t pid) {
     }
 }
 
-int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd, uint32_t *status,
-                          int *sys_errno) {
-    int pipefd[2];
+/* Creates a CLOEXEC pipe and forks. Returns the child's pid to the parent,
+ * 0 to the child, or a negative errno if pipe2()/fork() itself failed (both
+ * pipe ends are already closed in that case). */
+static pid_t fork_with_pipe(int pipefd[2]) {
     if (pipe2(pipefd, O_CLOEXEC) == -1)
         return -errno;
 
@@ -409,52 +419,22 @@ int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd, uint32_t *status,
         close(pipefd[1]);
         return -saved_errno;
     }
+    return pid;
+}
 
-    if (pid == 0) {
-        close(pipefd[0]);
-
-        int ret = install_seccomp(DEFUSED_OP_MOUNT);
-        if (ret < 0) {
-            struct sandbox_result result = {
-                .status = DEFUSED_ERR_MOUNT_FAILED,
-                .sys_errno = -ret,
-                .ret = ret,
-            };
-            sandbox_finish(pipefd[1], result);
-        }
-
-        if (sandbox_setns(pidfd, CLONE_NEWNS) == -1) {
-            ret = neg_errno();
-            struct sandbox_result result = {
-                .status = DEFUSED_ERR_SETNS_FAILED,
-                .sys_errno = -ret,
-                .ret = ret,
-            };
-            sandbox_finish(pipefd[1], result);
-        }
-
-        if (sandbox_move_mount(mountfd, "", mnt_fd, "",
-                               MOVE_MOUNT_F_EMPTY_PATH |
-                                   MOVE_MOUNT_T_EMPTY_PATH) == -1)
-            ret = neg_errno();
-        else
-            ret = 0;
-        struct sandbox_result result = {
-            .status = ret < 0 ? DEFUSED_ERR_MOUNT_FAILED : DEFUSED_OK,
-            .sys_errno = ret < 0 ? -ret : 0,
-            .ret = ret,
-        };
-        sandbox_finish(pipefd[1], result);
-    }
-
-    close(pipefd[1]);
+/* Reads the child's sandbox_result off pipefd_read and waits for pid,
+ * folding a pipe-read failure or an abnormal exit into the result so the
+ * caller doesn't have to special-case them. fail_status is reported if the
+ * child never got to send a result at all. */
+static int reap_sandbox(int pipefd_read, pid_t pid, uint32_t fail_status,
+                        uint32_t *status, int *sys_errno) {
     struct sandbox_result result = {
-        .status = DEFUSED_ERR_MOUNT_FAILED,
+        .status = fail_status,
         .sys_errno = EIO,
         .ret = -EIO,
     };
-    int ret = read_sandbox_result(pipefd[0], &result);
-    close(pipefd[0]);
+    int ret = read_sandbox_result(pipefd_read, &result);
+    close(pipefd_read);
     int wait_status = wait_sandbox(pid);
     if (ret < 0) {
         result.sys_errno = -ret;
@@ -472,6 +452,39 @@ int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd, uint32_t *status,
     return result.ret;
 }
 
+int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd, uint32_t *status,
+                          int *sys_errno) {
+    int pipefd[2];
+    pid_t pid = fork_with_pipe(pipefd);
+    if (pid < 0)
+        return (int)pid;
+
+    if (pid == 0) {
+        close(pipefd[0]);
+
+        int ret = install_seccomp(DEFUSED_OP_MOUNT);
+        if (ret < 0)
+            sandbox_done(pipefd[1], DEFUSED_ERR_MOUNT_FAILED, -ret, ret);
+
+        if (sandbox_setns(pidfd, CLONE_NEWNS) == -1) {
+            ret = neg_errno();
+            sandbox_done(pipefd[1], DEFUSED_ERR_SETNS_FAILED, -ret, ret);
+        }
+
+        ret = sandbox_move_mount(mountfd, "", mnt_fd, "",
+                                 MOVE_MOUNT_F_EMPTY_PATH |
+                                     MOVE_MOUNT_T_EMPTY_PATH) == -1
+                  ? neg_errno()
+                  : 0;
+        sandbox_done(pipefd[1], ret < 0 ? DEFUSED_ERR_MOUNT_FAILED : DEFUSED_OK,
+                     ret < 0 ? -ret : 0, ret);
+    }
+
+    close(pipefd[1]);
+    return reap_sandbox(pipefd[0], pid, DEFUSED_ERR_MOUNT_FAILED, status,
+                        sys_errno);
+}
+
 int defused_sandbox_unmount(int pidfd, int proc_fd, int mnt_fd, bool lazy,
                             long mnt_id, uid_t uid, uint32_t *status,
                             int *sys_errno) {
@@ -479,59 +492,29 @@ int defused_sandbox_unmount(int pidfd, int proc_fd, int mnt_fd, bool lazy,
     snprintf(proc_path, sizeof(proc_path), "self/fd/%d", mnt_fd);
 
     int pipefd[2];
-    if (pipe2(pipefd, O_CLOEXEC) == -1)
-        return -errno;
-
-    pid_t pid = fork();
-    if (pid == -1) {
-        int saved_errno = errno;
-        close(pipefd[0]);
-        close(pipefd[1]);
-        return -saved_errno;
-    }
+    pid_t pid = fork_with_pipe(pipefd);
+    if (pid < 0)
+        return (int)pid;
 
     if (pid == 0) {
         close(pipefd[0]);
 
         int ret = install_seccomp(DEFUSED_OP_UNMOUNT);
-        if (ret < 0) {
-            struct sandbox_result result = {
-                .status = DEFUSED_ERR_UNMOUNT_FAILED,
-                .sys_errno = -ret,
-                .ret = ret,
-            };
-            sandbox_finish(pipefd[1], result);
-        }
+        if (ret < 0)
+            sandbox_done(pipefd[1], DEFUSED_ERR_UNMOUNT_FAILED, -ret, ret);
 
         if (sandbox_setns(pidfd, CLONE_NEWNS) == -1) {
             ret = neg_errno();
-            struct sandbox_result result = {
-                .status = DEFUSED_ERR_SETNS_FAILED,
-                .sys_errno = -ret,
-                .ret = ret,
-            };
-            sandbox_finish(pipefd[1], result);
+            sandbox_done(pipefd[1], DEFUSED_ERR_SETNS_FAILED, -ret, ret);
         }
 
         uid_t owner;
         ret = sandbox_fuse_mount_owner(proc_fd, mnt_id, &owner);
-        if (ret < 0) {
-            struct sandbox_result result = {
-                .status = DEFUSED_ERR_NOT_A_FUSE_MOUNT,
-                .sys_errno = 0,
-                .ret = ret,
-            };
-            sandbox_finish(pipefd[1], result);
-        }
+        if (ret < 0)
+            sandbox_done(pipefd[1], DEFUSED_ERR_NOT_A_FUSE_MOUNT, 0, ret);
 
-        if (owner != uid) {
-            struct sandbox_result result = {
-                .status = DEFUSED_ERR_NOT_ALLOWED,
-                .sys_errno = 0,
-                .ret = -EPERM,
-            };
-            sandbox_finish(pipefd[1], result);
-        }
+        if (owner != uid)
+            sandbox_done(pipefd[1], DEFUSED_ERR_NOT_ALLOWED, 0, -EPERM);
 
         /*
          * Resolve the mount through the O_PATH fd that supplied mnt_id above,
@@ -542,37 +525,14 @@ int defused_sandbox_unmount(int pidfd, int proc_fd, int mnt_fd, bool lazy,
          */
         ret = sandbox_umount_by_proc_path(proc_fd, proc_path,
                                           lazy ? MNT_DETACH : 0);
-        struct sandbox_result result = {
-            .status = ret < 0 ? DEFUSED_ERR_UNMOUNT_FAILED : DEFUSED_OK,
-            .sys_errno = ret < 0 ? -ret : 0,
-            .ret = ret,
-        };
-        sandbox_finish(pipefd[1], result);
+        sandbox_done(pipefd[1],
+                     ret < 0 ? DEFUSED_ERR_UNMOUNT_FAILED : DEFUSED_OK,
+                     ret < 0 ? -ret : 0, ret);
     }
 
     close(pipefd[1]);
-    struct sandbox_result result = {
-        .status = DEFUSED_ERR_UNMOUNT_FAILED,
-        .sys_errno = EIO,
-        .ret = -EIO,
-    };
-    int ret = read_sandbox_result(pipefd[0], &result);
-    close(pipefd[0]);
-    int wait_status = wait_sandbox(pid);
-    if (ret < 0) {
-        result.sys_errno = -ret;
-        result.ret = ret;
-    } else if (wait_status < 0) {
-        result.sys_errno = -wait_status;
-        result.ret = wait_status;
-    } else if (!WIFEXITED(wait_status)) {
-        result.sys_errno = EIO;
-        result.ret = -EIO;
-    }
-
-    *status = result.status;
-    *sys_errno = result.sys_errno;
-    return result.ret;
+    return reap_sandbox(pipefd[0], pid, DEFUSED_ERR_UNMOUNT_FAILED, status,
+                        sys_errno);
 }
 
 #ifdef DEFUSED_TEST

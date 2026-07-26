@@ -49,7 +49,7 @@
  * back to defused's own namespace instead of failing would show up as
  * neither of its two accepted statuses. Real, trusted-caller (root)
  * coverage of both mount and unmount across mount namespaces lives in
- * nixos/tests/mount-namespace.nix instead.
+ * packaging/nixos/tests/mount-namespace.nix instead.
  */
 #define _GNU_SOURCE
 #include "defused_proto.h"
@@ -190,15 +190,12 @@ static int send_non_fuse_umount_request(int sock) {
     if (error_id != NULL)
         goto out;
 
-    struct service_response {
-        uint32_t status;
-        int32_t sys_errno;
-    } parsed = {};
+    struct defused_resp parsed = {0};
     static const sd_json_dispatch_field dispatch_table[] = {
         {"status", SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uint32,
-         offsetof(struct service_response, status), SD_JSON_MANDATORY},
+         offsetof(struct defused_resp, status), SD_JSON_MANDATORY},
         {"sysErrno", SD_JSON_VARIANT_INTEGER, sd_json_dispatch_int32,
-         offsetof(struct service_response, sys_errno), SD_JSON_MANDATORY},
+         offsetof(struct defused_resp, sys_errno), SD_JSON_MANDATORY},
         {},
     };
     ret = sd_json_dispatch(reply, dispatch_table, 0, &parsed);

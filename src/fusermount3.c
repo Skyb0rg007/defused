@@ -101,7 +101,7 @@ static int wait_and_auto_unmount(int cfd, const char *mnt)
 static int connect_service(sd_varlink **ret)
     __attribute__((__nonnull__(1), __warn_unused_result__));
 static int transact(uint32_t op, const union defused_req *req, const int *fds,
-                    size_t fd_count, struct defused_resp *resp)
+                    size_t fd_count, const char *mnt)
     __attribute__((__nonnull__(2, 3, 5), __warn_unused_result__));
 static void print_service_error(uint32_t op, const char *mnt,
                                 const struct defused_resp *resp)
@@ -265,18 +265,10 @@ static int do_mount(const char *mnt, const char *opts, int cfd) {
         goto out;
     }
 
-    struct defused_resp resp = {0};
     int fds[] = {fuse_fd, mnt_fd};
-    int res = transact(DEFUSED_OP_MOUNT, &u, fds, 2, &resp);
-    if (res < 0) {
-        ret = res;
+    ret = transact(DEFUSED_OP_MOUNT, &u, fds, 2, mnt);
+    if (ret < 0)
         goto out;
-    }
-    if (resp.status != DEFUSED_OK) {
-        print_service_error(DEFUSED_OP_MOUNT, mnt, &resp);
-        ret = -EPERM;
-        goto out;
-    }
 
     ret = send_fd(cfd, fuse_fd);
     if (ret < 0) {
@@ -337,18 +329,10 @@ static int do_unmount(const char *mnt, bool lazy) {
     union defused_req u = {.umount = {.lazy = lazy}};
     (void)strlcpy(u.umount.name, name, sizeof(u.umount.name));
 
-    struct defused_resp resp = {0};
     int fds[] = {parent_fd};
-    int res = transact(DEFUSED_OP_UNMOUNT, &u, fds, 1, &resp);
-    if (res < 0) {
-        ret = res;
+    ret = transact(DEFUSED_OP_UNMOUNT, &u, fds, 1, mnt);
+    if (ret < 0)
         goto out;
-    }
-    if (resp.status != DEFUSED_OK) {
-        print_service_error(DEFUSED_OP_UNMOUNT, mnt, &resp);
-        ret = -EPERM;
-        goto out;
-    }
 
 out:
     if (parent_fd >= 0)
@@ -359,11 +343,10 @@ out:
 }
 
 /*
- * Starts the auto_unmount daemon.
- * Creates a new process tree, closes all file descriptors,
- * blocks all signals, and waits for the fuse server to exit (seen via EOF
- * on the communication socket).
- * Then it lazily unmounts the filesystem.
+ * Detaches from the caller's session in place (no fork: the caller already
+ * has the FUSE fd from do_mount()'s send_fd() and isn't waiting on this
+ * process to exit), then blocks until the fuse server exits -- seen via EOF
+ * on the communication socket -- and lazily unmounts the filesystem.
  */
 static int wait_and_auto_unmount(int cfd, const char *mnt) {
     int ret = close_inherited_fds(cfd);
@@ -416,9 +399,12 @@ fail:
     return r;
 }
 
-/* One request/response with the service */
+/* One request/response with the service. Returns 0, -EPERM if the service
+ * accepted the request but reported a non-OK status (also printed via
+ * print_service_error(), unless quiet), or whatever negative errno the RPC
+ * itself failed with. */
 static int transact(uint32_t op, const union defused_req *req, const int *fds,
-                    size_t fd_count, struct defused_resp *resp) {
+                    size_t fd_count, const char *mnt) {
     if (fd_count > 2)
         return -EINVAL;
 
@@ -462,29 +448,30 @@ static int transact(uint32_t op, const union defused_req *req, const int *fds,
         goto out_unref_reply;
     }
 
-    struct service_response {
-        uint32_t status;
-        int32_t sys_errno;
-    } parsed = {};
+    struct defused_resp resp = {0};
     static const sd_json_dispatch_field dispatch_table[] = {
         {"status", SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uint32,
-         offsetof(struct service_response, status), SD_JSON_MANDATORY},
+         offsetof(struct defused_resp, status), SD_JSON_MANDATORY},
         {"sysErrno", SD_JSON_VARIANT_INTEGER, sd_json_dispatch_int32,
-         offsetof(struct service_response, sys_errno), SD_JSON_MANDATORY},
+         offsetof(struct defused_resp, sys_errno), SD_JSON_MANDATORY},
         {},
     };
-    ret = sd_json_dispatch(reply, dispatch_table, 0, &parsed);
+    ret = sd_json_dispatch(reply, dispatch_table, 0, &resp);
     if (ret < 0)
         goto out_unref_reply;
-    resp->status = parsed.status;
-    resp->sys_errno = parsed.sys_errno;
     ret = 0;
 
 out_unref_reply:
     sd_json_variant_unref(reply);
 out_close:
     sd_varlink_flush_close_unref(link);
-    return ret;
+    if (ret < 0)
+        return ret;
+    if (resp.status != DEFUSED_OK) {
+        print_service_error(op, mnt, &resp);
+        return -EPERM;
+    }
+    return 0;
 }
 
 static void print_service_error(uint32_t op, const char *mnt,

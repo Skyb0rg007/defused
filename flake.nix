@@ -22,7 +22,7 @@
     in
     {
       nixosModules = {
-        default = import ./nixos/module.nix { inherit self; };
+        default = import ./packaging/nixos/module.nix { inherit self; };
         defused = self.nixosModules.default;
       };
 
@@ -31,7 +31,7 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
         in
-        (import ./nixos/tests {
+        (import ./packaging/nixos/tests {
           inherit self pkgs system;
         })
         // {
