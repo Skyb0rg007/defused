@@ -70,6 +70,29 @@ in
 
       serviceConfig = {
         ExecStart = lib.escapeShellArgs ([ "${package}/lib/defused/defused" ] ++ cfg.extraArgs);
+        AmbientCapabilities = [
+          "CAP_DAC_READ_SEARCH"
+          "CAP_SYS_ADMIN"
+          "CAP_SYS_CHROOT"
+          "CAP_SYS_PTRACE"
+        ];
+        CapabilityBoundingSet = [
+          "CAP_DAC_READ_SEARCH"
+          "CAP_SYS_ADMIN"
+          "CAP_SYS_CHROOT"
+          "CAP_SYS_PTRACE"
+        ];
+        NoNewPrivileges = true;
+        AppArmorProfile = "-defused";
+
+        LockPersonality = true;
+        MemoryDenyWriteExecute = true;
+        ProtectHostname = true;
+        RemoveIPC = true;
+        RestrictAddressFamilies = [ "AF_UNIX" ];
+        RestrictRealtime = true;
+        RestrictSUIDSGID = true;
+        SystemCallArchitectures = "native";
       };
     };
   };

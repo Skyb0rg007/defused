@@ -57,6 +57,11 @@ install_data(
   install_dir : get_option('datadir') / 'polkit-1/actions',
 )
 
+install_data(
+  'packaging/apparmor/defused',
+  install_dir : get_option('sysconfdir') / 'apparmor.d',
+)
+
 ## Tests ##
 
 test_protocol_exe = executable(
