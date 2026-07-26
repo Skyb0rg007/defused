@@ -17,6 +17,9 @@
  *
  *  - unmount: -u -z becomes a defused_umount_req with lazy set, and a
  *    service error status surfaces as a nonzero exit.
+ *
+ *  - root fallback: the client delegates its original argument vector to
+ *    the configured libfuse helper before parsing it.
  */
 #define _GNU_SOURCE
 #include "defused_proto.h"
@@ -39,6 +42,8 @@
 #include <unistd.h>
 
 static int failures;
+
+#define FALLBACK_EXIT_STATUS 42
 
 #define CHECK(cond)                                                            \
     do {                                                                       \
@@ -105,6 +110,20 @@ static int wait_exit_code(pid_t pid) {
     if (waitpid(pid, &wstatus, 0) != pid || !WIFEXITED(wstatus))
         return -ECHILD;
     return WEXITSTATUS(wstatus);
+}
+
+static int test_root_fallback(const char *client) {
+    char *args[] = {(char *)"--not-a-defused-option", (char *)"mountpoint"};
+    pid_t pid;
+
+    setenv("DEFUSED_TEST_UID", "0", 1);
+    setenv("DEFUSED_TEST_LIBFUSE_HELPER", "1", 1);
+    CHECK(spawn_client(client, -1, args, 2, &pid) == 0);
+    unsetenv("DEFUSED_TEST_UID");
+    unsetenv("DEFUSED_TEST_LIBFUSE_HELPER");
+
+    CHECK(wait_exit_code(pid) == FALLBACK_EXIT_STATUS);
+    return failures ? -EINVAL : 0;
 }
 
 static int reply_status(sd_varlink *link, uint32_t status) {
@@ -332,18 +351,21 @@ static int test_unmount(const char *client, int listen_fd) {
 }
 
 int main(int argc, char *argv[]) {
+    if (getenv("DEFUSED_TEST_LIBFUSE_HELPER") != NULL) {
+        CHECK(argc == 3);
+        CHECK(strcmp(argv[0], "fusermount3") == 0);
+        CHECK(strcmp(argv[1], "--not-a-defused-option") == 0);
+        CHECK(strcmp(argv[2], "mountpoint") == 0);
+        return failures ? EXIT_FAILURE : FALLBACK_EXIT_STATUS;
+    }
+
     if (argc != 2) {
         fprintf(stderr, "usage: %s /path/to/fusermount3\n", argv[0]);
         return 2;
     }
 
-    if (getuid() == 0 || geteuid() == 0) {
-        char *args[] = {(char *)"."};
-        pid_t pid;
-        CHECK(spawn_client(argv[1], -1, args, 1, &pid) == 0);
-        CHECK(wait_exit_code(pid) != 0);
-        return failures ? 1 : 0;
-    }
+    (void)test_root_fallback(argv[1]);
+    setenv("DEFUSED_TEST_UID", "1", 1);
 
     /* If the client never connects (e.g. it errored out during option
      * parsing), fail fast instead of hanging in accept(). */
@@ -378,5 +400,6 @@ int main(int argc, char *argv[]) {
     close(listen_fd);
     unlink(sock_path);
     rmdir(dir);
+    unsetenv("DEFUSED_TEST_UID");
     return failures ? 1 : 0;
 }

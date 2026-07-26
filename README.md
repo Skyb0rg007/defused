@@ -45,6 +45,11 @@ The system service is written to use systemd socket activation with
 On systems without systemd as service manager or and for testing,
 you can run the service with `systemd-socket-activate`.
 
+Root callers are delegated directly to libfuse's `fusermount3`, since they do
+not need the unprivileged service path. Meson resolves that helper to an
+absolute path at configure time; use
+`-Dlibfuse_fusermount3=/path/to/fusermount3` to select it explicitly.
+
 ## Mountpoint ownership model
 
 Defused uses a different mountpoint ownership model than libfuse's setuid

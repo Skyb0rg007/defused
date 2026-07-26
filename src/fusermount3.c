@@ -44,6 +44,10 @@
 #define DEFUSED_VERSION "unknown"
 #endif
 
+#ifndef LIBFUSE_FUSERMOUNT3
+#define LIBFUSE_FUSERMOUNT3 "fusermount3"
+#endif
+
 /* This table is copied from libfuse */
 struct flag_opt {
     /* Option name */
@@ -118,6 +122,7 @@ static int parse_u32(const char *s, unsigned len, const char *pfx,
 static noreturn void usage(void) __attribute__((__noreturn__));
 static noreturn void die(const char *fmt, ...)
     __attribute__((__noreturn__, __format__(__printf__, 1, 2)));
+static bool caller_is_root(void);
 
 static const char *progname;
 static bool quiet;
@@ -125,6 +130,12 @@ static bool auto_unmount;
 
 int main(int argc, char *argv[]) {
     progname = argc > 0 ? argv[0] : "fusermount3";
+
+    if (caller_is_root()) {
+        execv(LIBFUSE_FUSERMOUNT3, argv);
+        die("cannot execute libfuse helper %s: %s", LIBFUSE_FUSERMOUNT3,
+            strerror(errno));
+    }
 
     int exit_status = EXIT_FAILURE;
     bool unmount = false;
@@ -177,9 +188,6 @@ int main(int argc, char *argv[]) {
 
     if (argc > optind + 1)
         die("extra arguments after the mountpoint");
-
-    if (getuid() == 0 || geteuid() == 0)
-        die("root callers are not handled by defused");
 
     mnt = fuse_mnt_resolve_path(progname, argv[optind]);
     if (mnt == NULL)
@@ -234,6 +242,15 @@ int main(int argc, char *argv[]) {
 out:
     free(mnt);
     return exit_status;
+}
+
+static bool caller_is_root(void) {
+#ifdef DEFUSED_TEST
+    const char *forced_uid = getenv("DEFUSED_TEST_UID");
+    if (forced_uid != NULL)
+        return strcmp(forced_uid, "0") == 0;
+#endif
+    return getuid() == 0 || geteuid() == 0;
 }
 
 static int do_mount(const char *mnt, const char *opts, int cfd) {
