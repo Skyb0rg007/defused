@@ -33,7 +33,7 @@ nix flake check
 
 This is what CI runs.
 This will build the project, run the normal tests, and then also
-run the NixOS VM test suite (in `nixos/tests/`).
+run the NixOS VM test suite (in `packaging/nixos/tests/`).
 It will also run `reuse lint` to ensure that all files have SPDX headers.
 
 ## Formatting and licensing

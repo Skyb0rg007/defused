@@ -34,8 +34,8 @@ in
           Additional command-line arguments passed to defused. defused
           currently takes no flags beyond --help -- mount policy is decided
           per request by polkit, see security.polkit.extraConfig and
-          examples/50-defused-mount-policy.rules. Kept for forward
-          compatibility.
+          packaging/polkit/examples/50-defused-mount-policy.rules. Kept for
+          forward compatibility.
         '';
       };
     };

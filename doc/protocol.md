@@ -211,7 +211,7 @@ writing polkit rules:
 Both values are strings, so a rule comparing `current-mounts` numerically needs
 to call `parseInt()` first, and one inspecting `privileged-flags` needs to call
 `.split(",")` on it.
-`examples/50-defused-mount-policy.rules` is a complete, installable rule
+`packaging/polkit/examples/50-defused-mount-policy.rules` is a complete, installable rule
 using both: it grants ordinary mounts (fewer than 100 open, requesting no
 privileged option the rule doesn't explicitly allowlist) without
 prompting, and falls back to `AUTH_ADMIN_KEEP` for anything past that limit
@@ -232,7 +232,7 @@ different risk than an ordinary self-only mount -- and more capabilities
 in the same category are planned (e.g. `suid`, `cuse`, `blkdev`), so
 `privileged-flags` carries every privileged capability name a request
 sets. That lets a rule allowlist capabilities by name and fail on any name it
-doesn't recognize, as is done in `examples/50-defused-mount-policy.rules`.
+doesn't recognize, as is done in `packaging/polkit/examples/50-defused-mount-policy.rules`.
 
 ### Why unmount's default policy differs from mount's
 
