@@ -83,15 +83,19 @@ enum defused_mount_flag {
      DEFUSED_FUSE_DEFAULT_PERMISSIONS)
 
 /*
- * Request a FUSE mount. The Varlink call carries two file descriptors,
- * referenced from the JSON payload by fd index:
- *
- *  1. A file descriptor opened from /dev/fuse
- *  2. A file descriptor opened to the destination mountpoint directory or
- *     regular file
- *
- * The service will then attempt to create the mountpoint with the given
- * options at the location specified by the second file descriptor.
+ * File descriptor positions for a Mount call. The Varlink call must carry
+ * exactly DEFUSED_MOUNT_FD_COUNT file descriptors in this order.
+ */
+enum defused_mount_fd_index {
+    DEFUSED_MOUNT_FD_FUSE = 0,
+    DEFUSED_MOUNT_FD_MOUNTPOINT = 1,
+    DEFUSED_MOUNT_FD_COUNT,
+};
+
+/*
+ * Request a FUSE mount. The service will attempt to create the mountpoint
+ * with the given options at the location specified by
+ * DEFUSED_MOUNT_FD_MOUNTPOINT.
  */
 struct defused_mount_req {
     /* enum defused_mount_flag bits */
@@ -105,12 +109,18 @@ struct defused_mount_req {
 };
 
 /*
- * Request a FUSE unmount. The Varlink call carries one file descriptor for the
- * *parent* directory of the mount to tear down, referenced from the JSON
- * payload by fd index.
- *
- * The service will unmount the FUSE filesystem mounted with the given name
- * in the directory passed via file descriptor.
+ * File descriptor positions for an Unmount call. The Varlink call must carry
+ * exactly DEFUSED_UNMOUNT_FD_COUNT file descriptors in this order.
+ */
+enum defused_unmount_fd_index {
+    DEFUSED_UNMOUNT_FD_PARENT = 0,
+    DEFUSED_UNMOUNT_FD_COUNT,
+};
+
+/*
+ * Request a FUSE unmount. The service will unmount the FUSE filesystem
+ * mounted with the given name in the directory passed at
+ * DEFUSED_UNMOUNT_FD_PARENT.
  */
 struct defused_umount_req {
     /* set nonzero to perform a lazy unmount (MNT_DETACH) */

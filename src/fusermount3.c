@@ -282,8 +282,11 @@ static int do_mount(const char *mnt, const char *opts, int cfd) {
         goto out;
     }
 
-    int fds[] = {fuse_fd, mnt_fd};
-    ret = transact(DEFUSED_OP_MOUNT, &u, fds, 2, mnt);
+    int fds[DEFUSED_MOUNT_FD_COUNT] = {
+        [DEFUSED_MOUNT_FD_FUSE] = fuse_fd,
+        [DEFUSED_MOUNT_FD_MOUNTPOINT] = mnt_fd,
+    };
+    ret = transact(DEFUSED_OP_MOUNT, &u, fds, DEFUSED_MOUNT_FD_COUNT, mnt);
     if (ret < 0)
         goto out;
 
@@ -346,8 +349,10 @@ static int do_unmount(const char *mnt, bool lazy) {
     union defused_req u = {.umount = {.lazy = lazy}};
     (void)strlcpy(u.umount.name, name, sizeof(u.umount.name));
 
-    int fds[] = {parent_fd};
-    ret = transact(DEFUSED_OP_UNMOUNT, &u, fds, 1, mnt);
+    int fds[DEFUSED_UNMOUNT_FD_COUNT] = {
+        [DEFUSED_UNMOUNT_FD_PARENT] = parent_fd,
+    };
+    ret = transact(DEFUSED_OP_UNMOUNT, &u, fds, DEFUSED_UNMOUNT_FD_COUNT, mnt);
     if (ret < 0)
         goto out;
 
@@ -422,7 +427,8 @@ fail:
  * itself failed with. */
 static int transact(uint32_t op, const union defused_req *req, const int *fds,
                     size_t fd_count, const char *mnt) {
-    if (fd_count > 2)
+    if ((op == DEFUSED_OP_MOUNT && fd_count != DEFUSED_MOUNT_FD_COUNT) ||
+        (op == DEFUSED_OP_UNMOUNT && fd_count != DEFUSED_UNMOUNT_FD_COUNT))
         return -EINVAL;
 
     sd_varlink *link = NULL;
@@ -441,8 +447,6 @@ static int transact(uint32_t op, const union defused_req *req, const int *fds,
     if (op == DEFUSED_OP_MOUNT)
         ret = sd_varlink_callbo(
             link, DEFUSED_VARLINK_METHOD_MOUNT, &reply, &error_id,
-            SD_JSON_BUILD_PAIR_UNSIGNED("fuseFileDescriptor", 0),
-            SD_JSON_BUILD_PAIR_UNSIGNED("mountpointFileDescriptor", 1),
             SD_JSON_BUILD_PAIR_UNSIGNED("mountFlags", req->mount.mount_flags),
             SD_JSON_BUILD_PAIR_UNSIGNED("maxRead", req->mount.max_read),
             SD_JSON_BUILD_PAIR_UNSIGNED("blockSize", req->mount.blksize),
@@ -451,7 +455,6 @@ static int transact(uint32_t op, const union defused_req *req, const int *fds,
     else if (op == DEFUSED_OP_UNMOUNT)
         ret = sd_varlink_callbo(
             link, DEFUSED_VARLINK_METHOD_UNMOUNT, &reply, &error_id,
-            SD_JSON_BUILD_PAIR_UNSIGNED("parentFileDescriptor", 0),
             SD_JSON_BUILD_PAIR_STRING("name", req->umount.name),
             SD_JSON_BUILD_PAIR_BOOLEAN("lazy", req->umount.lazy != 0));
     else

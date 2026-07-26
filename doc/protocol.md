@@ -40,8 +40,6 @@ interface website.soss.defused
 
 ```varlink
 method Mount(
-  fuseFileDescriptor: int,
-  mountpointFileDescriptor: int,
   mountFlags: int,
   maxRead: int,
   blockSize: int,
@@ -55,8 +53,9 @@ The client attaches exactly two fds to the Varlink call:
 1. A file descriptor for `/dev/fuse`.
 2. A file descriptor for the mountpoint.
 
-`fuseFileDescriptor` and `mountpointFileDescriptor` are indices into the fd
-array associated with the call. `fusermount3` sends `0` and `1`, respectively.
+The fd positions are fixed by the protocol: `/dev/fuse` must be at index `0`
+(`DEFUSED_MOUNT_FD_FUSE`) and the mountpoint must be at index `1`
+(`DEFUSED_MOUNT_FD_MOUNTPOINT`). The indices are not sent in the JSON payload.
 
 `mountFlags` is the final option bitmask requested by the client. The empty
 bitmask is the fusermount3-compatible unprivileged default: `nosuid` and
@@ -91,15 +90,15 @@ with `move_mount()`, and replies `DEFUSED_OK`.
 
 ```varlink
 method Unmount(
-  parentFileDescriptor: int,
   name: string,
   lazy: bool
 ) -> (status: int, sysErrno: int)
 ```
 
 The client attaches exactly one fd: a file descriptor for the mountpoint's
-parent directory. `parentFileDescriptor` is the index of that fd, normally `0`.
-`name` is the mountpoint's basename within that directory.
+parent directory. Its position is fixed at index `0`
+(`DEFUSED_UNMOUNT_FD_PARENT`) and is not sent in the JSON payload. `name` is
+the mountpoint's basename within that directory.
 
 The service opens `name` under the parent fd to identify the target via its
 `fdinfo` `mnt_id` and compares that with the parent fd's `mnt_id`. It retains
@@ -146,8 +145,8 @@ sysErrno: int
 | 6 | `DEFUSED_ERR_UNMOUNT_FAILED` | `umount2(2)` failed, or polkit could not be reached; see `sysErrno` |
 | 7 | `DEFUSED_ERR_SETNS_FAILED` | Could not join the caller's mount namespace; see `sysErrno` |
 
-Varlink protocol-level problems, such as missing fields, wrong field types, bad
-fd indices, or wrong fd count, are returned as standard Varlink errors by
+Varlink protocol-level problems, such as missing fields, wrong field types, or
+wrong fd count, are returned as standard Varlink errors by
 libsystemd rather than as a `defused_status`.
 
 ## Why Varlink
