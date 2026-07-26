@@ -364,6 +364,56 @@ out_kill:
     return ret;
 }
 
+/* --daemon does not create the socket's parent directory -- it just binds
+ * inside a directory that must already exist (e.g. via systemd's
+ * RuntimeDirectory=, see packaging/nixos/tests/daemon.nix). Confirms it
+ * fails fast with a nonzero exit rather than creating the directory or
+ * hanging. */
+static int test_daemon_missing_socket_dir(const char *defused_path) {
+    char dir[] = "/tmp/defused-daemon-missing-dir-test-XXXXXX";
+    if (mkdtemp(dir) == NULL) {
+        perror("mkdtemp");
+        return -errno;
+    }
+    char missing_dir[sizeof(dir) + 16];
+    snprintf(missing_dir, sizeof(missing_dir), "%s/does-not-exist", dir);
+    char sock_path[sizeof(missing_dir) + 16];
+    snprintf(sock_path, sizeof(sock_path), "%s/defused.sock", missing_dir);
+
+    pid_t pid;
+    int ret = spawn_defused_daemon(defused_path, sock_path, &pid);
+    if (ret < 0) {
+        rmdir(dir);
+        return ret;
+    }
+
+    int status;
+    if (waitpid(pid, &status, 0) == -1) {
+        ret = -errno;
+        perror("waitpid");
+        goto out;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) == 0) {
+        fprintf(stderr,
+                "FAIL: expected --daemon to exit nonzero with a missing "
+                "socket directory (status 0x%x)\n",
+                status);
+        ret = -EINVAL;
+        goto out;
+    }
+    if (access(missing_dir, F_OK) == 0 || errno != ENOENT) {
+        fprintf(stderr, "FAIL: --daemon should not have created the socket "
+                        "directory\n");
+        ret = -EINVAL;
+        goto out;
+    }
+    ret = 0;
+
+out:
+    rmdir(dir);
+    return ret;
+}
+
 /* Must match DEFUSED_DAEMON_MAX_CONNECTIONS in src/defused.c: the number of
  * concurrent connections test_daemon_connection_cap() needs to open to pin
  * run_fork_daemon()'s live_children count at the cap. */
@@ -514,6 +564,9 @@ int main(int argc, char *argv[]) {
     }
 
     if (test_daemon_mode(argv[1]) != 0)
+        return 1;
+
+    if (test_daemon_missing_socket_dir(argv[1]) != 0)
         return 1;
 
     if (test_daemon_connection_cap(argv[1]) != 0)

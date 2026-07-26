@@ -18,9 +18,10 @@ pkgs.testers.nixosTest {
   # This test deliberately does not use services.defused.enable (see
   # common.nix's baseNode) -- the whole point of --daemon is running without
   # systemd Accept=yes socket activation, so the unit here is a plain,
-  # always-running service that execs `defused --daemon` directly. It's also
-  # deliberately given no RuntimeDirectory=, to exercise --daemon's own
-  # mkdir_parent() logic for creating /run/defused itself.
+  # always-running service that execs `defused --daemon` directly.
+  # RuntimeDirectory= is still required: --daemon does not create
+  # /run/defused itself, it just binds a socket inside a directory that
+  # must already exist.
   nodes.machine =
     { ... }:
     {
@@ -42,6 +43,7 @@ pkgs.testers.nixosTest {
 
         serviceConfig = {
           ExecStart = "${package}/lib/defused/defused --daemon";
+          RuntimeDirectory = "defused";
         };
       };
 
