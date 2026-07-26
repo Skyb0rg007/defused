@@ -63,6 +63,9 @@
               pkgs.libseccomp
               pkgs.systemdLibs
             ];
+            mesonFlags = [
+              "-Dlibfuse_fusermount3=${pkgs.fuse3}/bin/fusermount3"
+            ];
           };
         }
       );
@@ -82,7 +85,7 @@
               pkgs.nixfmt
               pkgs.clang-tools
               pkgs.reuse
-              pkgs.fuse
+              pkgs.fuse3
             ];
             shellHook = ''
               export NIX_CFLAGS_COMPILE="-U_FORTIFY_SOURCE $NIX_CFLAGS_COMPILE"

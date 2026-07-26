@@ -13,9 +13,14 @@ project(
 cc = meson.get_compiler('c')
 seccomp_dep = cc.find_library('seccomp', has_headers : ['seccomp.h'])
 systemd_dep = dependency('libsystemd')
+libfuse_fusermount3 = find_program(get_option('libfuse_fusermount3'))
 
 # XXX: Check for function availability
 common_c_args = ['-DHAVE_CLOSE_RANGE']
+fusermount3_c_args = common_c_args + [
+  '-DDEFUSED_VERSION="@0@"'.format(meson.project_version()),
+  '-DLIBFUSE_FUSERMOUNT3="@0@"'.format(libfuse_fusermount3.full_path()),
+]
 
 sandbox_lib = static_library(
   'defused-sandbox',
@@ -42,7 +47,7 @@ fusermount3_exe = executable(
   'src/fusermount3.c',
   'src/defused-varlink.c',
   'src/util.c',
-  c_args : common_c_args + ['-DDEFUSED_VERSION="@0@"'.format(meson.project_version())],
+  c_args : fusermount3_c_args,
   dependencies : [systemd_dep],
   install : true,
 )
@@ -72,7 +77,20 @@ test_client_exe = executable(
   include_directories : include_directories('src'),
 )
 
-test('client', test_client_exe, args : [fusermount3_exe])
+test_fusermount3_exe = executable(
+  'test-fusermount3',
+  'src/fusermount3.c',
+  'src/defused-varlink.c',
+  'src/util.c',
+  c_args : common_c_args + [
+    '-DDEFUSED_TEST',
+    '-DDEFUSED_VERSION="@0@"'.format(meson.project_version()),
+    '-DLIBFUSE_FUSERMOUNT3="@0@"'.format(test_client_exe.full_path()),
+  ],
+  dependencies : [systemd_dep],
+)
+
+test('client', test_client_exe, args : [test_fusermount3_exe])
 
 test_mountns_exe = executable(
   'test-mountns',

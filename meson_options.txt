@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: 2026 Skye Soss <skye@soss.website>
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+option(
+  'libfuse_fusermount3',
+  type : 'string',
+  value : 'fusermount3',
+  description : 'Path or program name of the upstream libfuse fusermount3 helper',
+)
