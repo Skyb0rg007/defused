@@ -49,6 +49,12 @@ instead: it creates the Varlink socket itself and forks a child to handle
 each accepted connection, so it doesn't depend on systemd socket
 activation at all.
 
+The packaged systemd service retains only the capabilities needed to inspect
+delegated mountpoints and perform mount operations. An AppArmor profile is
+installed as `apparmor.d/defused`; load it with the distribution's normal
+AppArmor tooling to add path and D-Bus confinement. The service uses the
+profile automatically when it is loaded.
+
 Root callers are delegated directly to libfuse's `fusermount3`, since they do
 not need the unprivileged service path. Meson resolves that helper to an
 absolute path at configure time; use

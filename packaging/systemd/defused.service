@@ -10,5 +10,18 @@ After=polkit.service
 
 [Service]
 ExecStart=/usr/lib/defused/defused
+AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SYS_PTRACE
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SYS_PTRACE
+NoNewPrivileges=yes
+AppArmorProfile=-defused
+
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ProtectHostname=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
 
 [Install]
