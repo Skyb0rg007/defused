@@ -115,10 +115,20 @@ for `.rpm`, see `debian/` and `packaging/defused.spec`) rather than with Nix,
 so they're linked against the target distro's own glibc/libseccomp/libsystemd
 instead of nixpkgs'.
 
-Note that defused's Varlink usage currently needs a fairly recent
-**libsystemd >= 258**, which as of this writing means a current Fedora
-release or Ubuntu 26.04+; older LTS/stable releases (Debian 12/13, Ubuntu
-24.04) don't ship a new enough libsystemd yet.
+Note that defused's Varlink usage currently needs **libsystemd >= 258**
+(both packages declare this explicitly as a runtime dependency --
+`libsystemd0 (>= 258)` for `.deb`, `systemd-libs >= 258` for `.rpm` -- rather
+than relying solely on the auto-detected shared-library version, since it's
+a meaningfully high floor). As of this writing that means:
+
+- Fedora: works on current releases (Fedora 44 ships systemd 259).
+- Debian: does **not** work on Debian 12 (bookworm) or 13 (trixie, current
+  stable) -- trixie's systemd 257 is still one major version short.
+- Ubuntu: does **not** work on 24.04 LTS (systemd 255) or earlier; needs
+  26.04 LTS (systemd 259) or newer.
+
+If you're on a distribution that doesn't ship a new enough systemd yet, use
+the Nix package instead (see above), which carries its own libsystemd.
 
 Install with your distribution's package manager, e.g.:
 
