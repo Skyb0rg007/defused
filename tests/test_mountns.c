@@ -178,11 +178,10 @@ static int send_non_fuse_umount_request(int sock) {
         status = ret;
         goto out;
     }
-    ret = sd_varlink_callbo(
-        link, DEFUSED_VARLINK_METHOD_UNMOUNT, &reply, &error_id,
-        SD_JSON_BUILD_PAIR_UNSIGNED("parentFileDescriptor", 0),
-        SD_JSON_BUILD_PAIR_STRING("name", "target"),
-        SD_JSON_BUILD_PAIR_BOOLEAN("lazy", true));
+    ret = sd_varlink_callbo(link, DEFUSED_VARLINK_METHOD_UNMOUNT, &reply,
+                            &error_id,
+                            SD_JSON_BUILD_PAIR_STRING("name", "target"),
+                            SD_JSON_BUILD_PAIR_BOOLEAN("lazy", true));
     if (ret < 0) {
         status = ret;
         goto out;

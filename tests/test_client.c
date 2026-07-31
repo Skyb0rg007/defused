@@ -137,8 +137,6 @@ static int method_mount(sd_varlink *link, sd_json_variant *parameters,
     (void)flags;
     (void)userdata;
     struct mount_parameters {
-        uint32_t fuse_fd_index;
-        uint32_t mnt_fd_index;
         uint32_t mount_flags;
         uint32_t max_read;
         uint32_t blksize;
@@ -146,12 +144,6 @@ static int method_mount(sd_varlink *link, sd_json_variant *parameters,
         const char *subtype;
     } p = {};
     static const sd_json_dispatch_field dispatch_table[] = {
-        {"fuseFileDescriptor", SD_JSON_VARIANT_UNSIGNED,
-         sd_json_dispatch_uint32,
-         offsetof(struct mount_parameters, fuse_fd_index), SD_JSON_MANDATORY},
-        {"mountpointFileDescriptor", SD_JSON_VARIANT_UNSIGNED,
-         sd_json_dispatch_uint32,
-         offsetof(struct mount_parameters, mnt_fd_index), SD_JSON_MANDATORY},
         {"mountFlags", SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uint32,
          offsetof(struct mount_parameters, mount_flags), SD_JSON_MANDATORY},
         {"maxRead", SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uint32,
@@ -166,7 +158,7 @@ static int method_mount(sd_varlink *link, sd_json_variant *parameters,
     };
 
     CHECK(sd_varlink_dispatch(link, parameters, dispatch_table, &p) == 0);
-    CHECK(sd_varlink_get_n_fds(link) == 2);
+    CHECK(sd_varlink_get_n_fds(link) == DEFUSED_MOUNT_FD_COUNT);
 
     uint32_t expected_flags =
         DEFUSED_MOUNT_RDONLY | DEFUSED_MOUNT_NOEXEC | DEFUSED_MOUNT_ALLOW_DEV |
@@ -178,13 +170,13 @@ static int method_mount(sd_varlink *link, sd_json_variant *parameters,
     CHECK(strcmp(p.fsname, "test,fs") == 0);
     CHECK(strcmp(p.subtype, "mem,fs") == 0);
 
-    int fuse_fd = sd_varlink_take_fd(link, p.fuse_fd_index);
+    int fuse_fd = sd_varlink_take_fd(link, DEFUSED_MOUNT_FD_FUSE);
     CHECK(fuse_fd >= 0);
     struct stat fuse_in_st;
     CHECK(fstat(fuse_fd, &fuse_in_st) == 0 && S_ISCHR(fuse_in_st.st_mode));
     close(fuse_fd);
 
-    int mnt_fd = sd_varlink_take_fd(link, p.mnt_fd_index);
+    int mnt_fd = sd_varlink_take_fd(link, DEFUSED_MOUNT_FD_MOUNTPOINT);
     CHECK(mnt_fd >= 0);
     struct stat fd_st, dot_st;
     CHECK(fstat(mnt_fd, &fd_st) == 0 && stat(".", &dot_st) == 0);
@@ -203,15 +195,10 @@ static int method_unmount(sd_varlink *link, sd_json_variant *parameters,
         const char *name;
     } *expect = userdata;
     struct unmount_parameters {
-        uint32_t parent_fd_index;
         const char *name;
         int lazy;
     } p = {};
     static const sd_json_dispatch_field dispatch_table[] = {
-        {"parentFileDescriptor", SD_JSON_VARIANT_UNSIGNED,
-         sd_json_dispatch_uint32,
-         offsetof(struct unmount_parameters, parent_fd_index),
-         SD_JSON_MANDATORY},
         {"name", SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string,
          offsetof(struct unmount_parameters, name), SD_JSON_MANDATORY},
         {"lazy", SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_intbool,
@@ -220,10 +207,10 @@ static int method_unmount(sd_varlink *link, sd_json_variant *parameters,
     };
 
     CHECK(sd_varlink_dispatch(link, parameters, dispatch_table, &p) == 0);
-    CHECK(sd_varlink_get_n_fds(link) == 1);
+    CHECK(sd_varlink_get_n_fds(link) == DEFUSED_UNMOUNT_FD_COUNT);
     CHECK(p.lazy);
     CHECK(strcmp(p.name, expect->name) == 0);
-    int parent_fd = sd_varlink_take_fd(link, p.parent_fd_index);
+    int parent_fd = sd_varlink_take_fd(link, DEFUSED_UNMOUNT_FD_PARENT);
     CHECK(parent_fd >= 0);
     struct stat fd_st, parent_st;
     CHECK(fstat(parent_fd, &fd_st) == 0 &&

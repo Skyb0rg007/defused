@@ -83,8 +83,6 @@ static int send_mount_req(int sock, const struct defused_mount_req *req,
 
     ret = sd_varlink_callbo(
         link, DEFUSED_VARLINK_METHOD_MOUNT, &reply, &error_id,
-        SD_JSON_BUILD_PAIR_UNSIGNED("fuseFileDescriptor", 0),
-        SD_JSON_BUILD_PAIR_UNSIGNED("mountpointFileDescriptor", 1),
         SD_JSON_BUILD_PAIR_UNSIGNED("mountFlags", req->mount_flags),
         SD_JSON_BUILD_PAIR_UNSIGNED("maxRead", req->max_read),
         SD_JSON_BUILD_PAIR_UNSIGNED("blockSize", req->blksize),

@@ -261,8 +261,6 @@ static int varlink_mount(sd_varlink *link, sd_json_variant *parameters,
     int dev_fd = -1, mnt_fd = -1;
 
     struct mount_parameters {
-        uint32_t fuse_fd_index;
-        uint32_t mnt_fd_index;
         uint32_t mount_flags;
         uint32_t max_read;
         uint32_t blksize;
@@ -270,12 +268,6 @@ static int varlink_mount(sd_varlink *link, sd_json_variant *parameters,
         const char *subtype;
     } parsed = {};
     static const sd_json_dispatch_field dispatch_table[] = {
-        {"fuseFileDescriptor", SD_JSON_VARIANT_UNSIGNED,
-         sd_json_dispatch_uint32,
-         offsetof(struct mount_parameters, fuse_fd_index), SD_JSON_MANDATORY},
-        {"mountpointFileDescriptor", SD_JSON_VARIANT_UNSIGNED,
-         sd_json_dispatch_uint32,
-         offsetof(struct mount_parameters, mnt_fd_index), SD_JSON_MANDATORY},
         {"mountFlags", SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uint32,
          offsetof(struct mount_parameters, mount_flags), SD_JSON_MANDATORY},
         {"maxRead", SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uint32,
@@ -304,19 +296,16 @@ static int varlink_mount(sd_varlink *link, sd_json_variant *parameters,
     (void)strlcpy(req.fsname, parsed.fsname, sizeof(req.fsname));
     (void)strlcpy(req.subtype, parsed.subtype, sizeof(req.subtype));
 
-    if (sd_varlink_get_n_fds(link) != 2)
-        return sd_varlink_error_invalid_parameter_name(link,
-                                                       "fuseFileDescriptor");
-    dev_fd = sd_varlink_take_fd(link, parsed.fuse_fd_index);
-    mnt_fd = sd_varlink_take_fd(link, parsed.mnt_fd_index);
+    if (sd_varlink_get_n_fds(link) != DEFUSED_MOUNT_FD_COUNT)
+        return sd_varlink_error_invalid_parameter_name(link, "fileDescriptors");
+    dev_fd = sd_varlink_take_fd(link, DEFUSED_MOUNT_FD_FUSE);
+    mnt_fd = sd_varlink_take_fd(link, DEFUSED_MOUNT_FD_MOUNTPOINT);
     if (dev_fd < 0 || mnt_fd < 0) {
         if (dev_fd >= 0)
             close(dev_fd);
         if (mnt_fd >= 0)
             close(mnt_fd);
-        return sd_varlink_error_invalid_parameter_name(
-            link,
-            dev_fd < 0 ? "fuseFileDescriptor" : "mountpointFileDescriptor");
+        return sd_varlink_error_invalid_parameter_name(link, "fileDescriptors");
     }
 
     struct ucred cred;
@@ -338,15 +327,10 @@ static int varlink_unmount(sd_varlink *link, sd_json_variant *parameters,
     int ret = 0;
 
     struct unmount_parameters {
-        uint32_t parent_fd_index;
         const char *name;
         int lazy;
     } parsed = {};
     static const sd_json_dispatch_field dispatch_table[] = {
-        {"parentFileDescriptor", SD_JSON_VARIANT_UNSIGNED,
-         sd_json_dispatch_uint32,
-         offsetof(struct unmount_parameters, parent_fd_index),
-         SD_JSON_MANDATORY},
         {"name", SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string,
          offsetof(struct unmount_parameters, name),
          SD_JSON_MANDATORY | SD_JSON_STRICT},
@@ -363,13 +347,11 @@ static int varlink_unmount(sd_varlink *link, sd_json_variant *parameters,
     (void)strlcpy(req.name, parsed.name, sizeof(req.name));
     req.lazy = parsed.lazy;
 
-    if (sd_varlink_get_n_fds(link) != 1)
-        return sd_varlink_error_invalid_parameter_name(link,
-                                                       "parentFileDescriptor");
-    parent_fd = sd_varlink_take_fd(link, parsed.parent_fd_index);
+    if (sd_varlink_get_n_fds(link) != DEFUSED_UNMOUNT_FD_COUNT)
+        return sd_varlink_error_invalid_parameter_name(link, "fileDescriptors");
+    parent_fd = sd_varlink_take_fd(link, DEFUSED_UNMOUNT_FD_PARENT);
     if (parent_fd < 0)
-        return sd_varlink_error_invalid_parameter_name(link,
-                                                       "parentFileDescriptor");
+        return sd_varlink_error_invalid_parameter_name(link, "fileDescriptors");
 
     struct ucred cred;
     ret = get_peer_cred(ctx->sock, &cred);
