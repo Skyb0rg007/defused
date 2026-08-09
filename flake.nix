@@ -64,8 +64,14 @@
               pkgs.systemdLibs
             ];
             mesonFlags = [
-              "-Dlibfuse_fusermount3=${pkgs.fuse3}/bin/fusermount3"
+              (lib.mesonOption "libfuse_fusermount3" (lib.getExe' pkgs.fuse3 "fusermount3"))
             ];
+
+            meta = {
+              description = "SETUID-less fusermount3 implementation";
+              license = lib.licenses.gpl2Only;
+              platforms = lib.platforms.linux;
+            };
           };
         }
       );
