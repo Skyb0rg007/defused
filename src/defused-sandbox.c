@@ -80,8 +80,6 @@ out:
     return ret < 0 ? ret : 0;
 }
 
-static int neg_errno(void) { return -errno; }
-
 /*
  * Everything below install_seccomp() that can run after setns() uses these
  * wrappers. syscall() has exactly the kernel entry named here, unlike a libc
@@ -325,7 +323,7 @@ static int mountinfo_feed(struct mountinfo_parser *parser, char ch) {
 static int sandbox_fuse_mount_owner(int proc_fd, long mnt_id, uid_t *out_uid) {
     int fd = sandbox_openat(proc_fd, "self/mountinfo", O_RDONLY | O_CLOEXEC);
     if (fd == -1)
-        return neg_errno();
+        return -errno;
 
     struct mountinfo_parser parser = {
         .target_id = mnt_id,
@@ -338,7 +336,7 @@ static int sandbox_fuse_mount_owner(int proc_fd, long mnt_id, uid_t *out_uid) {
     for (;;) {
         ssize_t n = sandbox_read(fd, buf, sizeof(buf));
         if (n < 0) {
-            ret = neg_errno();
+            ret = -errno;
             break;
         }
         if (n == 0)
@@ -368,10 +366,10 @@ out:
 static int sandbox_umount_by_proc_path(int proc_fd, const char *proc_path,
                                        int flags) {
     if (sandbox_fchdir(proc_fd) == -1)
-        return neg_errno();
+        return -errno;
 
     if (sandbox_umount2(proc_path, flags) == -1)
-        return neg_errno();
+        return -errno;
     return 0;
 }
 
@@ -467,14 +465,14 @@ int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd, uint32_t *status,
             sandbox_done(pipefd[1], DEFUSED_ERR_MOUNT_FAILED, -ret, ret);
 
         if (sandbox_setns(pidfd, CLONE_NEWNS) == -1) {
-            ret = neg_errno();
+            ret = -errno;
             sandbox_done(pipefd[1], DEFUSED_ERR_SETNS_FAILED, -ret, ret);
         }
 
         ret = sandbox_move_mount(mountfd, "", mnt_fd, "",
                                  MOVE_MOUNT_F_EMPTY_PATH |
                                      MOVE_MOUNT_T_EMPTY_PATH) == -1
-                  ? neg_errno()
+                  ? -errno
                   : 0;
         sandbox_done(pipefd[1], ret < 0 ? DEFUSED_ERR_MOUNT_FAILED : DEFUSED_OK,
                      ret < 0 ? -ret : 0, ret);
@@ -504,7 +502,7 @@ int defused_sandbox_unmount(int pidfd, int proc_fd, int mnt_fd, bool lazy,
             sandbox_done(pipefd[1], DEFUSED_ERR_UNMOUNT_FAILED, -ret, ret);
 
         if (sandbox_setns(pidfd, CLONE_NEWNS) == -1) {
-            ret = neg_errno();
+            ret = -errno;
             sandbox_done(pipefd[1], DEFUSED_ERR_SETNS_FAILED, -ret, ret);
         }
 
