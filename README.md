@@ -29,9 +29,11 @@ The `no_new_privileges` flag is important for proper application sandboxing,
 as Linux features such as [landlock][] and [seccomp-bpf][] can only be used
 after a call to `prctl(PR_SET_NO_NEW_PRIVS, 1)`.
 
-Using Unix domain sockets like defused does also means that privileges can be
-granted or denied by bind-mounting the sockets into the application's
-namespace. Doing so with `/usr/bin` is much more challenging.
+Using Unix domain sockets like defused does also means that the FUSE-mounting
+capability can be granted to applications by allow-listing the socket in the
+application's AppArmor or Landlock configuration.
+Doing so with `fusermount3` is much more challenging, as it is not compatible
+with Landlock.
 
 ## Project structure
 
@@ -42,23 +44,14 @@ This project provides the following:
 
 The system service is written to use systemd socket activation with
 `Accept=yes`.
-For testing under systemd, you can instead run the service with
-`systemd-socket-activate`.
-On systems without systemd as service manager, run `defused --daemon`
-instead: it creates the Varlink socket itself and forks a child to handle
-each accepted connection, so it doesn't depend on systemd socket
-activation at all.
-
-The packaged systemd service retains only the capabilities needed to inspect
-delegated mountpoints and perform mount operations. An AppArmor profile is
-installed as `apparmor.d/defused`; load it with the distribution's normal
-AppArmor tooling to add path and D-Bus confinement. The service uses the
-profile automatically when it is loaded.
+For testing or on systems without systemd, `defused --daemon` can be used
+to create the Varlink socket and fork off child processes to handle
+accepted connections.
 
 Root callers are delegated directly to libfuse's `fusermount3`, since they do
-not need the unprivileged service path. Meson resolves that helper to an
-absolute path at configure time; use
-`-Dlibfuse_fusermount3=/path/to/fusermount3` to select it explicitly.
+not need the unprivileged service path.
+This means libfuse's `fusermount3` should still be installed, just not in
+`/usr/bin` (ex. `/usr/lib/fuse3/fusermount3`).
 
 ## Mountpoint ownership model
 
@@ -66,7 +59,7 @@ Defused uses a different mountpoint ownership model than libfuse's setuid
 `fusermount3`.
 For non-root mounts, the mountpoint must be a directory or regular file owned
 by the caller.
-It must be writable by that caller; directories must also be searchable.
+It must be writable by that caller, and directories must also be searchable.
 
 This means defused rejects mounts on writable shared directories owned by
 another user, even when libfuse's setuid helper would allow them because the
@@ -103,9 +96,11 @@ See [contributing.md](./doc/contributing.md).
 
 ## Licensing
 
-This project copies a lot of helpers from libfuse, which are either
-GPL-2.0-only or LGPL-2.1-only.
-All of my code is licensed under GPL-2.0-or-later.
+This project copies a some helpers from libfuse in [util.h](./src/util.h),
+which are either GPL-2.0-only or LGPL-2.1-only
+(marked via SPDX snippets in [util.c](./src/util.c)).
+All of my code is licensed under GPL-2.0-or-later, but the resulting binary
+will be GPL-2.0-only.
 
 [FUSE-Wikipedia]: https://en.wikipedia.org/wiki/Filesystem_in_Userspace
 [FUSE]: https://www.kernel.org/doc/html/next/filesystems/fuse.html

@@ -17,6 +17,7 @@ interface is defined in `src/defused-varlink.c`.
 
 The service listens on an `AF_UNIX` `SOCK_STREAM` socket and speaks Varlink
 using libsystemd's `sd-varlink` implementation.
+It must be started as root.
 
 - **Socket path**: `/run/defused/defused.sock` (`DEFUSED_SOCKET_PATH`).
 - **Socket type**: `SOCK_STREAM`.
@@ -28,13 +29,10 @@ using libsystemd's `sd-varlink` implementation.
   manager, `defused --daemon` creates and binds the Varlink socket itself
   (still at `DEFUSED_SOCKET_PATH` by default, also mode 0666), then forks
   a child per accepted connection to run the same one-call-per-connection
-  handling as the `Accept=yes` path. Since both modes leave the socket
-  world-writable, authorization is enforced per request by polkit either
-  way -- the socket's mode is not itself the access control.
+  handling as the `Accept=yes` path.
 
 The service handles one Varlink method call and exits when the connection goes
-idle. Message framing, JSON parsing, method dispatch, parameter type checking,
-and file-descriptor association are delegated to libsystemd.
+idle.
 
 ## Interface
 
@@ -80,20 +78,16 @@ Policy applied before the mount is attempted:
 - The mountpoint fd must name a caller-owned writable mountpoint on a backing
   filesystem type that libfuse permits for unprivileged mounts
   (`DEFUSED_ERR_NOT_ALLOWED` otherwise). Directories must also be searchable by
-  the caller. This is an intentional policy difference from libfuse's setuid
-  `fusermount3`: libfuse allows writable non-sticky shared directories owned by
-  another user, while defused requires caller ownership so the privileged
-  service can authorize the received mountpoint fd directly.
+  the caller.
 - The service asks polkit (`org.freedesktop.PolicyKit1.Authority
   .CheckAuthorization`) whether the caller may create this mount
-  (`website.soss.defused.mount`), providing the privileged options (currently
-  just `ALLOW_OTHER`) that the request asks for via the `privileged-flags`
-  detail. A denial or challenge maps to `DEFUSED_ERR_NOT_ALLOWED`; being unable
-  to reach polkit fails with `DEFUSED_ERR_MOUNT_FAILED`.
+  (`website.soss.defused.mount`), providing the privileged options that the
+  request asks for via the `privileged-flags` detail, and the total number
+  of FUSE mounts via `current-mounts`.
 
-On success, the service creates the mount with the Linux new mount API
-(`fsopen()`/`fsconfig()`/`fsmount()`), attaches it to the received mountpoint fd
-with `move_mount()`, and replies `DEFUSED_OK`.
+On success, the service creates the mount with Linux's file-descriptor-based
+mount API (`fsopen()`/`fsconfig()`/`fsmount()`), attaches it to the received
+mountpoint fd with `move_mount()`, and replies `DEFUSED_OK`.
 
 ### Unmount
 
@@ -105,25 +99,21 @@ method Unmount(
 ) -> (status: int, sysErrno: int)
 ```
 
-The client attaches exactly one fd: a file descriptor for the mountpoint's
-parent directory. `parentFileDescriptor` is the index of that fd, normally `0`.
+The client attaches a file descriptor for the mountpoint's parent directory.
+`parentFileDescriptor` is the index of that fd, normally `0`.
 `name` is the mountpoint's basename within that directory.
 
 The service opens `name` under the parent fd to identify the target via its
-`fdinfo` `mnt_id` and compares that with the parent fd's `mnt_id`. It retains
-that target fd through authorization. The target must be a mountpoint under the
-parent, not just a regular directory inside the same mount, so the target and
-parent mount IDs must differ
-(`DEFUSED_ERR_NOT_A_FUSE_MOUNT` otherwise).
+`fdinfo` `mnt_id` and compares that with the parent fd's `mnt_id`.
+It retains that target fd through authorization.
+The target must be a mountpoint under the parent, not just a regular directory
+inside the same mount, so the target and parent mount IDs must differ.
 
-The service then asks polkit whether the caller is permitted to call
-`website.soss.defused.unmount`: a denial maps to `DEFUSED_ERR_NOT_ALLOWED`,
-while being unable to reach polkit at all fails with
-`DEFUSED_ERR_UNMOUNT_FAILED`. After joining the caller's mount namespace, the
-the target's `mnt_id` must also identify a FUSE mount in
-`/proc/self/mountinfo`
-(`DEFUSED_ERR_NOT_A_FUSE_MOUNT` otherwise), and its `user_id=` superblock
-option must match the caller's uid (`DEFUSED_ERR_NOT_ALLOWED` otherwise).
+The service then ensures via polkit that the caller is permitted to call
+`website.soss.defused.unmount`, failing otherwise.
+The service then joins the caller's mount namespace and checks that
+the target's `mnt_id` identifies a FUSE mount in `/proc/self/mountinfo`,
+and its `user_id=` superblock option matches the caller's uid.
 The polkit check only answers whether the caller may use unmount at all,
 and thus the default policy is to always allow.
 
@@ -161,10 +151,11 @@ libsystemd rather than as a `defused_status`.
 ## Why Varlink
 
 Varlink gives defused a typed, introspectable request protocol without a custom
-binary parser. The service uses libsystemd for the JSON parser, method
-dispatcher, fd passing bookkeeping, and reply framing. The only values defused
-interprets itself are already-typed integers, booleans, and strings delivered
-by `sd_varlink_dispatch()`.
+binary parser.
+The service uses libsystemd for the JSON parser, method dispatcher, fd passing
+bookkeeping, and reply framing.
+The only values defused interprets itself are already-typed integers, booleans,
+and strings delivered by `sd_varlink_dispatch()`.
 
 ## Why the service resolves the mount namespace from the socket peer
 
@@ -177,36 +168,40 @@ The service uses `SO_PEERPIDFD` on the accepted socket to identify the
 connecting process and joins that process's mount namespace before the
 mount/umount operation.
 
-The main service process never enters the client-controlled namespace. After
-validating and authorizing the request, it forks a short-lived child that
-installs an enforcing seccomp filter and then joins the namespace. For mounts,
-the parent creates a detached FUSE mount first, leaving the child only
-`setns()` and `move_mount()`. For unmounts, the child can additionally read the
-trusted procfs file descriptor opened by the parent and call `umount2()`. The
-post-`setns()` code uses explicit syscall wrappers so the filter's allowlist
-fully describes its possible kernel interface.
+The main service process never enters the client-controlled namespace.
+After validating and authorizing the request, it forks a short-lived child that
+installs an enforcing seccomp filter and then joins the namespace.
+For mounts, the parent creates a detached FUSE mount first, leaving the child
+only `setns()` and `move_mount()`.
+For unmounts, the child can additionally read the trusted procfs file
+descriptor opened by the parent and call `umount2()`.
+The post-`setns()` code uses explicit syscall wrappers so the filter's
+allowlist fully describes its possible kernel interface.
 
 ## Why unmount passes a parent-directory fd
 
 Passing an fd on the mountpoint itself makes non-lazy `umount2()` see an
-additional open reference and return `EBUSY`. Passing the parent directory plus
-the mountpoint basename mirrors libfuse's own `fusermount3` flow while still
-letting defused validate the target before closing the target fd and calling
-`umount2(..., UMOUNT_NOFOLLOW)`.
+additional open reference and return `EBUSY`.
+Passing the parent directory plus the mountpoint basename mirrors libfuse's own
+`fusermount3` flow while still letting defused validate the target before
+closing the target fd and calling `umount2(..., UMOUNT_NOFOLLOW)`.
 
 ## Why defused asks polkit
 
 Because defused runs as a system service, it is unable to use process-specific
-information when making filesystem access decisions such as those enforced
-via LSMs. It may also be desirable to set different mount limits for different
-users and groups, or to allow some privileged FUSE options after interactive
-authentication. defused uses polkit to implement these features.
+information when making filesystem access decisions such as those enforced via
+LSMs.
+It may also be desirable to set different mount limits for different users and
+groups, or to allow some privileged FUSE options after interactive
+authentication.
+defused uses polkit to implement these features.
 
 By default, defused is installed with a policy that requires `AUTH_ADMIN_KEEP`
-for all mount requests. This is likely overly restrictive.
-The project provides an example polkit rules file to allow unprivileged
-FUSE options to all users, and to only require authentication as admin for
-possibly insecure options such as `ALLOW_OTHER`.
+for all mount requests.
+This is likely overly restrictive.
+The project provides an example polkit rules file to allow unprivileged FUSE
+options to all users, and to only require authentication as admin for possibly
+insecure options such as `ALLOW_OTHER`.
 
 The mount action includes additional information that should be queried when
 writing polkit rules:
@@ -219,35 +214,29 @@ writing polkit rules:
 Both values are strings, so a rule comparing `current-mounts` numerically needs
 to call `parseInt()` first, and one inspecting `privileged-flags` needs to call
 `.split(",")` on it.
-`packaging/polkit/examples/50-defused-mount-policy.rules` is a complete, installable rule
-using both: it grants ordinary mounts (fewer than 100 open, requesting no
-privileged option the rule doesn't explicitly allowlist) without
-prompting, and falls back to `AUTH_ADMIN_KEEP` for anything past that limit
-or outside the allowlist.
-
-This check is something defused can opt out of: if `org.freedesktop.PolicyKit1`
-has no owner on the system bus, or the `CheckAuthorization` call otherwise
-fails, the operation is refused
-(`DEFUSED_ERR_MOUNT_FAILED`/`DEFUSED_ERR_UNMOUNT_FAILED`) rather than treated
-as "polkit isn't configured, so allow it". This does mean that defused needs
-polkit installed and running to work, and likely needs to add its own polkit
-rule to make the system usable.
+`packaging/polkit/examples/50-defused-mount-policy.rules` is a complete,
+installable rule using both: it grants ordinary mounts (fewer than 100 open,
+requesting no privileged option the rule doesn't explicitly allowlist) without
+prompting, and falls back to `AUTH_ADMIN_KEEP` for anything past that limit or
+outside the allowlist.
 
 ### Why `privileged-flags` is a name list
 
-`ALLOW_OTHER` lets *other* users access the mount, which is a materially
-different risk than an ordinary self-only mount -- and more capabilities
-in the same category are planned (e.g. `suid`, `cuse`, `blkdev`), so
-`privileged-flags` carries every privileged capability name a request
-sets. That lets a rule allowlist capabilities by name and fail on any name it
-doesn't recognize, as is done in `packaging/polkit/examples/50-defused-mount-policy.rules`.
+Flags like `ALLOW_OTHER` grant the caller additional privileges that need to be
+individually allow-listed.
+If each option was a separate polkit detail, a new release could result in a
+policy becoming insecure.
+By using a comma-separated list the polkit rule can simply require auth for
+every option it doesn't recognize: see
+`packaging/polkit/examples/50-defused-mount-policy.rules` for an example.
 
 ### Why unmount's default policy differs from mount's
 
 The permissions on the mount functionality is gated behind `AUTH_ADMIN_KEEP`,
-but `website.soss.defused.unmount`'s default is `YES`. This is because the
-ownership check that follows the polkit check (that the mount's `user_id=` must
-match the caller) is a sufficient answer to "is this caller allowed to tear
-down this specific mount". A deployment that wants to log unmounts or needs to
-prevent a specific pid from unmounting FUSE mounts owned by its uid can do so
-by modifying `website.soss.defused.unmount`'s policy with a custom polkit rule.
+but `website.soss.defused.unmount`'s default is `YES`.
+This is because the ownership check that follows the polkit check (that the
+mount's `user_id=` must match the caller) is a sufficient answer to "is this
+caller allowed to tear down this specific mount".
+A deployment that wants to log unmounts or needs to prevent a specific pid from
+unmounting FUSE mounts owned by its uid can do so by modifying
+`website.soss.defused.unmount`'s policy.
