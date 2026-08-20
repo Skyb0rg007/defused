@@ -19,15 +19,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-/*
- * <linux/pidfd.h> (for struct pidfd_info / PIDFD_GET_INFO) pulls in
- * <linux/fcntl.h>, whose <asm-generic/fcntl.h> unconditionally redefines
- * struct f_owner_ex/flock64 -- which glibc's own <fcntl.h> above (pulled in
- * transitively via defused-sandbox.h -> defused_proto.h -> sd-varlink-idl.h)
- * already declared with the same layout. Pre-defining the header's own
- * include guard makes it skip that body instead of redefining it, the same
- * trick glibc's <bits/fcntl-linux.h> already relies on internally.
- */
+/* Skips <linux/fcntl.h>'s struct redefinitions, which otherwise clash with
+ * glibc's <fcntl.h> above. */
 #define _ASM_GENERIC_FCNTL_H
 #include <linux/pidfd.h>
 
@@ -323,15 +316,8 @@ static int mountinfo_feed(struct mountinfo_parser *parser, char ch) {
     return -EINVAL;
 }
 
-/*
- * Translates pidfd to a pid via the kernel directly, racing against the peer
- * exiting and its pid being recycled by some unrelated task (see
- * open_peer_mountinfo() below for how that race is closed). This runs in the
- * parent, before any fork/setns, so it uses plain libc calls rather than the
- * sandbox_* syscall() wrappers (those exist only for the seccomp-restricted
- * child). PIDFD_GET_INFO requires Linux 6.13 -- see the "Requirements"
- * section of README.md.
- */
+/* Requires Linux 6.13; open_peer_mountinfo() below closes the pid-recycling
+ * race this alone doesn't. */
 static pid_t pidfd_to_pid(int pidfd) {
     struct pidfd_info info = {0};
     if (ioctl(pidfd, PIDFD_GET_INFO, &info) == -1)
@@ -342,16 +328,8 @@ static pid_t pidfd_to_pid(int pidfd) {
     return (pid_t)info.pid;
 }
 
-/*
- * Opens /proc/<pid>/mountinfo for the peer named by pidfd, race-free against
- * pid recycling: pidfd_send_signal(pidfd, 0, ...) fails with ESRCH once the
- * task behind pidfd has exited, and a pid can only be reassigned to a
- * different task after the task that held it has exited. So if the signal
- * probe below still succeeds *after* the open() by pid, the task cannot have
- * exited in between, and the pid therefore cannot have been recycled -- the
- * mountinfo just opened is guaranteed to be the peer's own, not an
- * impostor's that happened to reuse its pid.
- */
+/* The pidfd_send_signal() after open() proves the pid wasn't recycled to
+ * another task in between. */
 static int open_peer_mountinfo(int pidfd, int *out_fd) {
     pid_t pid = pidfd_to_pid(pidfd);
     if (pid < 0)
@@ -374,15 +352,8 @@ static int open_peer_mountinfo(int pidfd, int *out_fd) {
     return 0;
 }
 
-/*
- * Determines the owner of the FUSE mount identified by mnt_id, by reading
- * the peer's own /proc/<pid>/mountinfo directly from the parent -- without
- * joining the peer's mount namespace. mountinfo always reflects the mount
- * namespace of the process it belongs to, regardless of which namespace the
- * reader currently sits in, so this needs no setns() at all: it can run
- * before the sandboxed child exists, rather than after it has joined a
- * client-controlled namespace.
- */
+/* mountinfo reflects its owning process's namespace regardless of the reader's,
+ * so no setns() is needed. */
 static int peer_fuse_mount_owner(int pidfd, long mnt_id, uid_t *out_uid) {
     int fd;
     int ret = open_peer_mountinfo(pidfd, &fd);
@@ -552,15 +523,8 @@ int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd, uint32_t *status,
 int defused_sandbox_unmount(int pidfd, int proc_fd, int mnt_fd, bool lazy,
                             long mnt_id, uid_t uid, uint32_t *status,
                             int *sys_errno) {
-    /*
-     * Ownership is checked here, in the parent, before any child exists.
-     * peer_fuse_mount_owner() reads the peer's own /proc/<pid>/mountinfo
-     * directly, which reflects the peer's mount namespace regardless of
-     * which namespace we run in -- so this needs no setns(). That means the
-     * unauthorized case never has to fork or touch the client's namespace at
-     * all, and the child below is left with nothing to do but the umount2()
-     * itself.
-     */
+    /* Checked here, before forking, so an unauthorized caller never touches the
+     * client's namespace. */
     uid_t owner;
     int ret = peer_fuse_mount_owner(pidfd, mnt_id, &owner);
     if (ret < 0) {
