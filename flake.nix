@@ -19,6 +19,19 @@
         root = ./.;
         fileset = lib.fileset.gitTracked ./.;
       };
+
+      # meson.build's version : '...' is the single source of truth for the
+      # project version.
+      version =
+        let
+          matched = builtins.match ".*version[ \t]*:[ \t]*'([0-9]+\\.[0-9]+(\\.[0-9]+)?)'.*" (
+            builtins.readFile ./meson.build
+          );
+        in
+        if matched == null then
+          throw "flake.nix: could not extract version from meson.build"
+        else
+          builtins.elemAt matched 0;
     in
     {
       nixosModules = {
@@ -47,13 +60,9 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-        in
-        {
-          default = self.packages.${system}.defused;
           defused = pkgs.stdenv.mkDerivation {
             pname = "defused";
-            version = "0.1.0";
-            inherit src;
+            inherit version src;
             nativeBuildInputs = [
               pkgs.meson
               pkgs.ninja
@@ -73,6 +82,10 @@
               platforms = lib.platforms.linux;
             };
           };
+        in
+        {
+          default = self.packages.${system}.defused;
+          inherit defused;
         }
       );
 

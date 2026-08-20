@@ -1,0 +1,42 @@
+Source: defused
+Section: admin
+Priority: optional
+Maintainer: Skye Soss <skye@soss.website>
+Build-Depends: debhelper-compat (= 13),
+               meson,
+               ninja-build,
+               pkg-config,
+               libseccomp-dev,
+               libsystemd-dev
+Standards-Version: 4.7.2
+Homepage: https://github.com/Skyb0rg007/defused
+Rules-Requires-Root: no
+
+Package: defused
+Architecture: any
+# libsystemd0 (>= 258) is also implied by ${shlibs:Depends} (dpkg-shlibdeps
+# picks up the real per-symbol floor from the built binaries, e.g.
+# "libsystemd0 (>= 258~rc1)"), but src/defused_proto.h's Varlink usage needing a
+# systemd this recent is significant enough -- current Debian stable and
+# Ubuntu LTS don't ship it yet -- to also spell out explicitly here rather
+# than leave it implicit in a build-time-computed substvar. See README.md's
+# Installation section.
+#
+# polkitd, not the older policykit-1 name: current Debian (trixie) dropped
+# policykit-1 as an installable package entirely, and current Ubuntu (26.04)
+# did the same -- verified with `apt-cache policy policykit-1 polkitd` in
+# both. Every distro new enough to satisfy the libsystemd floor above also
+# has polkitd.
+Depends: ${shlibs:Depends}, ${misc:Depends}, libsystemd0 (>= 258), polkitd
+Description: setuid-less replacement for fusermount3
+ defused replaces libfuse's setuid-root fusermount3 helper with a
+ socket-activated system service (listening on
+ /run/defused/defused.sock) plus a fusermount3-compatible client
+ binary that talks to it over a Unix domain socket.
+ .
+ Because the setuid-root binary is gone, FUSE mounts keep working
+ under the no_new_privileges process flag used by sandboxing
+ techniques such as seccomp-bpf and landlock, and the privilege to
+ mount FUSE filesystems can be granted per-sandbox by bind-mounting
+ the socket into a container's namespace instead of relying on
+ /usr/bin placement.

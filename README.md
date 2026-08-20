@@ -88,7 +88,14 @@ deny access to `/dev/fuse` or `/run/defused/defused.sock`.
 See [protocol.md](./doc/protocol.md) for more information on how defused
 works.
 
-## Nix binary cache
+## Installation
+
+### Nix
+
+`flake.nix` exposes a `defused` package and a NixOS module
+(`nixosModules.defused`) that sets up the systemd socket/service natively.
+Add this repository as a flake input and, for NixOS, enable
+`services.defused`.
 
 I am using cachix as a binary cache:
 
@@ -96,6 +103,65 @@ I am using cachix as a binary cache:
 # Add to nix.conf
 extra-substituters = https://defused.cachix.org
 extra-trusted-public-keys = defused.cachix.org-1:/YD+2Bmle49JSliBhGRqTKpLYhvruoFyMPPU071YCAY=
+```
+
+### .deb / .rpm
+
+Every `v*` tag is built into `.deb` and `.rpm` packages for x86_64 and
+aarch64, published as assets on the corresponding [GitHub
+release](https://github.com/Skyb0rg007/defused/releases). These are built
+natively per-distro (`debhelper`/`dpkg-buildpackage` for `.deb`, `rpmbuild`
+for `.rpm`, see `debian/` and `packaging/defused.spec`) rather than with Nix,
+so they're linked against the target distro's own glibc/libseccomp/libsystemd
+instead of nixpkgs'.
+
+Note that defused's Varlink usage currently needs **libsystemd >= 258**
+(both packages declare this explicitly as a runtime dependency --
+`libsystemd0 (>= 258)` for `.deb`, `systemd-libs >= 258` for `.rpm` -- rather
+than relying solely on the auto-detected shared-library version, since it's
+a meaningfully high floor). As of this writing that means:
+
+- Fedora: works on current releases (Fedora 44 ships systemd 259).
+- Debian: does **not** work on Debian 12 (bookworm) or 13 (trixie, current
+  stable) -- trixie's systemd 257 is still one major version short.
+- Ubuntu: does **not** work on 24.04 LTS (systemd 255) or earlier; needs
+  26.04 LTS (systemd 259) or newer.
+
+If you're on a distribution that doesn't ship a new enough systemd yet, use
+the Nix package instead (see above), which carries its own libsystemd.
+
+Install with your distribution's package manager, e.g.:
+
+```sh
+# Debian/Ubuntu
+$ sudo apt install ./defused_<version>_amd64.deb
+# Fedora
+$ sudo dnf install ./defused-<version>-1.x86_64.rpm
+```
+
+This installs the `defused@.service`/`defused.socket` units and the polkit
+action, but doesn't enable or start the socket for you:
+
+```sh
+$ sudo systemctl enable --now defused.socket
+```
+
+See [protocol.md](./doc/protocol.md) for the default (interactive-only)
+polkit policy, and `packaging/polkit/examples/50-defused-mount-policy.rules`
+(installed under `/usr/share/doc/defused/examples`) for a less strict
+example rule.
+
+These packages can also be built locally:
+
+```sh
+# .deb, from the repo root
+$ dpkg-buildpackage -us -uc -b
+
+# .rpm: set up an rpmbuild tree, generate the source tarball
+# packaging/defused.spec expects, then build
+$ rpmdev-setuptree
+$ git archive --prefix=defused-0.1/ -o ~/rpmbuild/SOURCES/defused-0.1.tar.gz HEAD
+$ rpmbuild -ba packaging/defused.spec
 ```
 
 ## Contributing
