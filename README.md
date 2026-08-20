@@ -35,6 +35,12 @@ application's AppArmor or Landlock configuration.
 Doing so with `fusermount3` is much more challenging, as it is not compatible
 with Landlock.
 
+## Requirements
+
+Defused requires Linux 6.13 or later: the service authorizes unmounts by
+resolving a client's pidfd to its pid via the `PIDFD_GET_INFO` ioctl, which
+was added in 6.13.
+
 ## Project structure
 
 This project provides the following:

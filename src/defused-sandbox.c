@@ -329,7 +329,8 @@ static int mountinfo_feed(struct mountinfo_parser *parser, char ch) {
  * open_peer_mountinfo() below for how that race is closed). This runs in the
  * parent, before any fork/setns, so it uses plain libc calls rather than the
  * sandbox_* syscall() wrappers (those exist only for the seccomp-restricted
- * child).
+ * child). PIDFD_GET_INFO requires Linux 6.13 -- see the "Requirements"
+ * section of README.md.
  */
 static pid_t pidfd_to_pid(int pidfd) {
     struct pidfd_info info = {0};
