@@ -152,8 +152,10 @@ int main(void) {
     test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_getpid, EPERM);
     test_filter_syscall(DEFUSED_OP_MOUNT, SYS_read, EPERM);
     test_filter_syscall(DEFUSED_OP_MOUNT, SYS_close, EPERM);
-    test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_read, EBADF);
-    test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_close, EBADF);
+    test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_read, EPERM);
+    test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_close, EPERM);
+    test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_fchdir, EBADF);
+    test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_umount2, EFAULT);
     test_mountinfo_parser();
     test_long_mountinfo_line();
     return failures ? 1 : 0;

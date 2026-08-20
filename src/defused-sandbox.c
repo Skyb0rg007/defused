@@ -13,10 +13,23 @@
 #include <seccomp.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+/*
+ * <linux/pidfd.h> (for struct pidfd_info / PIDFD_GET_INFO) pulls in
+ * <linux/fcntl.h>, whose <asm-generic/fcntl.h> unconditionally redefines
+ * struct f_owner_ex/flock64 -- which glibc's own <fcntl.h> above (pulled in
+ * transitively via defused-sandbox.h -> defused_proto.h -> sd-varlink-idl.h)
+ * already declared with the same layout. Pre-defining the header's own
+ * include guard makes it skip that body instead of redefining it, the same
+ * trick glibc's <bits/fcntl-linux.h> already relies on internally.
+ */
+#define _ASM_GENERIC_FCNTL_H
+#include <linux/pidfd.h>
 
 struct sandbox_result {
     uint32_t status;
@@ -35,8 +48,8 @@ static int install_seccomp(enum defused_op op) {
         SCMP_SYS(move_mount),
     };
     static const int unmount_syscalls[] = {
-        SCMP_SYS(read),    SCMP_SYS(close),  SCMP_SYS(fchdir),
-        SCMP_SYS(umount2), SCMP_SYS(openat),
+        SCMP_SYS(fchdir),
+        SCMP_SYS(umount2),
     };
 
     scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_ERRNO(EPERM));
@@ -96,19 +109,9 @@ static int sandbox_move_mount(int from_fd, const char *from_path, int to_fd,
                         flags);
 }
 
-static int sandbox_openat(int dirfd, const char *path, int flags) {
-    return (int)syscall(SYS_openat, dirfd, path, flags, 0);
-}
-
-static ssize_t sandbox_read(int fd, void *buf, size_t count) {
-    return (ssize_t)syscall(SYS_read, fd, buf, count);
-}
-
 static ssize_t sandbox_write(int fd, const void *buf, size_t count) {
     return (ssize_t)syscall(SYS_write, fd, buf, count);
 }
-
-static int sandbox_close(int fd) { return (int)syscall(SYS_close, fd); }
 
 static int sandbox_fchdir(int fd) { return (int)syscall(SYS_fchdir, fd); }
 
@@ -320,10 +323,70 @@ static int mountinfo_feed(struct mountinfo_parser *parser, char ch) {
     return -EINVAL;
 }
 
-static int sandbox_fuse_mount_owner(int proc_fd, long mnt_id, uid_t *out_uid) {
-    int fd = sandbox_openat(proc_fd, "self/mountinfo", O_RDONLY | O_CLOEXEC);
+/*
+ * Translates pidfd to a pid via the kernel directly, racing against the peer
+ * exiting and its pid being recycled by some unrelated task (see
+ * open_peer_mountinfo() below for how that race is closed). This runs in the
+ * parent, before any fork/setns, so it uses plain libc calls rather than the
+ * sandbox_* syscall() wrappers (those exist only for the seccomp-restricted
+ * child).
+ */
+static pid_t pidfd_to_pid(int pidfd) {
+    struct pidfd_info info = {0};
+    if (ioctl(pidfd, PIDFD_GET_INFO, &info) == -1)
+        return -errno;
+    if (!(info.mask & PIDFD_INFO_PID) || info.pid == 0 ||
+        info.pid > (unsigned int)INT_MAX)
+        return -EINVAL;
+    return (pid_t)info.pid;
+}
+
+/*
+ * Opens /proc/<pid>/mountinfo for the peer named by pidfd, race-free against
+ * pid recycling: pidfd_send_signal(pidfd, 0, ...) fails with ESRCH once the
+ * task behind pidfd has exited, and a pid can only be reassigned to a
+ * different task after the task that held it has exited. So if the signal
+ * probe below still succeeds *after* the open() by pid, the task cannot have
+ * exited in between, and the pid therefore cannot have been recycled -- the
+ * mountinfo just opened is guaranteed to be the peer's own, not an
+ * impostor's that happened to reuse its pid.
+ */
+static int open_peer_mountinfo(int pidfd, int *out_fd) {
+    pid_t pid = pidfd_to_pid(pidfd);
+    if (pid < 0)
+        return (int)pid;
+
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/mountinfo", (int)pid);
+
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd == -1)
         return -errno;
+
+    if (syscall(SYS_pidfd_send_signal, pidfd, 0, NULL, 0) == -1) {
+        int saved_errno = errno;
+        close(fd);
+        return -saved_errno;
+    }
+
+    *out_fd = fd;
+    return 0;
+}
+
+/*
+ * Determines the owner of the FUSE mount identified by mnt_id, by reading
+ * the peer's own /proc/<pid>/mountinfo directly from the parent -- without
+ * joining the peer's mount namespace. mountinfo always reflects the mount
+ * namespace of the process it belongs to, regardless of which namespace the
+ * reader currently sits in, so this needs no setns() at all: it can run
+ * before the sandboxed child exists, rather than after it has joined a
+ * client-controlled namespace.
+ */
+static int peer_fuse_mount_owner(int pidfd, long mnt_id, uid_t *out_uid) {
+    int fd;
+    int ret = open_peer_mountinfo(pidfd, &fd);
+    if (ret < 0)
+        return ret;
 
     struct mountinfo_parser parser = {
         .target_id = mnt_id,
@@ -332,10 +395,12 @@ static int sandbox_fuse_mount_owner(int proc_fd, long mnt_id, uid_t *out_uid) {
     mountinfo_reset_line(&parser);
 
     char buf[4096];
-    int ret = -ENOENT;
+    ret = -ENOENT;
     for (;;) {
-        ssize_t n = sandbox_read(fd, buf, sizeof(buf));
+        ssize_t n = read(fd, buf, sizeof(buf));
         if (n < 0) {
+            if (errno == EINTR)
+                continue;
             ret = -errno;
             break;
         }
@@ -359,7 +424,7 @@ static int sandbox_fuse_mount_owner(int proc_fd, long mnt_id, uid_t *out_uid) {
     }
 
 out:
-    (void)sandbox_close(fd);
+    close(fd);
     return ret;
 }
 
@@ -486,6 +551,28 @@ int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd, uint32_t *status,
 int defused_sandbox_unmount(int pidfd, int proc_fd, int mnt_fd, bool lazy,
                             long mnt_id, uid_t uid, uint32_t *status,
                             int *sys_errno) {
+    /*
+     * Ownership is checked here, in the parent, before any child exists.
+     * peer_fuse_mount_owner() reads the peer's own /proc/<pid>/mountinfo
+     * directly, which reflects the peer's mount namespace regardless of
+     * which namespace we run in -- so this needs no setns(). That means the
+     * unauthorized case never has to fork or touch the client's namespace at
+     * all, and the child below is left with nothing to do but the umount2()
+     * itself.
+     */
+    uid_t owner;
+    int ret = peer_fuse_mount_owner(pidfd, mnt_id, &owner);
+    if (ret < 0) {
+        *status = DEFUSED_ERR_NOT_A_FUSE_MOUNT;
+        *sys_errno = 0;
+        return ret;
+    }
+    if (owner != uid) {
+        *status = DEFUSED_ERR_NOT_ALLOWED;
+        *sys_errno = 0;
+        return -EPERM;
+    }
+
     char proc_path[32];
     snprintf(proc_path, sizeof(proc_path), "self/fd/%d", mnt_fd);
 
@@ -497,22 +584,16 @@ int defused_sandbox_unmount(int pidfd, int proc_fd, int mnt_fd, bool lazy,
     if (pid == 0) {
         close(pipefd[0]);
 
-        int ret = install_seccomp(DEFUSED_OP_UNMOUNT);
-        if (ret < 0)
-            sandbox_done(pipefd[1], DEFUSED_ERR_UNMOUNT_FAILED, -ret, ret);
+        int child_ret = install_seccomp(DEFUSED_OP_UNMOUNT);
+        if (child_ret < 0)
+            sandbox_done(pipefd[1], DEFUSED_ERR_UNMOUNT_FAILED, -child_ret,
+                         child_ret);
 
         if (sandbox_setns(pidfd, CLONE_NEWNS) == -1) {
-            ret = -errno;
-            sandbox_done(pipefd[1], DEFUSED_ERR_SETNS_FAILED, -ret, ret);
+            child_ret = -errno;
+            sandbox_done(pipefd[1], DEFUSED_ERR_SETNS_FAILED, -child_ret,
+                         child_ret);
         }
-
-        uid_t owner;
-        ret = sandbox_fuse_mount_owner(proc_fd, mnt_id, &owner);
-        if (ret < 0)
-            sandbox_done(pipefd[1], DEFUSED_ERR_NOT_A_FUSE_MOUNT, 0, ret);
-
-        if (owner != uid)
-            sandbox_done(pipefd[1], DEFUSED_ERR_NOT_ALLOWED, 0, -EPERM);
 
         /*
          * Resolve the mount through the O_PATH fd that supplied mnt_id above,
@@ -521,11 +602,11 @@ int defused_sandbox_unmount(int pidfd, int proc_fd, int mnt_fd, bool lazy,
          * procfs, so following this magic link cannot redirect the unmount to
          * a different client-selected path.
          */
-        ret = sandbox_umount_by_proc_path(proc_fd, proc_path,
-                                          lazy ? MNT_DETACH : 0);
+        child_ret = sandbox_umount_by_proc_path(proc_fd, proc_path,
+                                                lazy ? MNT_DETACH : 0);
         sandbox_done(pipefd[1],
-                     ret < 0 ? DEFUSED_ERR_UNMOUNT_FAILED : DEFUSED_OK,
-                     ret < 0 ? -ret : 0, ret);
+                     child_ret < 0 ? DEFUSED_ERR_UNMOUNT_FAILED : DEFUSED_OK,
+                     child_ret < 0 ? -child_ret : 0, child_ret);
     }
 
     close(pipefd[1]);
