@@ -944,8 +944,8 @@ static int handle_umount(sd_varlink *link, int sock,
     /* Before the sandboxed child installs seccomp: the filter has no room for
      * the syscalls talking to polkit over D-Bus needs. This asks only whether
      * the caller may use unmount at all -- whether this specific mount is
-     * theirs to tear down is the ownership check below, which needs the
-     * caller's mount namespace and so can't move here. */
+     * theirs to tear down is checked separately, inside
+     * defused_sandbox_unmount(). */
     ret = check_polkit_authorized(sock, cred, DEFUSED_POLKIT_ACTION_UNMOUNT, -1,
                                   NULL);
     if (ret < 0) {
