@@ -317,7 +317,8 @@ static int mountinfo_feed(struct mountinfo_parser *parser, char ch) {
 }
 
 /* Requires Linux 6.13; open_peer_mountinfo() below closes the pid-recycling
- * race this alone doesn't. */
+ * race this alone doesn't. Older kernels could fall back to parsing
+ * /proc/self/fdinfo/<pidfd>'s "Pid:" line instead, but that isn't done here. */
 static pid_t pidfd_to_pid(int pidfd) {
     struct pidfd_info info = {0};
     if (ioctl(pidfd, PIDFD_GET_INFO, &info) == -1)
