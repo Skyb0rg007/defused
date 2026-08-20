@@ -13,6 +13,7 @@
 #include <seccomp.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/syscall.h>
@@ -29,6 +30,15 @@ struct sandbox_result {
     int32_t sys_errno;
     int32_t ret;
 };
+
+static int add_rules(scmp_filter_ctx ctx, const int *syscalls, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        int ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, syscalls[i], 0);
+        if (ret < 0)
+            return ret;
+    }
+    return 0;
+}
 
 /* After setns(), the filesystem will be controlled by the client.
  * Restrict ourselves before that to make sure nothing bad happens. */
@@ -49,34 +59,26 @@ static int install_seccomp(enum defused_op op) {
     if (!ctx)
         return -ENOMEM;
 
-    int ret = 0;
-    for (size_t i = 0;
-         i < sizeof(allowed_syscalls) / sizeof(allowed_syscalls[0]); i++) {
-        ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, allowed_syscalls[i], 0);
-        if (ret < 0)
-            goto out;
-    }
+    int ret = add_rules(ctx, allowed_syscalls,
+                        sizeof(allowed_syscalls) / sizeof(allowed_syscalls[0]));
+    if (ret < 0)
+        goto out;
 
     switch (op) {
     case DEFUSED_OP_MOUNT:
-        for (size_t i = 0;
-             i < sizeof(mount_syscalls) / sizeof(mount_syscalls[0]); i++) {
-            ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, mount_syscalls[i], 0);
-            if (ret < 0)
-                goto out;
-        }
+        ret = add_rules(ctx, mount_syscalls,
+                        sizeof(mount_syscalls) / sizeof(mount_syscalls[0]));
         break;
     case DEFUSED_OP_UNMOUNT:
-        for (size_t i = 0;
-             i < sizeof(unmount_syscalls) / sizeof(unmount_syscalls[0]); i++) {
-            ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, unmount_syscalls[i], 0);
-            if (ret < 0)
-                goto out;
-        }
+        ret = add_rules(ctx, unmount_syscalls,
+                        sizeof(unmount_syscalls) / sizeof(unmount_syscalls[0]));
         break;
     default:
+        seccomp_release(ctx);
         return -EINVAL;
     }
+    if (ret < 0)
+        goto out;
 
     ret = seccomp_load(ctx);
     if (ret >= 0)
@@ -191,17 +193,13 @@ static bool mountinfo_fstype_is_fuse(const struct mountinfo_parser *parser) {
     const char *s = parser->fstype_prefix;
     size_t len = parser->fstype_length;
 
-    if (len == 4 && s[0] == 'f' && s[1] == 'u' && s[2] == 's' && s[3] == 'e')
+    if (len == 4 && memcmp(s, "fuse", 4) == 0)
         return true;
-    if (len >= 5 && s[0] == 'f' && s[1] == 'u' && s[2] == 's' && s[3] == 'e' &&
-        s[4] == '.')
+    if (len >= 5 && memcmp(s, "fuse.", 5) == 0)
         return true;
-    if (len == 7 && s[0] == 'f' && s[1] == 'u' && s[2] == 's' && s[3] == 'e' &&
-        s[4] == 'b' && s[5] == 'l' && s[6] == 'k')
+    if (len == 7 && memcmp(s, "fuseblk", 7) == 0)
         return true;
-    return len >= 8 && s[0] == 'f' && s[1] == 'u' && s[2] == 's' &&
-           s[3] == 'e' && s[4] == 'b' && s[5] == 'l' && s[6] == 'k' &&
-           s[7] == '.';
+    return len >= 8 && memcmp(s, "fuseblk.", 8) == 0;
 }
 
 static int mountinfo_finish_option(struct mountinfo_parser *parser) {
