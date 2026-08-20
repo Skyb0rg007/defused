@@ -8,11 +8,12 @@ Copyright: 2026 Skye Soss <skye@soss.website>
 License: GPL-2.0-or-later
 
 Files:
- units/defused.service
- units/defused.socket
- examples/50-defused-mount-policy.rules
+ packaging/systemd/defused.socket
+ packaging/systemd/defused@.service
+ packaging/polkit/examples/50-defused-mount-policy.rules
  .github/workflows/*
  .github/dependabot.yml
+ .github/scripts/check-version-consistency.sh
 Copyright: 2026 Skye Soss <skye@soss.website>
 License: MIT-0
 
