@@ -74,15 +74,15 @@ static int install_seccomp(enum defused_op op) {
                         sizeof(unmount_syscalls) / sizeof(unmount_syscalls[0]));
         break;
     default:
-        seccomp_release(ctx);
-        return -EINVAL;
+        ret = -EINVAL;
+        break;
     }
     if (ret < 0)
         goto out;
 
+    /* The kernel keeps its own copy of a loaded filter, so ctx is released
+     * on success as well. */
     ret = seccomp_load(ctx);
-    if (ret >= 0)
-        return 0;
 out:
     seccomp_release(ctx);
     return ret < 0 ? ret : 0;
@@ -156,6 +156,9 @@ enum mountinfo_state {
     MOUNTINFO_SUPER_OPTIONS,
 };
 
+/* The super-options key whose value names the FUSE mount's owning uid. */
+static const char uid_prefix[] = "user_id=";
+
 struct mountinfo_parser {
     enum mountinfo_state state;
     long target_id;
@@ -203,7 +206,8 @@ static bool mountinfo_fstype_is_fuse(const struct mountinfo_parser *parser) {
 }
 
 static int mountinfo_finish_option(struct mountinfo_parser *parser) {
-    if (parser->option_matches_uid && parser->option_index > 8 &&
+    if (parser->option_matches_uid &&
+        parser->option_index > sizeof(uid_prefix) - 1 &&
         parser->option_has_uid_digit && !parser->option_uid_overflow &&
         parser->option_uid <= (unsigned long)((uid_t)-1)) {
         *parser->out_uid = (uid_t)parser->option_uid;
@@ -223,8 +227,6 @@ static int mountinfo_finish_option(struct mountinfo_parser *parser) {
  * when the requested mount exists but is not a well-formed FUSE entry.
  */
 static int mountinfo_feed(struct mountinfo_parser *parser, char ch) {
-    static const char uid_prefix[] = "user_id=";
-
     switch (parser->state) {
     case MOUNTINFO_ID:
         if (ch >= '0' && ch <= '9') {

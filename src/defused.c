@@ -15,6 +15,7 @@
 #include "defused_proto.h"
 #include "util.h"
 
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
@@ -81,7 +82,8 @@ struct prepared_mount {
     unsigned int mount_attrs;
 };
 
-static int reply_response(sd_varlink *link, uint32_t status, int sys_errno);
+/* Forward declarations, only for functions used before their definition;
+ * everything else carries its attributes on the definition itself. */
 static int varlink_mount(sd_varlink *link, sd_json_variant *parameters,
                          sd_varlink_method_flags_t flags, void *userdata)
     __attribute__((__nonnull__(1, 4), __warn_unused_result__));
@@ -90,28 +92,8 @@ static int varlink_unmount(sd_varlink *link, sd_json_variant *parameters,
     __attribute__((__nonnull__(1, 4), __warn_unused_result__));
 static const char *status_name(uint32_t status)
     __attribute__((__const__, __warn_unused_result__));
-static int peer_pidfd(int sock) __attribute__((__warn_unused_result__));
 static int get_peer_cred(int sock, struct ucred *cred)
     __attribute__((__nonnull__(2), __warn_unused_result__));
-static int check_mount_policy(const struct defused_mount_req *req)
-    __attribute__((__nonnull__(1), __warn_unused_result__));
-static int check_polkit_authorized(int sock, const struct ucred *cred,
-                                   const char *action_id, long current_mounts,
-                                   const char *privileged_flags)
-    __attribute__((__nonnull__(2, 3), __warn_unused_result__));
-static void format_privileged_flags(uint32_t mount_flags, char *buf,
-                                    size_t bufsz)
-    __attribute__((__nonnull__(2)));
-static int check_mountpoint_fstype(int mnt_fd)
-    __attribute__((__warn_unused_result__));
-static int check_fuse_device_fd(int dev_fd)
-    __attribute__((__warn_unused_result__));
-static int prepare_mount(const struct defused_mount_req *req, int dev_fd,
-                         const struct stat *st, const struct ucred *cred,
-                         struct prepared_mount *out)
-    __attribute__((__nonnull__(1, 3, 4, 5), __warn_unused_result__));
-static int create_detached_mount(const struct prepared_mount *mnt)
-    __attribute__((__nonnull__(1), __warn_unused_result__));
 static int handle_mount(sd_varlink *link, int sock,
                         const struct defused_mount_req *req, int mnt_fd,
                         int dev_fd, const struct ucred *cred)
@@ -120,14 +102,12 @@ static int handle_umount(sd_varlink *link, int sock,
                          const struct defused_umount_req *req, int parent_fd,
                          const struct ucred *cred)
     __attribute__((__nonnull__(1, 3, 5), __warn_unused_result__));
-static void usage(const char *prog) __attribute__((__nonnull__(1)));
 static int parse_args(int argc, char *argv[])
     __attribute__((__nonnull__(2), __warn_unused_result__));
 static int socket_activation_fd(int *out_fd)
     __attribute__((__nonnull__(1), __warn_unused_result__));
 static int handle_connection(int sock) __attribute__((__warn_unused_result__));
 static int run_fork_daemon(void) __attribute__((__warn_unused_result__));
-static void sigchld_handler(int sig);
 static int create_listening_socket(void)
     __attribute__((__warn_unused_result__));
 static int bind_unix_socket(int fd, const struct sockaddr_un *sa,
@@ -403,7 +383,7 @@ static const char *status_name(uint32_t status) {
     }
 }
 
-static int peer_pidfd(int sock) {
+static __attribute__((__warn_unused_result__)) int peer_pidfd(int sock) {
     int pidfd = -1;
     socklen_t len = sizeof(pidfd);
     if (getsockopt(sock, SOL_SOCKET, SO_PEERPIDFD, &pidfd, &len) == -1) {
@@ -436,24 +416,14 @@ static int mount_fsconfig_flag(int fsfd, const char *key) {
     return 0;
 }
 
-/* Check the client's mount request is well-formed. Policy questions like
- * whether this caller may use allow_other are answered entirely by polkit
- * (see check_polkit_authorized()); this only validates protocol shape. */
-static int check_mount_policy(const struct defused_mount_req *req) {
-    if ((req->mount_flags & ~(uint32_t)DEFUSED_MOUNT_FLAGS_MASK) != 0)
-        return -EINVAL;
-
-    return 0;
-}
-
 /* Writes a comma-separated list of privileged_mount_flags[] names for the
  * bits set in mount_flags into buf (empty string if none are set), for the
  * "privileged-flags" polkit detail -- see privileged_mount_flags[]'s doc
  * comment. buf is always NUL-terminated; names that wouldn't fit are
  * silently dropped, which only matters if this table grows to carry far
  * more (and far longer) names than it does today. */
-static void format_privileged_flags(uint32_t mount_flags, char *buf,
-                                    size_t bufsz) {
+static __attribute__((__nonnull__(2))) void
+format_privileged_flags(uint32_t mount_flags, char *buf, size_t bufsz) {
     size_t len = 0;
     buf[0] = '\0';
 
@@ -503,9 +473,10 @@ static void format_privileged_flags(uint32_t mount_flags, char *buf,
  * Fails closed: if polkit cannot be reached at all (e.g. not installed or
  * not running), the operation is refused rather than silently falling back
  * to the ownership check alone. */
-static int check_polkit_authorized(int sock, const struct ucred *cred,
-                                   const char *action_id, long current_mounts,
-                                   const char *privileged_flags) {
+static __attribute__((__nonnull__(2, 3), __warn_unused_result__)) int
+check_polkit_authorized(int sock, const struct ucred *cred,
+                        const char *action_id, long current_mounts,
+                        const char *privileged_flags) {
     bool have_privileged_flags = privileged_flags && privileged_flags[0];
     int pidfd = peer_pidfd(sock);
     if (pidfd < 0)
@@ -618,7 +589,8 @@ out:
     return ret;
 }
 
-static int check_mountpoint_fstype(int mnt_fd) {
+static __attribute__((__warn_unused_result__)) int
+check_mountpoint_fstype(int mnt_fd) {
     struct statfs fs;
     if (fstatfs(mnt_fd, &fs) == -1)
         return -errno;
@@ -626,7 +598,8 @@ static int check_mountpoint_fstype(int mnt_fd) {
     return check_nonroot_fstype("defused", &fs) == 0 ? 0 : -EPERM;
 }
 
-static int check_fuse_device_fd(int dev_fd) {
+static __attribute__((__warn_unused_result__)) int
+check_fuse_device_fd(int dev_fd) {
     struct stat st;
     if (fstat(dev_fd, &st) == -1)
         return -errno;
@@ -642,9 +615,10 @@ static int check_fuse_device_fd(int dev_fd) {
     return 0;
 }
 
-static int prepare_mount(const struct defused_mount_req *req, int dev_fd,
-                         const struct stat *st, const struct ucred *cred,
-                         struct prepared_mount *out) {
+static __attribute__((__nonnull__(1, 3, 4, 5))) void
+prepare_mount(const struct defused_mount_req *req, int dev_fd,
+              const struct stat *st, const struct ucred *cred,
+              struct prepared_mount *out) {
     memset(out, 0, sizeof(*out));
     snprintf(out->type, sizeof(out->type), "fuse%s%s",
              req->subtype[0] ? "." : "", req->subtype);
@@ -679,11 +653,10 @@ static int prepare_mount(const struct defused_mount_req *req, int dev_fd,
         out->mount_attrs |= MOUNT_ATTR_NODIRATIME;
     if (flags & DEFUSED_MOUNT_NOSYMFOLLOW)
         out->mount_attrs |= MOUNT_ATTR_NOSYMFOLLOW;
-
-    return 0;
 }
 
-static int create_detached_mount(const struct prepared_mount *mnt) {
+static __attribute__((__nonnull__(1), __warn_unused_result__)) int
+create_detached_mount(const struct prepared_mount *mnt) {
     int fsfd = fsopen(mnt->type, FSOPEN_CLOEXEC);
     if (fsfd == -1)
         return neg_errno();
@@ -761,18 +734,22 @@ static int handle_mount(sd_varlink *link, int sock,
     int ret = 0;
     int mountfd = -1;
 
-    if (strnlen(req->fsname, DEFUSED_MAX_NAME) == DEFUSED_MAX_NAME ||
-        strnlen(req->subtype, DEFUSED_MAX_NAME) == DEFUSED_MAX_NAME ||
-        strchr(req->fsname, '/') || strchr(req->subtype, '/')) {
+    /* varlink_mount() already bounds-checked these before copying them out
+     * of the JSON payload. */
+    assert(strnlen(req->fsname, DEFUSED_MAX_NAME) < DEFUSED_MAX_NAME);
+    assert(strnlen(req->subtype, DEFUSED_MAX_NAME) < DEFUSED_MAX_NAME);
+    if (strchr(req->fsname, '/') || strchr(req->subtype, '/')) {
         status = DEFUSED_ERR_MALFORMED;
         ret = -EINVAL;
         goto fail;
     }
 
-    ret = check_mount_policy(req);
-    if (ret < 0) {
-        status =
-            ret == -EINVAL ? DEFUSED_ERR_BAD_OPTION : DEFUSED_ERR_NOT_ALLOWED;
+    /* Policy questions like whether this caller may use allow_other are
+     * answered entirely by polkit (see check_polkit_authorized()); this
+     * only validates protocol shape. */
+    if ((req->mount_flags & ~(uint32_t)DEFUSED_MOUNT_FLAGS_MASK) != 0) {
+        status = DEFUSED_ERR_BAD_OPTION;
+        ret = -EINVAL;
         goto fail;
     }
 
@@ -844,13 +821,7 @@ static int handle_mount(sd_varlink *link, int sock,
     }
 
     struct prepared_mount prepared;
-    ret = prepare_mount(req, dev_fd, &st, cred, &prepared);
-    if (ret < 0) {
-        status = DEFUSED_ERR_MOUNT_FAILED;
-        sys_errno = -ret;
-        close(pidfd);
-        goto fail;
-    }
+    prepare_mount(req, dev_fd, &st, cred, &prepared);
 
     mountfd = create_detached_mount(&prepared);
     if (mountfd < 0) {
@@ -890,8 +861,10 @@ static int handle_umount(sd_varlink *link, int sock,
     int mnt_fd = -1;
     int proc_fd = -1;
 
-    if (strnlen(req->name, DEFUSED_MAX_FILENAME) == DEFUSED_MAX_FILENAME ||
-        req->name[0] == '\0' || strchr(req->name, '/') ||
+    /* varlink_unmount() already bounds-checked this before copying it out
+     * of the JSON payload. */
+    assert(strnlen(req->name, DEFUSED_MAX_FILENAME) < DEFUSED_MAX_FILENAME);
+    if (req->name[0] == '\0' || strchr(req->name, '/') ||
         !strcmp(req->name, ".") || !strcmp(req->name, "..")) {
         status = DEFUSED_ERR_MALFORMED;
         ret = -EINVAL;
@@ -986,7 +959,7 @@ out:
     return ret;
 }
 
-static void usage(const char *prog) {
+static __attribute__((__nonnull__(1))) void usage(const char *prog) {
     fprintf(
         stderr,
         "usage: %s [--daemon]\n"
