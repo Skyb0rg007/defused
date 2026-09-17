@@ -30,6 +30,9 @@ It must be started as root.
   (still at `DEFUSED_SOCKET_PATH` by default, also mode 0666), then forks
   a child per accepted connection to run the same one-call-per-connection
   handling as the `Accept=yes` path.
+- **Discovery**: the socket inode is tagged with the extended attribute
+  `user.varlink=entrypoint` as recommended by the [Varlink UAPI Spec][].
+  This only works on Linux 7.0 and above.
 
 The service handles one Varlink method call and exits when the connection goes
 idle.
@@ -240,3 +243,5 @@ caller allowed to tear down this specific mount".
 A deployment that wants to log unmounts or needs to prevent a specific pid from
 unmounting FUSE mounts owned by its uid can do so by modifying
 `website.soss.defused.unmount`'s policy.
+
+[Varlink UAPI Spec]: https://uapi-group.org/specifications/specs/varlink/
