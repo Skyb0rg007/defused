@@ -177,17 +177,50 @@ static void test_fdinfo_pid(void) {
     close(pidfd);
 }
 
+static void test_fdinfo_parser(void) {
+    long id = -1;
+    const char *info = "pos:\t0\nflags:\t012100000\nmnt_id:\t31\nino:\t4242\n";
+    CHECK(defused_test_fdinfo_mnt_id(info, strlen(info), &id) == 0);
+    CHECK(id == 31);
+
+    id = -1;
+    info = "pos:\t0\nflags:\t0\nmnt_id:\t7";
+    CHECK(defused_test_fdinfo_mnt_id(info, strlen(info), &id) == 0);
+    CHECK(id == 7);
+
+    info = "pos:\t0\nflags:\t0\nino:\t31\n";
+    CHECK(defused_test_fdinfo_mnt_id(info, strlen(info), &id) == -ENODATA);
+
+    info = "pos:\t0\nxmnt_id:\t31\n";
+    CHECK(defused_test_fdinfo_mnt_id(info, strlen(info), &id) == -ENODATA);
+
+    info = "mnt_id:\t\n";
+    CHECK(defused_test_fdinfo_mnt_id(info, strlen(info), &id) == -EINVAL);
+
+    info = "mnt_id:\t3x\n";
+    CHECK(defused_test_fdinfo_mnt_id(info, strlen(info), &id) == -EINVAL);
+
+    info = "mnt_id:\t99999999999999999999999\n";
+    CHECK(defused_test_fdinfo_mnt_id(info, strlen(info), &id) == -EOVERFLOW);
+}
+
 int main(void) {
     test_filter_syscall(DEFUSED_OP_MOUNT, SYS_getpid, EPERM);
     test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_getpid, EPERM);
     test_filter_syscall(DEFUSED_OP_MOUNT, SYS_read, EPERM);
     test_filter_syscall(DEFUSED_OP_MOUNT, SYS_close, EPERM);
-    test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_read, EPERM);
-    test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_close, EPERM);
+    test_filter_syscall(DEFUSED_OP_MOUNT, SYS_openat, EPERM);
+    test_filter_syscall(DEFUSED_OP_MOUNT, SYS_fchdir, EPERM);
+    test_filter_syscall(DEFUSED_OP_MOUNT, SYS_umount2, EPERM);
+    test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_move_mount, EPERM);
+    test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_read, EBADF);
+    test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_close, EBADF);
+    test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_openat, EFAULT);
     test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_fchdir, EBADF);
     test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_umount2, EFAULT);
     test_mountinfo_parser();
     test_long_mountinfo_line();
     test_fdinfo_pid();
+    test_fdinfo_parser();
     return failures ? 1 : 0;
 }

@@ -33,6 +33,10 @@
     inherit self pkgs system;
   };
 
+  non-lazy-unmount = import ./non-lazy-unmount.nix {
+    inherit self pkgs system;
+  };
+
   polkit = import ./polkit.nix {
     inherit self pkgs system;
   };

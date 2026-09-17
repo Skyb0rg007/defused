@@ -53,8 +53,8 @@ static int install_seccomp(enum defused_op op) {
         SCMP_SYS(move_mount),
     };
     static const int unmount_syscalls[] = {
-        SCMP_SYS(fchdir),
-        SCMP_SYS(umount2),
+        SCMP_SYS(fchdir), SCMP_SYS(openat),  SCMP_SYS(read),
+        SCMP_SYS(close),  SCMP_SYS(umount2),
     };
 
     scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_ERRNO(EPERM));
@@ -111,6 +111,16 @@ static ssize_t sandbox_write(int fd, const void *buf, size_t count) {
 }
 
 static int sandbox_fchdir(int fd) { return (int)syscall(SYS_fchdir, fd); }
+
+static int sandbox_openat(int dirfd, const char *path, int flags) {
+    return (int)syscall(SYS_openat, dirfd, path, flags, 0);
+}
+
+static ssize_t sandbox_read(int fd, void *buf, size_t count) {
+    return (ssize_t)syscall(SYS_read, fd, buf, count);
+}
+
+static int sandbox_close(int fd) { return (int)syscall(SYS_close, fd); }
 
 static int sandbox_umount2(const char *path, int flags) {
     return (int)syscall(SYS_umount2, path, flags);
@@ -458,12 +468,123 @@ out:
     return ret;
 }
 
-static int sandbox_umount_by_proc_path(int proc_fd, const char *proc_path,
-                                       int flags) {
-    if (sandbox_fchdir(proc_fd) == -1)
+/* Finds the "mnt_id:" line of a /proc/self/fdinfo/<fd> buffer. Works on a
+ * plain buffer so the sandboxed child can use it without stdio. */
+static int parse_fdinfo_mnt_id(const char *buf, size_t len, long *out_id) {
+    static const char key[] = "mnt_id:";
+    size_t i = 0;
+
+    while (i < len) {
+        size_t line_end = i;
+        while (line_end < len && buf[line_end] != '\n')
+            line_end++;
+
+        if (line_end - i > sizeof(key) - 1 &&
+            memcmp(buf + i, key, sizeof(key) - 1) == 0) {
+            size_t p = i + sizeof(key) - 1;
+            while (p < line_end && (buf[p] == ' ' || buf[p] == '\t'))
+                p++;
+
+            long id = 0;
+            bool have_digit = false;
+            for (; p < line_end; p++) {
+                if (buf[p] < '0' || buf[p] > '9')
+                    return -EINVAL;
+                unsigned int digit = (unsigned int)(buf[p] - '0');
+                if (id > (LONG_MAX - (long)digit) / 10)
+                    return -EOVERFLOW;
+                id = id * 10 + (long)digit;
+                have_digit = true;
+            }
+            if (!have_digit)
+                return -EINVAL;
+            *out_id = id;
+            return 0;
+        }
+
+        i = line_end + 1;
+    }
+
+    return -ENODATA;
+}
+
+/* snprintf()-free "self/fdinfo/<fd>" for the sandboxed child. */
+static void format_fdinfo_path(char out[32], int fd) {
+    static const char prefix[] = "self/fdinfo/";
+    char digits[3 * sizeof(int)];
+    size_t n = 0;
+    unsigned int v = (unsigned int)fd;
+
+    do {
+        digits[n++] = (char)('0' + v % 10);
+        v /= 10;
+    } while (v != 0);
+
+    memcpy(out, prefix, sizeof(prefix) - 1);
+    size_t pos = sizeof(prefix) - 1;
+    while (n > 0)
+        out[pos++] = digits[--n];
+    out[pos] = '\0';
+}
+
+/* Post-setns() counterpart of defused.c's fd_mnt_id(): reads fd's fdinfo from
+ * the service's trusted procfs with raw syscalls only. */
+static int sandbox_fd_mnt_id(int proc_fd, int fd, long *out_id) {
+    char path[32];
+    format_fdinfo_path(path, fd);
+
+    int info_fd = sandbox_openat(proc_fd, path, O_RDONLY | O_CLOEXEC);
+    if (info_fd == -1)
         return -errno;
 
-    if (sandbox_umount2(proc_path, flags) == -1)
+    char buf[1024];
+    size_t len = 0;
+    int ret = 0;
+    while (len < sizeof(buf)) {
+        ssize_t n = sandbox_read(info_fd, buf + len, sizeof(buf) - len);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            ret = -errno;
+            break;
+        }
+        if (n == 0)
+            break;
+        len += (size_t)n;
+    }
+    sandbox_close(info_fd);
+    if (ret < 0)
+        return ret;
+    /* An O_PATH fd's fdinfo is a few short lines; a full buffer means the
+     * mnt_id line might have been cut in half. */
+    if (len == sizeof(buf))
+        return -E2BIG;
+    return parse_fdinfo_mnt_id(buf, len, out_id);
+}
+
+/*
+ * Runs after setns(). Checks that name, relative to parent_fd, still resolves
+ * to the mount the parent authorized, then unmounts it by that same name.
+ * The O_PATH fd used for the check is closed before umount2(): an open
+ * reference to the mount makes a non-lazy unmount fail with EBUSY.
+ */
+static int sandbox_unmount_verified(int proc_fd, int parent_fd,
+                                    const char *name, long mnt_id, int flags) {
+    if (sandbox_fchdir(parent_fd) == -1)
+        return -errno;
+
+    int fd = sandbox_openat(parent_fd, name, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    if (fd == -1)
+        return -errno;
+    long id = -1;
+    int ret = sandbox_fd_mnt_id(proc_fd, fd, &id);
+    sandbox_close(fd);
+    if (ret < 0)
+        return ret;
+    if (id != mnt_id)
+        return -ESTALE;
+
+    if (sandbox_umount2(name, UMOUNT_NOFOLLOW | flags) == -1)
         return -errno;
     return 0;
 }
@@ -578,9 +699,9 @@ int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd, uint32_t *status,
                         sys_errno);
 }
 
-int defused_sandbox_unmount(int pidfd, int proc_fd, int mnt_fd, bool lazy,
-                            long mnt_id, uid_t uid, uint32_t *status,
-                            int *sys_errno) {
+int defused_sandbox_unmount(int pidfd, int proc_fd, int parent_fd,
+                            const char *name, bool lazy, long mnt_id, uid_t uid,
+                            uint32_t *status, int *sys_errno) {
     /* Checked here, before forking, so an unauthorized caller never touches the
      * client's namespace. */
     uid_t owner;
@@ -595,9 +716,6 @@ int defused_sandbox_unmount(int pidfd, int proc_fd, int mnt_fd, bool lazy,
         *sys_errno = 0;
         return -EPERM;
     }
-
-    char proc_path[32];
-    snprintf(proc_path, sizeof(proc_path), "self/fd/%d", mnt_fd);
 
     int pipefd[2];
     pid_t pid = fork_with_pipe(pipefd);
@@ -618,15 +736,8 @@ int defused_sandbox_unmount(int pidfd, int proc_fd, int mnt_fd, bool lazy,
                          child_ret);
         }
 
-        /*
-         * Resolve the mount through the O_PATH fd that supplied mnt_id above,
-         * rather than looking up the client-controlled parent/name pair
-         * again after authorization. proc_fd refers to the service's trusted
-         * procfs, so following this magic link cannot redirect the unmount to
-         * a different client-selected path.
-         */
-        child_ret = sandbox_umount_by_proc_path(proc_fd, proc_path,
-                                                lazy ? MNT_DETACH : 0);
+        child_ret = sandbox_unmount_verified(proc_fd, parent_fd, name, mnt_id,
+                                             lazy ? MNT_DETACH : 0);
         sandbox_done(pipefd[1],
                      child_ret < 0 ? DEFUSED_ERR_UNMOUNT_FAILED : DEFUSED_OK,
                      child_ret < 0 ? -child_ret : 0, child_ret);
@@ -671,5 +782,9 @@ pid_t defused_test_fdinfo_pid(const char *text) {
 
 pid_t defused_test_pidfd_to_pid_fdinfo(int pidfd) {
     return pidfd_to_pid_fdinfo(pidfd);
+}
+
+int defused_test_fdinfo_mnt_id(const char *buf, size_t len, long *out_id) {
+    return parse_fdinfo_mnt_id(buf, len, out_id);
 }
 #endif

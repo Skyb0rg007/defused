@@ -166,6 +166,24 @@ let
                 print(e, file=sys.stderr)
             os.close(fuse_fd)
 
+    def assert_unmount(mountpoint, opts):
+        fuse_fd = mount_fuse(mountpoint, opts)
+        try:
+            init_fuse(fuse_fd)
+            print(mountinfo_for(mountpoint), flush=True)
+            try:
+                unmount_fuse(mountpoint, lazy=False)
+            except RuntimeError:
+                unmount_fuse(mountpoint, lazy=True)
+                raise
+            with open("/proc/self/mountinfo", encoding="utf-8") as f:
+                for line in f:
+                    fields = line.split()
+                    if len(fields) >= 5 and fields[4] == os.path.abspath(mountpoint):
+                        raise AssertionError(f"still mounted after unmount: {line}")
+        finally:
+            os.close(fuse_fd)
+
     def hold_mount(mountpoint, opts, ready, release, tokens):
         fuse_fd = mount_fuse(mountpoint, opts)
         try:
@@ -201,6 +219,8 @@ let
     mode = sys.argv[1]
     if mode == "assert-mount":
         assert_mount(sys.argv[2], sys.argv[3], sys.argv[4:])
+    elif mode == "assert-unmount":
+        assert_unmount(sys.argv[2], sys.argv[3])
     elif mode == "hold-mount":
         hold_mount(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6:])
     elif mode == "expect-failure":
