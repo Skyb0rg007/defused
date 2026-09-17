@@ -4,6 +4,10 @@
 
 {
   description = "defused -- a setuid-less fusermount";
+  nixConfig = {
+    extra-substituters = [ "https://defused.cachix.org" ];
+    extra-trusted-public-keys = [ "defused.cachix.org-1:/YD+2Bmle49JSliBhGRqTKpLYhvruoFyMPPU071YCAY=" ];
+  };
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
