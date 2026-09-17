@@ -23,5 +23,3 @@ RestrictAddressFamilies=AF_UNIX
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 SystemCallArchitectures=native
-
-[Install]
