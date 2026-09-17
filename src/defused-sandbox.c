@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <sched.h>
 #include <seccomp.h>
 #include <stdbool.h>
@@ -369,8 +370,24 @@ static pid_t pidfd_to_pid(int pidfd) {
     return pid;
 }
 
-/* The pidfd_send_signal() after open() proves the pid wasn't recycled to
- * another task in between. */
+/* A pidfd polls readable once its process has exited. Unlike a
+ * pidfd_send_signal() probe this needs no CAP_KILL, which the hardened
+ * service unit doesn't grant. */
+static int pidfd_alive(int pidfd) {
+    struct pollfd pfd = {.fd = pidfd, .events = POLLIN};
+    for (;;) {
+        int n = poll(&pfd, 1, 0);
+        if (n == -1) {
+            if (errno == EINTR)
+                continue;
+            return -errno;
+        }
+        return n == 0 ? 0 : -ESRCH;
+    }
+}
+
+/* The liveness check after open() proves the pid wasn't recycled to another
+ * task in between. */
 static int open_peer_mountinfo(int pidfd, int *out_fd) {
     pid_t pid = pidfd_to_pid(pidfd);
     if (pid < 0)
@@ -383,10 +400,10 @@ static int open_peer_mountinfo(int pidfd, int *out_fd) {
     if (fd == -1)
         return -errno;
 
-    if (syscall(SYS_pidfd_send_signal, pidfd, 0, NULL, 0) == -1) {
-        int saved_errno = errno;
+    int ret = pidfd_alive(pidfd);
+    if (ret < 0) {
         close(fd);
-        return -saved_errno;
+        return ret;
     }
 
     *out_fd = fd;
