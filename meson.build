@@ -11,7 +11,7 @@ project(
 )
 
 cc = meson.get_compiler('c')
-seccomp_dep = cc.find_library('seccomp', has_headers : ['seccomp.h'])
+seccomp_dep = dependency('libseccomp')
 systemd_dep = dependency('libsystemd')
 libfuse_fusermount3 = find_program(get_option('libfuse_fusermount3'))
 
