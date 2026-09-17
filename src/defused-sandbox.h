@@ -14,10 +14,10 @@ int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd, uint32_t *status,
                           int *sys_errno)
     __attribute__((__nonnull__(4, 5), __warn_unused_result__));
 
-int defused_sandbox_unmount(int pidfd, int proc_fd, int mnt_fd, bool lazy,
-                            long mnt_id, uid_t uid, uint32_t *status,
-                            int *sys_errno)
-    __attribute__((__nonnull__(7, 8), __warn_unused_result__));
+int defused_sandbox_unmount(int pidfd, int proc_fd, int parent_fd,
+                            const char *name, bool lazy, long mnt_id, uid_t uid,
+                            uint32_t *status, int *sys_errno)
+    __attribute__((__nonnull__(4, 8, 9), __warn_unused_result__));
 
 #ifdef DEFUSED_TEST
 int defused_test_install_seccomp(enum defused_op op)
@@ -28,6 +28,8 @@ pid_t defused_test_fdinfo_pid(const char *text)
     __attribute__((__nonnull__(1), __warn_unused_result__));
 pid_t defused_test_pidfd_to_pid_fdinfo(int pidfd)
     __attribute__((__warn_unused_result__));
+int defused_test_fdinfo_mnt_id(const char *buf, size_t len, long *out_id)
+    __attribute__((__nonnull__(1, 3), __warn_unused_result__));
 #endif
 
 #endif /* DEFUSED_SANDBOX_H */

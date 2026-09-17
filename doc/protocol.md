@@ -106,24 +106,29 @@ The client attaches a file descriptor for the mountpoint's parent directory.
 `parentFileDescriptor` is the index of that fd, normally `0`.
 `name` is the mountpoint's basename within that directory.
 
-The service opens `name` under the parent fd to identify the target via its
-`fdinfo` `mnt_id` and compares that with the parent fd's `mnt_id`.
-It retains that target fd through authorization.
+The service opens `name` under the parent fd with `O_PATH | O_NOFOLLOW`,
+reads the target's `mnt_id` from its `fdinfo`, compares that with the parent
+fd's `mnt_id`, and closes the target fd again.
 The target must be a mountpoint under the parent, not just a regular directory
 inside the same mount, so the target and parent mount IDs must differ.
+From here on the `mnt_id` is what identifies the target.
 
 The service then ensures via polkit that the caller is permitted to call
 `website.soss.defused.unmount`, failing otherwise.
-The service then joins the caller's mount namespace and checks that
-the target's `mnt_id` identifies a FUSE mount in `/proc/self/mountinfo`,
-and its `user_id=` superblock option matches the caller's uid.
 The polkit check only answers whether the caller may use unmount at all,
 and thus the default policy is to always allow.
+The service then reads the caller's `/proc/<pid>/mountinfo` (the pid comes
+from the socket peer's pidfd) and checks that the target's `mnt_id` identifies
+a FUSE mount whose `user_id=` superblock option matches the caller's uid.
 
-The service unmounts through the retained target fd's trusted
-`/proc/self/fd/<fd>` link, so a concurrent rename or replacement of `name`
-cannot redirect the final operation to a different mount. If `lazy` is true,
-the service uses `MNT_DETACH`; otherwise it performs a non-lazy unmount.
+Finally, a sandboxed child joins the caller's mount namespace, changes
+directory to the parent fd, re-opens `name` with `O_PATH | O_NOFOLLOW`, and
+checks through the service's trusted procfs that its `mnt_id` is still the
+one that was authorized.
+It closes that fd again and calls `umount2(name, UMOUNT_NOFOLLOW)`, adding
+`MNT_DETACH` if `lazy` is true.
+No defused process holds an fd on the mount at that point, since any such
+reference would make a non-lazy unmount fail with `EBUSY`.
 
 ## Response Status
 
@@ -176,8 +181,9 @@ After validating and authorizing the request, it forks a short-lived child that
 installs an enforcing seccomp filter and then joins the namespace.
 For mounts, the parent creates a detached FUSE mount first, leaving the child
 only `setns()` and `move_mount()`.
-For unmounts, the child can additionally read the trusted procfs file
-descriptor opened by the parent and call `umount2()`.
+For unmounts, the child can additionally open `name` under the parent
+directory, read its `fdinfo` through the trusted procfs file descriptor opened
+by the parent, close it, and call `umount2()`.
 The post-`setns()` code uses explicit syscall wrappers so the filter's
 allowlist fully describes its possible kernel interface.
 
@@ -185,9 +191,18 @@ allowlist fully describes its possible kernel interface.
 
 Passing an fd on the mountpoint itself makes non-lazy `umount2()` see an
 additional open reference and return `EBUSY`.
-Passing the parent directory plus the mountpoint basename mirrors libfuse's own
-`fusermount3` flow while still letting defused validate the target before
-closing the target fd and calling `umount2(..., UMOUNT_NOFOLLOW)`.
+The same applies to fds the service opens: the `O_PATH` fd it uses to read the
+target's `mnt_id` is closed before `umount2()` runs, and the final call names
+the target as `name` relative to the parent directory, mirroring libfuse's own
+`fusermount3` flow.
+
+That parent-relative lookup is what the sandboxed child re-checks right before
+`umount2()`: `name` must still resolve to the authorized `mnt_id`, so a rename
+or replacement of `name` after authorization is caught instead of redirecting
+the unmount to a different mount.
+The kernel also refuses to rename a mountpoint, or over one, within the
+caller's mount namespace, so what remains is a window of two syscalls in which
+only the mount table itself could change under the same directory entry.
 
 ## Why defused asks polkit
 

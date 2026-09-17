@@ -917,6 +917,12 @@ static int handle_umount(sd_varlink *link, int sock,
         goto out;
     }
 
+    /* From here on the target is identified by mnt_id. Close the fd now: an
+     * open reference to the mount, here or inherited by the sandboxed child,
+     * makes a non-lazy umount2() fail with EBUSY. */
+    close(mnt_fd);
+    mnt_fd = -1;
+
     /* Before the sandboxed child installs seccomp: the filter has no room for
      * the syscalls talking to polkit over D-Bus needs. This asks only whether
      * the caller may use unmount at all -- whether this specific mount is
@@ -939,8 +945,9 @@ static int handle_umount(sd_varlink *link, int sock,
         goto out;
     }
 
-    ret = defused_sandbox_unmount(pidfd, proc_fd, mnt_fd, req->lazy, mnt_id,
-                                  cred->uid, &status, &sys_errno);
+    ret =
+        defused_sandbox_unmount(pidfd, proc_fd, parent_fd, req->name, req->lazy,
+                                mnt_id, cred->uid, &status, &sys_errno);
     close(pidfd);
     if (ret < 0)
         goto out;
