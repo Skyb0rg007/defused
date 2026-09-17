@@ -50,6 +50,14 @@ in
     # check to ever succeed, rather than fail closed.
     security.polkit.enable = lib.mkDefault true;
 
+    security.apparmor = {
+      policies.defused.path = "${package}/etc/apparmor.d/defused";
+      includes."local/defused" = ''
+        include "${pkgs.apparmorRulesFromClosure { name = "defused"; } [ package ]}"
+        ${package}/lib/defused/defused mr,
+      '';
+    };
+
     systemd.sockets.defused = {
       description = "defused FUSE mount service listening socket";
       documentation = [ "https://github.com/Skyb0rg007/defused" ];
@@ -87,7 +95,7 @@ in
           "CAP_SYS_PTRACE"
         ];
         NoNewPrivileges = true;
-        AppArmorProfile = "-defused";
+        AppArmorProfile = if config.security.apparmor.enable then "defused" else "-defused";
 
         LockPersonality = true;
         MemoryDenyWriteExecute = true;

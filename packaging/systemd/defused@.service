@@ -13,6 +13,7 @@ ExecStart=/usr/lib/defused/defused
 AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SYS_PTRACE
 CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SYS_PTRACE
 NoNewPrivileges=yes
+# Drop the "-" where AppArmor is known to be enabled, to fail closed.
 AppArmorProfile=-defused
 
 LockPersonality=yes
