@@ -13,6 +13,7 @@
 #include <seccomp.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
@@ -316,10 +317,8 @@ static int mountinfo_feed(struct mountinfo_parser *parser, char ch) {
     return -EINVAL;
 }
 
-/* Requires Linux 6.13; open_peer_mountinfo() below closes the pid-recycling
- * race this alone doesn't. Older kernels could fall back to parsing
- * /proc/self/fdinfo/<pidfd>'s "Pid:" line instead, but that isn't done here. */
-static pid_t pidfd_to_pid(int pidfd) {
+/* Linux 6.13+. */
+static pid_t pidfd_to_pid_ioctl(int pidfd) {
     struct pidfd_info info = {0};
     if (ioctl(pidfd, PIDFD_GET_INFO, &info) == -1)
         return -errno;
@@ -327,6 +326,47 @@ static pid_t pidfd_to_pid(int pidfd) {
         info.pid > (unsigned int)INT_MAX)
         return -EINVAL;
     return (pid_t)info.pid;
+}
+
+/* A "Pid:" of -1 (not visible from this pid namespace) or 0 (exited) means
+ * there is no process to look up. */
+static pid_t fdinfo_pid(FILE *f) {
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "Pid:", 4) != 0)
+            continue;
+        char *end;
+        errno = 0;
+        long pid = strtol(line + 4, &end, 10);
+        if (end == line + 4 || errno != 0 || pid > INT_MAX ||
+            (*end != '\n' && *end != '\0'))
+            return -EINVAL;
+        return pid > 0 ? (pid_t)pid : -ESRCH;
+    }
+    return -ENODATA;
+}
+
+/* Linux 5.2+: "Pid:" is reported in the reader's pid namespace, which is the
+ * one /proc/<pid>/mountinfo is opened from below. Runs in the parent before
+ * the seccomp filter exists, so stdio is fine here. */
+static pid_t pidfd_to_pid_fdinfo(int pidfd) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", pidfd);
+    FILE *f = fopen(path, "re");
+    if (!f)
+        return -errno;
+    pid_t pid = fdinfo_pid(f);
+    fclose(f);
+    return pid;
+}
+
+/* Kernels before 6.13 fail PIDFD_GET_INFO with ENOTTY. open_peer_mountinfo()
+ * below closes the pid-recycling race this alone doesn't. */
+static pid_t pidfd_to_pid(int pidfd) {
+    pid_t pid = pidfd_to_pid_ioctl(pidfd);
+    if (pid == -ENOTTY)
+        pid = pidfd_to_pid_fdinfo(pidfd);
+    return pid;
 }
 
 /* The pidfd_send_signal() after open() proves the pid wasn't recycled to
@@ -601,5 +641,18 @@ int defused_test_mountinfo_owner(const char *line, long mnt_id,
 
     int ret = mountinfo_feed(&parser, '\n');
     return ret > 0 ? 0 : ret == 0 ? -ENOENT : ret;
+}
+
+pid_t defused_test_fdinfo_pid(const char *text) {
+    FILE *f = fmemopen((void *)text, strlen(text), "r");
+    if (!f)
+        return -errno;
+    pid_t pid = fdinfo_pid(f);
+    fclose(f);
+    return pid;
+}
+
+pid_t defused_test_pidfd_to_pid_fdinfo(int pidfd) {
+    return pidfd_to_pid_fdinfo(pidfd);
 }
 #endif

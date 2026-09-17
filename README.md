@@ -37,11 +37,10 @@ with Landlock.
 
 ## Requirements
 
-Defused requires Linux 6.13 or later: the service authorizes unmounts by
-resolving a client's pidfd to its pid via the `PIDFD_GET_INFO` ioctl, which
-was added in 6.13. Support for older kernels is possible by falling back to
-parsing `/proc/self/fdinfo/<pidfd>`'s `Pid:` line, but that fallback is not
-currently implemented.
+Defused requires Linux 6.5 or later, for `SO_PEERPIDFD`. To authorize
+unmounts, the service resolves a client's pidfd to its pid with the
+`PIDFD_GET_INFO` ioctl on Linux 6.13 or later, and falls back to the `Pid:`
+line of `/proc/self/fdinfo/<pidfd>` on older kernels.
 
 ## Project structure
 
