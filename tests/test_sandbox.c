@@ -147,6 +147,36 @@ static void test_long_mountinfo_line(void) {
     CHECK(uid == 4242);
 }
 
+static void test_fdinfo_pid(void) {
+    CHECK(
+        defused_test_fdinfo_pid("pos:\t0\nflags:\t02\nmnt_id:\t14\nino:\t1234\n"
+                                "Pid:\t4242\nNSpid:\t4242\t1\n") == 4242);
+    CHECK(defused_test_fdinfo_pid("Pid:\t7") == 7);
+    CHECK(defused_test_fdinfo_pid("pos:\t0\nNSpid:\t1\nPPid:\t1\n") ==
+          -ENODATA);
+    CHECK(defused_test_fdinfo_pid("Pid:\t-1\nNSpid:\t-1\n") == -ESRCH);
+    CHECK(defused_test_fdinfo_pid("Pid:\t0\n") == -ESRCH);
+    CHECK(defused_test_fdinfo_pid("Pid:\t\n") == -EINVAL);
+    CHECK(defused_test_fdinfo_pid("Pid:\t2147483648\n") == -EINVAL);
+    CHECK(defused_test_fdinfo_pid("Pid:\t4242 junk\n") == -EINVAL);
+
+    int pidfd = (int)syscall(SYS_pidfd_open, getpid(), 0);
+    CHECK(pidfd >= 0);
+    CHECK(defused_test_pidfd_to_pid_fdinfo(pidfd) == getpid());
+    close(pidfd);
+
+    /* A reaped process has no pid left to look up. */
+    pid_t child = fork();
+    CHECK(child >= 0);
+    if (child == 0)
+        _exit(0);
+    pidfd = (int)syscall(SYS_pidfd_open, child, 0);
+    CHECK(pidfd >= 0);
+    CHECK(waitpid(child, NULL, 0) == child);
+    CHECK(defused_test_pidfd_to_pid_fdinfo(pidfd) == -ESRCH);
+    close(pidfd);
+}
+
 int main(void) {
     test_filter_syscall(DEFUSED_OP_MOUNT, SYS_getpid, EPERM);
     test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_getpid, EPERM);
@@ -158,5 +188,6 @@ int main(void) {
     test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_umount2, EFAULT);
     test_mountinfo_parser();
     test_long_mountinfo_line();
+    test_fdinfo_pid();
     return failures ? 1 : 0;
 }
