@@ -15,8 +15,10 @@ seccomp_dep = dependency('libseccomp')
 systemd_dep = dependency('libsystemd')
 libfuse_fusermount3 = find_program(get_option('libfuse_fusermount3'))
 
-# XXX: Check for function availability
-common_c_args = ['-DHAVE_CLOSE_RANGE']
+common_c_args = []
+if cc.has_function('close_range', prefix : '#include <unistd.h>', args : ['-D_GNU_SOURCE'])
+  common_c_args += ['-DHAVE_CLOSE_RANGE']
+endif
 fusermount3_c_args = common_c_args + [
   '-DDEFUSED_VERSION="@0@"'.format(meson.project_version()),
   '-DLIBFUSE_FUSERMOUNT3="@0@"'.format(libfuse_fusermount3.full_path()),
