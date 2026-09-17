@@ -10,6 +10,7 @@ Documentation=https://github.com/Skyb0rg007/defused
 Accept=yes
 ListenStream=/run/defused/defused.sock
 RuntimeDirectory=defused
+XAttrEntryPoint=user.varlink=entrypoint
 
 [Install]
 WantedBy=sockets.target

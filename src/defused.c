@@ -33,6 +33,7 @@
 #include <sys/un.h>
 #include <sys/vfs.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 #include <systemd/sd-bus.h>
 #include <systemd/sd-daemon.h>
 #include <systemd/sd-event.h>
@@ -110,6 +111,8 @@ static int handle_connection(int sock) __attribute__((__warn_unused_result__));
 static int run_fork_daemon(void) __attribute__((__warn_unused_result__));
 static int create_listening_socket(void)
     __attribute__((__warn_unused_result__));
+static void tag_varlink_entrypoint(const char *path)
+    __attribute__((__nonnull__(1)));
 static int bind_unix_socket(int fd, const struct sockaddr_un *sa,
                             socklen_t sa_len, const char *path)
     __attribute__((__nonnull__(2, 4), __warn_unused_result__));
@@ -1108,6 +1111,8 @@ static int create_listening_socket(void) {
     if (ret < 0)
         goto out_close;
 
+    tag_varlink_entrypoint(path);
+
     if (chmod(path, 0666) == -1) {
         ret = -errno;
         fprintf(stderr, "defused: chmod(%s): %s\n", path, strerror(errno));
@@ -1127,6 +1132,18 @@ out_unlink:
 out_close:
     close(fd);
     return ret;
+}
+
+/* Advisory Varlink entrypoint tag, as systemd's XAttrEntryPoint= sets it.
+ * Kernels before 7.0 reject xattrs on socket inodes with EPERM. */
+static void tag_varlink_entrypoint(const char *path) {
+    static const char value[] = "entrypoint";
+    if (setxattr(path, "user.varlink", value, sizeof(value) - 1, 0) == 0)
+        return;
+    if (errno == EPERM || errno == ENOTSUP || errno == EOPNOTSUPP)
+        return;
+    fprintf(stderr, "defused: setxattr(%s, user.varlink): %s\n", path,
+            strerror(errno));
 }
 
 /* bind(2), handling the case where path already exists: if it's a live
