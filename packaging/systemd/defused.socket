@@ -10,3 +10,6 @@ Documentation=https://github.com/Skyb0rg007/defused
 Accept=yes
 ListenStream=/run/defused/defused.sock
 RuntimeDirectory=defused
+
+[Install]
+WantedBy=sockets.target
