@@ -27,6 +27,7 @@ let
     file-mountpoint = ./file-mountpoint.nix;
     non-lazy-unmount = ./non-lazy-unmount.nix;
     polkit = ./polkit.nix;
+    apparmor = ./apparmor.nix;
   };
 
   # "linux-6_12": stable across point releases.

@@ -6,7 +6,8 @@ abi <abi/4.0>,
 
 include <tunables/global>
 
-profile defused /usr/lib/defused/defused flags=(attach_disconnected) {
+# No attachment path: nothing is confined until AppArmorProfile= asks for it.
+profile defused flags=(attach_disconnected) {
   include <abstractions/base>
   include <abstractions/dbus-strict>
 
@@ -16,6 +17,10 @@ profile defused /usr/lib/defused/defused flags=(attach_disconnected) {
   capability sys_ptrace,
 
   network unix stream,
+
+  # setns() into a client's mount namespace via its pidfd needs PTRACE_MODE_READ
+  # on the client, whatever that client's own label is.
+  ptrace (read),
 
   dbus send
     bus=system
@@ -37,4 +42,6 @@ profile defused /usr/lib/defused/defused flags=(attach_disconnected) {
 
   mount,
   umount,
+
+  include if exists <local/defused>
 }
