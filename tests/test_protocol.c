@@ -11,6 +11,7 @@
 #define _GNU_SOURCE
 #include "common.h"
 #include "defused_proto.h"
+#include "test_timeout.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -538,6 +539,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "usage: %s /path/to/defused\n", argv[0]);
         return 2;
     }
+    test_set_timeout();
 
     struct defused_mount_req bad_opt = {
         .mount_flags = 1u << 31, /* never in DEFUSED_MOUNT_FLAGS_MASK */

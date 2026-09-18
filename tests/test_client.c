@@ -24,6 +24,7 @@
 #define _GNU_SOURCE
 #include "common.h"
 #include "defused_proto.h"
+#include "test_timeout.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -349,6 +350,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "usage: %s /path/to/fusermount3\n", argv[0]);
         return 2;
     }
+    test_set_timeout();
 
     /* spawn_client() hands the client /dev/null as the FUSE device. */
     int devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
@@ -363,10 +365,6 @@ int main(int argc, char *argv[]) {
 
     (void)test_root_fallback(argv[1]);
     setenv("DEFUSED_TEST_UID", "1", 1);
-
-    /* If the client never connects (e.g. it errored out during option
-     * parsing), fail fast instead of hanging in accept(). */
-    alarm(20);
 
     /* sun_path is only ~108 bytes, so fall back to /tmp if TMPDIR is deep. */
     const char *tmp = getenv("TMPDIR");

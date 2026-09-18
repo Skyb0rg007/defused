@@ -6,6 +6,7 @@
 #define _GNU_SOURCE
 #include "common.h"
 #include "defused-sandbox.h"
+#include "test_timeout.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -215,6 +216,8 @@ static void test_fdinfo_parser(void) {
 }
 
 int main(void) {
+    test_set_timeout();
+
     int ret = seccomp_available();
     if (ret < 0) {
         fprintf(stderr,

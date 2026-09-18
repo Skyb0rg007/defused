@@ -75,6 +75,8 @@
             ];
 
             doCheck = true;
+            # Keep Meson's per-test timeouts; nixpkgs disables them by default.
+            dontAddTimeoutMultiplier = true;
 
             meta = {
               description = "SETUID-less fusermount3 implementation";
