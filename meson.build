@@ -13,7 +13,9 @@ project(
 cc = meson.get_compiler('c')
 seccomp_dep = dependency('libseccomp')
 systemd_dep = dependency('libsystemd')
-libfuse_fusermount3 = find_program(get_option('libfuse_fusermount3'))
+
+# Not $libdir: the systemd unit and AppArmor profile hard-code this path.
+defused_install_dir = get_option('prefix') / 'lib/defused'
 
 common_c_args = []
 if cc.has_function('close_range', prefix : '#include <unistd.h>', args : ['-D_GNU_SOURCE'])
@@ -21,7 +23,8 @@ if cc.has_function('close_range', prefix : '#include <unistd.h>', args : ['-D_GN
 endif
 fusermount3_c_args = common_c_args + [
   '-DDEFUSED_VERSION="@0@"'.format(meson.project_version()),
-  '-DLIBFUSE_FUSERMOUNT3="@0@"'.format(libfuse_fusermount3.full_path()),
+  # Spawned as `defused --child` by privileged callers.
+  '-DDEFUSED_PATH="@0@"'.format(defused_install_dir / 'defused'),
 ]
 
 sandbox_lib = static_library(
@@ -40,7 +43,7 @@ defused_exe = executable(
   c_args : common_c_args,
   dependencies : [seccomp_dep, systemd_dep],
   link_with : sandbox_lib,
-  install_dir : get_option('prefix') / 'lib/defused',
+  install_dir : defused_install_dir,
   install : true,
 )
 
@@ -95,7 +98,8 @@ test_fusermount3_exe = executable(
   c_args : common_c_args + [
     '-DDEFUSED_TEST',
     '-DDEFUSED_VERSION="@0@"'.format(meson.project_version()),
-    '-DLIBFUSE_FUSERMOUNT3="@0@"'.format(test_client_exe.full_path()),
+    # test-client doubles as the fake `defused --child` for privileged callers.
+    '-DDEFUSED_PATH="@0@"'.format(test_client_exe.full_path()),
   ],
   dependencies : [systemd_dep],
 )

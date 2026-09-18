@@ -70,9 +70,6 @@
               pkgs.libseccomp
               pkgs.systemdLibs
             ];
-            mesonFlags = [
-              (lib.mesonOption "libfuse_fusermount3" (lib.getExe' pkgs.fuse3 "fusermount3"))
-            ];
 
             doCheck = true;
             # Keep Meson's per-test timeouts; nixpkgs disables them by default.
