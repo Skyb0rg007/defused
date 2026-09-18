@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #define _GNU_SOURCE
+#include "common.h"
 #include "defused-sandbox.h"
 
 #include <errno.h>
@@ -49,7 +50,7 @@ static int read_full(int fd, void *buf, size_t size) {
 
 static void test_filter_syscall(enum defused_op op, long syscall_number,
                                 int expected_errno) {
-    int pipefd[2];
+    _cleanup_close_pair_ int pipefd[2] = EBADF_PAIR;
     int ret = pipe2(pipefd, O_CLOEXEC);
     CHECK(ret == 0);
     if (ret < 0)
@@ -57,14 +58,11 @@ static void test_filter_syscall(enum defused_op op, long syscall_number,
 
     pid_t pid = fork();
     CHECK(pid >= 0);
-    if (pid < 0) {
-        close(pipefd[0]);
-        close(pipefd[1]);
+    if (pid < 0)
         return;
-    }
 
     if (pid == 0) {
-        close(pipefd[0]);
+        pipefd[0] = safe_close(pipefd[0]);
         struct filter_result result = {
             .install_ret = defused_test_install_seccomp(op),
         };
@@ -77,10 +75,9 @@ static void test_filter_syscall(enum defused_op op, long syscall_number,
             (void)syscall(SYS_exit, 1);
     }
 
-    close(pipefd[1]);
+    pipefd[1] = safe_close(pipefd[1]);
     struct filter_result result = {};
     CHECK(read_full(pipefd[0], &result, sizeof(result)) == 0);
-    close(pipefd[0]);
 
     int status;
     CHECK(waitpid(pid, &status, 0) == pid);
@@ -160,10 +157,10 @@ static void test_fdinfo_pid(void) {
     CHECK(defused_test_fdinfo_pid("Pid:\t2147483648\n") == -EINVAL);
     CHECK(defused_test_fdinfo_pid("Pid:\t4242 junk\n") == -EINVAL);
 
-    int pidfd = (int)syscall(SYS_pidfd_open, getpid(), 0);
+    _cleanup_close_ int pidfd = (int)syscall(SYS_pidfd_open, getpid(), 0);
     CHECK(pidfd >= 0);
     CHECK(defused_test_pidfd_to_pid_fdinfo(pidfd) == getpid());
-    close(pidfd);
+    pidfd = safe_close(pidfd);
 
     /* A reaped process has no pid left to look up. */
     pid_t child = fork();
@@ -174,7 +171,6 @@ static void test_fdinfo_pid(void) {
     CHECK(pidfd >= 0);
     CHECK(waitpid(child, NULL, 0) == child);
     CHECK(defused_test_pidfd_to_pid_fdinfo(pidfd) == -ESRCH);
-    close(pidfd);
 }
 
 static void test_fdinfo_parser(void) {

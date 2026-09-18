@@ -6,6 +6,8 @@
 #define _GNU_SOURCE
 #include "defused-sandbox.h"
 
+#include "common.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -33,6 +35,8 @@ struct sandbox_result {
     int32_t ret;
 };
 
+DEFINE_TRIVIAL_CLEANUP_FUNC(scmp_filter_ctx, seccomp_release);
+
 static int add_rules(scmp_filter_ctx ctx, const int *syscalls, size_t count) {
     for (size_t i = 0; i < count; i++) {
         int ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, syscalls[i], 0);
@@ -57,14 +61,17 @@ static int install_seccomp(enum defused_op op) {
         SCMP_SYS(close),  SCMP_SYS(umount2),
     };
 
-    scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_ERRNO(EPERM));
+    /* The kernel keeps its own copy of a loaded filter, so ctx is released
+     * on success as well. */
+    _cleanup_(seccomp_releasep) scmp_filter_ctx ctx =
+        seccomp_init(SCMP_ACT_ERRNO(EPERM));
     if (!ctx)
         return -ENOMEM;
 
     int ret = add_rules(ctx, allowed_syscalls,
                         sizeof(allowed_syscalls) / sizeof(allowed_syscalls[0]));
     if (ret < 0)
-        goto out;
+        return ret;
 
     switch (op) {
     case DEFUSED_OP_MOUNT:
@@ -80,13 +87,9 @@ static int install_seccomp(enum defused_op op) {
         break;
     }
     if (ret < 0)
-        goto out;
+        return ret;
 
-    /* The kernel keeps its own copy of a loaded filter, so ctx is released
-     * on success as well. */
     ret = seccomp_load(ctx);
-out:
-    seccomp_release(ctx);
     return ret < 0 ? ret : 0;
 }
 
@@ -121,6 +124,13 @@ static ssize_t sandbox_read(int fd, void *buf, size_t count) {
 }
 
 static int sandbox_close(int fd) { return (int)syscall(SYS_close, fd); }
+
+/* _cleanup_ handler for fds owned by the sandboxed child, where libc's
+ * close() may not be what the seccomp filter allows. */
+static void sandbox_closep(int *fd) {
+    if (*fd >= 0)
+        (void)sandbox_close(*fd);
+}
 
 static int sandbox_umount2(const char *path, int flags) {
     return (int)syscall(SYS_umount2, path, flags);
@@ -363,12 +373,10 @@ static pid_t fdinfo_pid(FILE *f) {
 static pid_t pidfd_to_pid_fdinfo(int pidfd) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", pidfd);
-    FILE *f = fopen(path, "re");
+    _cleanup_fclose_ FILE *f = fopen(path, "re");
     if (!f)
         return -errno;
-    pid_t pid = fdinfo_pid(f);
-    fclose(f);
-    return pid;
+    return fdinfo_pid(f);
 }
 
 /* Kernels before 6.13 fail PIDFD_GET_INFO with ENOTTY. open_peer_mountinfo()
@@ -406,24 +414,22 @@ static int open_peer_mountinfo(int pidfd, int *out_fd) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/mountinfo", (int)pid);
 
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    _cleanup_close_ int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd == -1)
         return -errno;
 
     int ret = pidfd_alive(pidfd);
-    if (ret < 0) {
-        close(fd);
+    if (ret < 0)
         return ret;
-    }
 
-    *out_fd = fd;
+    *out_fd = TAKE_FD(fd);
     return 0;
 }
 
 /* mountinfo reflects its owning process's namespace regardless of the reader's,
  * so no setns() is needed. */
 static int peer_fuse_mount_owner(int pidfd, long mnt_id, uid_t *out_uid) {
-    int fd;
+    _cleanup_close_ int fd = -EBADF;
     int ret = open_peer_mountinfo(pidfd, &fd);
     if (ret < 0)
         return ret;
@@ -449,11 +455,8 @@ static int peer_fuse_mount_owner(int pidfd, long mnt_id, uid_t *out_uid) {
 
         for (ssize_t i = 0; i < n; i++) {
             ret = mountinfo_feed(&parser, buf[i]);
-            if (ret != 0) {
-                if (ret > 0)
-                    ret = 0;
-                goto out;
-            }
+            if (ret != 0)
+                return ret > 0 ? 0 : ret;
         }
     }
 
@@ -463,8 +466,6 @@ static int peer_fuse_mount_owner(int pidfd, long mnt_id, uid_t *out_uid) {
             ret = 0;
     }
 
-out:
-    close(fd);
     return ret;
 }
 
@@ -533,28 +534,24 @@ static int sandbox_fd_mnt_id(int proc_fd, int fd, long *out_id) {
     char path[32];
     format_fdinfo_path(path, fd);
 
-    int info_fd = sandbox_openat(proc_fd, path, O_RDONLY | O_CLOEXEC);
+    _cleanup_(sandbox_closep) int info_fd =
+        sandbox_openat(proc_fd, path, O_RDONLY | O_CLOEXEC);
     if (info_fd == -1)
         return -errno;
 
     char buf[1024];
     size_t len = 0;
-    int ret = 0;
     while (len < sizeof(buf)) {
         ssize_t n = sandbox_read(info_fd, buf + len, sizeof(buf) - len);
         if (n < 0) {
             if (errno == EINTR)
                 continue;
-            ret = -errno;
-            break;
+            return -errno;
         }
         if (n == 0)
             break;
         len += (size_t)n;
     }
-    sandbox_close(info_fd);
-    if (ret < 0)
-        return ret;
     /* An O_PATH fd's fdinfo is a few short lines; a full buffer means the
      * mnt_id line might have been cut in half. */
     if (len == sizeof(buf))
@@ -562,27 +559,34 @@ static int sandbox_fd_mnt_id(int proc_fd, int fd, long *out_id) {
     return parse_fdinfo_mnt_id(buf, len, out_id);
 }
 
-/*
- * Runs after setns(). Checks that name, relative to parent_fd, still resolves
- * to the mount the parent authorized, then unmounts it by that same name.
- * The O_PATH fd used for the check is closed before umount2(): an open
- * reference to the mount makes a non-lazy unmount fail with EBUSY.
- */
+/* Runs after setns(). Checks that name, relative to parent_fd, still resolves
+ * to the mount the parent authorized. Its own function so the O_PATH fd is
+ * closed on return, before the caller's umount2(): an open reference to the
+ * mount makes a non-lazy unmount fail with EBUSY. */
+static int sandbox_check_mnt_id(int proc_fd, int parent_fd, const char *name,
+                                long mnt_id) {
+    _cleanup_(sandbox_closep) int fd =
+        sandbox_openat(parent_fd, name, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    if (fd == -1)
+        return -errno;
+    long id = -1;
+    int ret = sandbox_fd_mnt_id(proc_fd, fd, &id);
+    if (ret < 0)
+        return ret;
+    return id == mnt_id ? 0 : -ESTALE;
+}
+
+/* Runs after setns(). Unmounts name, relative to parent_fd, once
+ * sandbox_check_mnt_id() confirms it is still the mount the parent
+ * authorized. */
 static int sandbox_unmount_verified(int proc_fd, int parent_fd,
                                     const char *name, long mnt_id, int flags) {
     if (sandbox_fchdir(parent_fd) == -1)
         return -errno;
 
-    int fd = sandbox_openat(parent_fd, name, O_PATH | O_NOFOLLOW | O_CLOEXEC);
-    if (fd == -1)
-        return -errno;
-    long id = -1;
-    int ret = sandbox_fd_mnt_id(proc_fd, fd, &id);
-    sandbox_close(fd);
+    int ret = sandbox_check_mnt_id(proc_fd, parent_fd, name, mnt_id);
     if (ret < 0)
         return ret;
-    if (id != mnt_id)
-        return -ESTALE;
 
     if (sandbox_umount2(name, UMOUNT_NOFOLLOW | flags) == -1)
         return -errno;
@@ -619,20 +623,16 @@ static int wait_sandbox(pid_t pid) {
     }
 }
 
-/* Creates a CLOEXEC pipe and forks. Returns the child's pid to the parent,
- * 0 to the child, or a negative errno if pipe2()/fork() itself failed (both
- * pipe ends are already closed in that case). */
+/* Creates a CLOEXEC pipe into the caller's _cleanup_close_pair_ pipefd and
+ * forks. Returns the child's pid to the parent, 0 to the child, or a
+ * negative errno if pipe2()/fork() itself failed. */
 static pid_t fork_with_pipe(int pipefd[2]) {
     if (pipe2(pipefd, O_CLOEXEC) == -1)
         return -errno;
 
     pid_t pid = fork();
-    if (pid == -1) {
-        int saved_errno = errno;
-        close(pipefd[0]);
-        close(pipefd[1]);
-        return -saved_errno;
-    }
+    if (pid == -1)
+        return -errno;
     return pid;
 }
 
@@ -648,7 +648,6 @@ static int reap_sandbox(int pipefd_read, pid_t pid, uint32_t fail_status,
         .ret = -EIO,
     };
     int ret = read_sandbox_result(pipefd_read, &result);
-    close(pipefd_read);
     int wait_status = wait_sandbox(pid);
     if (ret < 0) {
         result.sys_errno = -ret;
@@ -668,13 +667,13 @@ static int reap_sandbox(int pipefd_read, pid_t pid, uint32_t fail_status,
 
 int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd, uint32_t *status,
                           int *sys_errno) {
-    int pipefd[2];
+    _cleanup_close_pair_ int pipefd[2] = EBADF_PAIR;
     pid_t pid = fork_with_pipe(pipefd);
     if (pid < 0)
         return (int)pid;
 
     if (pid == 0) {
-        close(pipefd[0]);
+        pipefd[0] = safe_close(pipefd[0]);
 
         int ret = install_seccomp(DEFUSED_OP_MOUNT);
         if (ret < 0)
@@ -694,7 +693,7 @@ int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd, uint32_t *status,
                      ret < 0 ? -ret : 0, ret);
     }
 
-    close(pipefd[1]);
+    pipefd[1] = safe_close(pipefd[1]);
     return reap_sandbox(pipefd[0], pid, DEFUSED_ERR_MOUNT_FAILED, status,
                         sys_errno);
 }
@@ -717,13 +716,13 @@ int defused_sandbox_unmount(int pidfd, int proc_fd, int parent_fd,
         return -EPERM;
     }
 
-    int pipefd[2];
+    _cleanup_close_pair_ int pipefd[2] = EBADF_PAIR;
     pid_t pid = fork_with_pipe(pipefd);
     if (pid < 0)
         return (int)pid;
 
     if (pid == 0) {
-        close(pipefd[0]);
+        pipefd[0] = safe_close(pipefd[0]);
 
         int child_ret = install_seccomp(DEFUSED_OP_UNMOUNT);
         if (child_ret < 0)
@@ -743,7 +742,7 @@ int defused_sandbox_unmount(int pidfd, int proc_fd, int parent_fd,
                      child_ret < 0 ? -child_ret : 0, child_ret);
     }
 
-    close(pipefd[1]);
+    pipefd[1] = safe_close(pipefd[1]);
     return reap_sandbox(pipefd[0], pid, DEFUSED_ERR_UNMOUNT_FAILED, status,
                         sys_errno);
 }
@@ -772,12 +771,10 @@ int defused_test_mountinfo_owner(const char *line, long mnt_id,
 }
 
 pid_t defused_test_fdinfo_pid(const char *text) {
-    FILE *f = fmemopen((void *)text, strlen(text), "r");
+    _cleanup_fclose_ FILE *f = fmemopen((void *)text, strlen(text), "r");
     if (!f)
         return -errno;
-    pid_t pid = fdinfo_pid(f);
-    fclose(f);
-    return pid;
+    return fdinfo_pid(f);
 }
 
 pid_t defused_test_pidfd_to_pid_fdinfo(int pidfd) {

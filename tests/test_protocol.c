@@ -9,12 +9,14 @@
  * handling that needs privilege to succeed.
  */
 #define _GNU_SOURCE
+#include "common.h"
 #include "defused_proto.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,15 +28,38 @@
 #include <systemd/sd-varlink.h>
 #include <unistd.h>
 
+/* Scope-exit teardown for the scratch state the daemon tests create: a
+ * mkdtemp()'d directory, the socket path a daemon binds inside it, and the
+ * daemon process itself. Each is a no-op while NULL/0, so the variable can
+ * be declared before the resource exists. */
+static void rmdirp(const char **dir) {
+    if (*dir)
+        rmdir(*dir);
+}
+
+static void unlinkp(const char **path) {
+    if (*path)
+        unlink(*path);
+}
+
+static void sigterm_waitp(pid_t *pid) {
+    if (*pid > 0) {
+        kill(*pid, SIGTERM);
+        waitpid(*pid, NULL, 0);
+    }
+}
+
 static int spawn_defused(const char *defused_path, int *client_sock,
                          pid_t *out_pid) {
-    int sv[2];
+    _cleanup_close_pair_ int sv[2] = EBADF_PAIR;
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == -1) {
         perror("socketpair");
         return -errno;
     }
 
     pid_t pid = fork();
+    if (pid < 0)
+        return -errno;
     if (pid == 0) {
         /* Mimic systemd's Accept=yes handoff (sd_listen_fds(3)) rather than
          * the old inetd-style stdin convention. */
@@ -52,34 +77,35 @@ static int spawn_defused(const char *defused_path, int *client_sock,
         _exit(127);
     }
 
-    close(sv[1]);
-    *client_sock = sv[0];
+    *client_sock = TAKE_FD(sv[0]);
     *out_pid = pid;
     return 0;
 }
 
-static int send_mount_req(int sock, const struct defused_mount_req *req,
+/* Takes ownership of sock_fd. */
+static int send_mount_req(int sock_fd, const struct defused_mount_req *req,
                           int dev_fd, int mnt_fd, struct defused_resp *resp) {
-    sd_varlink *link = NULL;
-    sd_json_variant *reply = NULL;
+    _cleanup_close_ int sock = sock_fd;
+    _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *link = NULL;
+    _cleanup_(sd_json_variant_unrefp) sd_json_variant *reply = NULL;
     const char *error_id = NULL;
     int ret = sd_varlink_connect_fd(&link, sock);
     if (ret < 0)
         return ret;
-    sock = -1;
+    TAKE_FD(sock);
 
     ret = sd_varlink_set_allow_fd_passing_input(link, true);
     if (ret < 0)
-        goto out;
+        return ret;
     ret = sd_varlink_set_allow_fd_passing_output(link, true);
     if (ret < 0)
-        goto out;
+        return ret;
     ret = sd_varlink_push_dup_fd(link, dev_fd);
     if (ret < 0)
-        goto out;
+        return ret;
     ret = sd_varlink_push_dup_fd(link, mnt_fd);
     if (ret < 0)
-        goto out;
+        return ret;
 
     ret = sd_varlink_callbo(
         link, DEFUSED_VARLINK_METHOD_MOUNT, &reply, &error_id,
@@ -91,11 +117,10 @@ static int send_mount_req(int sock, const struct defused_mount_req *req,
         SD_JSON_BUILD_PAIR_STRING("fsName", req->fsname),
         SD_JSON_BUILD_PAIR_STRING("subtype", req->subtype));
     if (ret < 0)
-        goto out;
+        return ret;
     if (error_id != NULL) {
         fprintf(stderr, "FAIL: Varlink error %s\n", error_id);
-        ret = -EBADMSG;
-        goto out;
+        return -EBADMSG;
     }
 
     static const sd_json_dispatch_field dispatch_table[] = {
@@ -105,16 +130,7 @@ static int send_mount_req(int sock, const struct defused_mount_req *req,
          offsetof(struct defused_resp, sys_errno), SD_JSON_MANDATORY},
         {},
     };
-    ret = sd_json_dispatch(reply, dispatch_table, 0, resp);
-    if (ret < 0)
-        goto out;
-
-out:
-    sd_json_variant_unref(reply);
-    sd_varlink_flush_close_unref(link);
-    if (sock >= 0)
-        close(sock);
-    return ret;
+    return sd_json_dispatch(reply, dispatch_table, 0, resp);
 }
 
 /* Runs one mount request against a fresh defused instance and reports the
@@ -123,31 +139,28 @@ out:
 static int run_mount_req(const char *defused_path,
                          const struct defused_mount_req *req, const char *path,
                          const char *dev_path, uint32_t *out_status) {
-    int sock;
+    _cleanup_close_ int sock = -EBADF;
     pid_t pid;
     int ret = spawn_defused(defused_path, &sock, &pid);
     if (ret < 0)
         return ret;
 
-    int mnt_fd = open(path, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    _cleanup_close_ int mnt_fd =
+        open(path, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (mnt_fd < 0) {
         ret = -errno;
         perror(path);
         return ret;
     }
-    int dev_fd = open(dev_path, O_RDWR | O_CLOEXEC);
+    _cleanup_close_ int dev_fd = open(dev_path, O_RDWR | O_CLOEXEC);
     if (dev_fd < 0) {
         ret = -errno;
         perror(dev_path);
-        close(mnt_fd);
         return ret;
     }
 
     struct defused_resp resp;
-    ret = send_mount_req(sock, req, dev_fd, mnt_fd, &resp);
-    close(dev_fd);
-    close(mnt_fd);
-    close(sock);
+    ret = send_mount_req(TAKE_FD(sock), req, dev_fd, mnt_fd, &resp);
 
     int wstatus;
     waitpid(pid, &wstatus, 0);
@@ -191,19 +204,23 @@ static int run_mount_req_expect(const char *defused_path,
  * answer -- what matters here is that an unauthorized request never gets
  * past this gate to the privileged mount syscalls, not what a particular
  * polkit configuration decides. */
+static bool fuse_device_usable(void) {
+    _cleanup_close_ int probe = open("/dev/fuse", O_RDWR | O_CLOEXEC);
+    return probe >= 0;
+}
+
 static int test_polkit_gate(const char *defused_path) {
-    int probe = open("/dev/fuse", O_RDWR | O_CLOEXEC);
-    if (probe < 0) {
+    if (!fuse_device_usable()) {
         fprintf(stderr,
                 "SKIP: /dev/fuse not usable here (%s), skipping polkit gate "
                 "test\n",
                 strerror(errno));
         return 0;
     }
-    close(probe);
 
-    char dir[] = "/tmp/defused-polkit-test-XXXXXX";
-    if (mkdtemp(dir) == NULL) {
+    char dir_template[] = "/tmp/defused-polkit-test-XXXXXX";
+    _cleanup_(rmdirp) const char *dir = mkdtemp(dir_template);
+    if (dir == NULL) {
         perror("mkdtemp");
         return -errno;
     }
@@ -211,7 +228,6 @@ static int test_polkit_gate(const char *defused_path) {
     struct defused_mount_req req = {};
     uint32_t status = DEFUSED_OK;
     int ret = run_mount_req(defused_path, &req, dir, "/dev/fuse", &status);
-    rmdir(dir);
     if (ret < 0)
         return ret;
 
@@ -261,16 +277,14 @@ static int connect_daemon_socket(const char *sock_path) {
     (void)strlcpy(sa.sun_path, sock_path, sizeof(sa.sun_path));
 
     for (int i = 0; i < 100; i++) {
-        int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        _cleanup_close_ int sock =
+            socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
         if (sock == -1)
             return -errno;
         if (connect(sock, (struct sockaddr *)&sa, sizeof(sa)) == 0)
-            return sock;
-
-        int saved_errno = errno;
-        close(sock);
-        if (saved_errno != ENOENT && saved_errno != ECONNREFUSED)
-            return -saved_errno;
+            return TAKE_FD(sock);
+        if (errno != ENOENT && errno != ECONNREFUSED)
+            return -errno;
         usleep(10000);
     }
     return -ETIMEDOUT;
@@ -283,31 +297,24 @@ static int connect_daemon_socket(const char *sock_path) {
 static int run_daemon_mount_req(const char *sock_path,
                                 const struct defused_mount_req *req,
                                 const char *path, uint32_t expect_status) {
-    int sock = connect_daemon_socket(sock_path);
+    _cleanup_close_ int sock = connect_daemon_socket(sock_path);
     if (sock < 0) {
         fprintf(stderr, "FAIL: could not connect to daemon socket: %s\n",
                 strerror(-sock));
         return sock;
     }
 
-    int mnt_fd = open(path, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    int dev_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
+    _cleanup_close_ int mnt_fd =
+        open(path, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    _cleanup_close_ int dev_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
     if (mnt_fd < 0 || dev_fd < 0) {
         int ret = -errno;
         perror("open");
-        if (mnt_fd >= 0)
-            close(mnt_fd);
-        if (dev_fd >= 0)
-            close(dev_fd);
-        close(sock);
         return ret;
     }
 
     struct defused_resp resp;
-    int ret = send_mount_req(sock, req, dev_fd, mnt_fd, &resp);
-    close(dev_fd);
-    close(mnt_fd);
-    close(sock);
+    int ret = send_mount_req(TAKE_FD(sock), req, dev_fd, mnt_fd, &resp);
     if (ret < 0)
         return ret;
     if (resp.status != expect_status) {
@@ -331,20 +338,20 @@ static int run_daemon_mount_req(const char *sock_path,
  * them without a pause also exercises run_fork_daemon()'s live_children
  * cap under light concurrency without tripping it. */
 static int test_daemon_mode(const char *defused_path) {
-    char dir[] = "/tmp/defused-daemon-test-XXXXXX";
-    if (mkdtemp(dir) == NULL) {
+    char dir_template[] = "/tmp/defused-daemon-test-XXXXXX";
+    _cleanup_(rmdirp) const char *dir = mkdtemp(dir_template);
+    if (dir == NULL) {
         perror("mkdtemp");
         return -errno;
     }
-    char sock_path[sizeof(dir) + 16];
-    snprintf(sock_path, sizeof(sock_path), "%s/defused.sock", dir);
+    char sock_path_buf[sizeof(dir_template) + 16];
+    snprintf(sock_path_buf, sizeof(sock_path_buf), "%s/defused.sock", dir);
+    _cleanup_(unlinkp) const char *sock_path = sock_path_buf;
 
-    pid_t pid;
+    _cleanup_(sigterm_waitp) pid_t pid = 0;
     int ret = spawn_defused_daemon(defused_path, sock_path, &pid);
-    if (ret < 0) {
-        rmdir(dir);
+    if (ret < 0)
         return ret;
-    }
 
     struct defused_mount_req bad_opt = {
         .mount_flags = 1u << 31, /* never in DEFUSED_MOUNT_FLAGS_MASK */
@@ -352,16 +359,9 @@ static int test_daemon_mode(const char *defused_path) {
     ret =
         run_daemon_mount_req(sock_path, &bad_opt, ".", DEFUSED_ERR_BAD_OPTION);
     if (ret < 0)
-        goto out_kill;
-    ret =
-        run_daemon_mount_req(sock_path, &bad_opt, ".", DEFUSED_ERR_BAD_OPTION);
-
-out_kill:
-    kill(pid, SIGTERM);
-    waitpid(pid, NULL, 0);
-    unlink(sock_path);
-    rmdir(dir);
-    return ret;
+        return ret;
+    return run_daemon_mount_req(sock_path, &bad_opt, ".",
+                                DEFUSED_ERR_BAD_OPTION);
 }
 
 /* --daemon does not create the socket's parent directory -- it just binds
@@ -370,48 +370,41 @@ out_kill:
  * fails fast with a nonzero exit rather than creating the directory or
  * hanging. */
 static int test_daemon_missing_socket_dir(const char *defused_path) {
-    char dir[] = "/tmp/defused-daemon-missing-dir-test-XXXXXX";
-    if (mkdtemp(dir) == NULL) {
+    char dir_template[] = "/tmp/defused-daemon-missing-dir-test-XXXXXX";
+    _cleanup_(rmdirp) const char *dir = mkdtemp(dir_template);
+    if (dir == NULL) {
         perror("mkdtemp");
         return -errno;
     }
-    char missing_dir[sizeof(dir) + 16];
+    char missing_dir[sizeof(dir_template) + 16];
     snprintf(missing_dir, sizeof(missing_dir), "%s/does-not-exist", dir);
     char sock_path[sizeof(missing_dir) + 16];
     snprintf(sock_path, sizeof(sock_path), "%s/defused.sock", missing_dir);
 
     pid_t pid;
     int ret = spawn_defused_daemon(defused_path, sock_path, &pid);
-    if (ret < 0) {
-        rmdir(dir);
+    if (ret < 0)
         return ret;
-    }
 
     int status;
     if (waitpid(pid, &status, 0) == -1) {
         ret = -errno;
         perror("waitpid");
-        goto out;
+        return ret;
     }
     if (!WIFEXITED(status) || WEXITSTATUS(status) == 0) {
         fprintf(stderr,
                 "FAIL: expected --daemon to exit nonzero with a missing "
                 "socket directory (status 0x%x)\n",
                 status);
-        ret = -EINVAL;
-        goto out;
+        return -EINVAL;
     }
     if (access(missing_dir, F_OK) == 0 || errno != ENOENT) {
         fprintf(stderr, "FAIL: --daemon should not have created the socket "
                         "directory\n");
-        ret = -EINVAL;
-        goto out;
+        return -EINVAL;
     }
-    ret = 0;
-
-out:
-    rmdir(dir);
-    return ret;
+    return 0;
 }
 
 /* Must match DEFUSED_DAEMON_MAX_CONNECTIONS in src/defused.c: the number of
@@ -419,32 +412,46 @@ out:
  * run_fork_daemon()'s live_children count at the cap. */
 #define TEST_DAEMON_MAX_CONNECTIONS 64
 
-/* Opens n connections to sock_path into slots[0..n), leaving each one open
+/* The connections test_daemon_connection_cap() holds open, closed together
+ * when the batch goes out of scope. */
+struct connection_slots {
+    int fds[TEST_DAEMON_MAX_CONNECTIONS];
+};
+
+static void connection_slots_init(struct connection_slots *slots) {
+    for (int i = 0; i < TEST_DAEMON_MAX_CONNECTIONS; i++)
+        slots->fds[i] = -EBADF;
+}
+
+static void connection_slots_done(struct connection_slots *slots) {
+    for (int i = 0; i < TEST_DAEMON_MAX_CONNECTIONS; i++)
+        safe_close(slots->fds[i]);
+}
+
+/* Opens a connection to sock_path into every slot, leaving each one open
  * without sending a request, so every forked child stays alive blocked on
- * read and live_children holds at n. The first connection goes through
+ * read and live_children holds at the cap. The first connection goes through
  * connect_daemon_socket() to ride out the daemon's startup race; the rest
  * connect directly since the daemon is known to be up by then. On failure,
- * closes whatever it already opened. */
-static int open_daemon_connections(const char *sock_path, int *slots, int n) {
-    slots[0] = connect_daemon_socket(sock_path);
-    if (slots[0] < 0)
-        return slots[0];
+ * whatever was already opened is left for the caller's cleanup. */
+static int open_daemon_connections(const char *sock_path,
+                                   struct connection_slots *slots) {
+    slots->fds[0] = connect_daemon_socket(sock_path);
+    if (slots->fds[0] < 0)
+        return slots->fds[0];
 
     struct sockaddr_un sa = {.sun_family = AF_UNIX};
     (void)strlcpy(sa.sun_path, sock_path, sizeof(sa.sun_path));
-    for (int i = 1; i < n; i++) {
-        int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    for (int i = 1; i < TEST_DAEMON_MAX_CONNECTIONS; i++) {
+        _cleanup_close_ int sock =
+            socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
         if (sock == -1 ||
             connect(sock, (struct sockaddr *)&sa, sizeof(sa)) == -1) {
             int ret = -errno;
             perror("connect");
-            if (sock >= 0)
-                close(sock);
-            for (int j = 0; j < i; j++)
-                close(slots[j]);
             return ret;
         }
-        slots[i] = sock;
+        slots->fds[i] = TAKE_FD(sock);
     }
     return 0;
 }
@@ -458,26 +465,26 @@ static int open_daemon_connections(const char *sock_path, int *slots, int n) {
  * without ever getting a response. Also checks the connections under the
  * cap are untouched by the overflow. */
 static int test_daemon_connection_cap(const char *defused_path) {
-    char dir[] = "/tmp/defused-daemon-cap-test-XXXXXX";
-    if (mkdtemp(dir) == NULL) {
+    char dir_template[] = "/tmp/defused-daemon-cap-test-XXXXXX";
+    _cleanup_(rmdirp) const char *dir = mkdtemp(dir_template);
+    if (dir == NULL) {
         perror("mkdtemp");
         return -errno;
     }
-    char sock_path[sizeof(dir) + 16];
-    snprintf(sock_path, sizeof(sock_path), "%s/defused.sock", dir);
+    char sock_path_buf[sizeof(dir_template) + 16];
+    snprintf(sock_path_buf, sizeof(sock_path_buf), "%s/defused.sock", dir);
+    _cleanup_(unlinkp) const char *sock_path = sock_path_buf;
 
-    pid_t pid;
+    _cleanup_(sigterm_waitp) pid_t pid = 0;
     int ret = spawn_defused_daemon(defused_path, sock_path, &pid);
-    if (ret < 0) {
-        rmdir(dir);
-        return ret;
-    }
-
-    int slots[TEST_DAEMON_MAX_CONNECTIONS];
-    ret =
-        open_daemon_connections(sock_path, slots, TEST_DAEMON_MAX_CONNECTIONS);
     if (ret < 0)
-        goto out_kill;
+        return ret;
+
+    _cleanup_(connection_slots_done) struct connection_slots slots;
+    connection_slots_init(&slots);
+    ret = open_daemon_connections(sock_path, &slots);
+    if (ret < 0)
+        return ret;
 
     /* Give the single-threaded accept loop a moment to accept()/fork() all
      * of the above before adding the connection meant to overflow the cap
@@ -487,57 +494,42 @@ static int test_daemon_connection_cap(const char *defused_path) {
 
     struct sockaddr_un sa = {.sun_family = AF_UNIX};
     (void)strlcpy(sa.sun_path, sock_path, sizeof(sa.sun_path));
-    int overflow = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    _cleanup_close_ int overflow =
+        socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (overflow == -1) {
         ret = -errno;
         perror("socket");
-        goto out_close;
+        return ret;
     }
     if (connect(overflow, (struct sockaddr *)&sa, sizeof(sa)) == -1) {
         ret = -errno;
         perror("connect");
-        close(overflow);
-        goto out_close;
+        return ret;
     }
 
     struct pollfd pfd = {.fd = overflow, .events = POLLIN};
     ret = poll(&pfd, 1, 2000);
     if (ret <= 0 || !(pfd.revents & (POLLIN | POLLHUP))) {
         fprintf(stderr, "FAIL: overflow connection was not dropped\n");
-        ret = -EINVAL;
-        goto out_close_overflow;
+        return -EINVAL;
     }
     char buf[1];
     ssize_t n = recv(overflow, buf, sizeof(buf), 0);
     if (n != 0) {
         fprintf(stderr, "FAIL: expected EOF on overflow connection, got %zd\n",
                 n);
-        ret = -EINVAL;
-        goto out_close_overflow;
+        return -EINVAL;
     }
 
-    ret = 0;
     for (int i = 0; i < TEST_DAEMON_MAX_CONNECTIONS; i++) {
-        struct pollfd p = {.fd = slots[i], .events = POLLIN};
+        struct pollfd p = {.fd = slots.fds[i], .events = POLLIN};
         if (poll(&p, 1, 0) > 0) {
             fprintf(stderr, "FAIL: connection %d under the cap was dropped\n",
                     i);
-            ret = -EINVAL;
-            break;
+            return -EINVAL;
         }
     }
-
-out_close_overflow:
-    close(overflow);
-out_close:
-    for (int i = 0; i < TEST_DAEMON_MAX_CONNECTIONS; i++)
-        close(slots[i]);
-out_kill:
-    kill(pid, SIGTERM);
-    waitpid(pid, NULL, 0);
-    unlink(sock_path);
-    rmdir(dir);
-    return ret;
+    return 0;
 }
 
 int main(int argc, char *argv[]) {

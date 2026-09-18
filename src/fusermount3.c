@@ -14,6 +14,7 @@
  * FUSE option parsing happens here; the service wire protocol is Varlink.
  */
 #define _GNU_SOURCE
+#include "common.h"
 #include "defused_proto.h"
 #include "util.h"
 
@@ -137,13 +138,11 @@ int main(int argc, char *argv[]) {
             strerror(errno));
     }
 
-    int exit_status = EXIT_FAILURE;
     bool unmount = false;
     bool lazy = false;
     bool setup_auto_unmount_only = false;
     const char *opts = "";
     const char *commfd_str = NULL;
-    char *mnt = NULL;
     int ch;
     while ((ch = getopt_long(argc, argv, short_opts, long_opts, NULL)) != -1) {
         switch (ch) {
@@ -189,27 +188,25 @@ int main(int argc, char *argv[]) {
     if (argc > optind + 1)
         die("extra arguments after the mountpoint");
 
-    mnt = fuse_mnt_resolve_path(progname, argv[optind]);
+    _cleanup_free_ char *mnt = fuse_mnt_resolve_path(progname, argv[optind]);
     if (mnt == NULL)
-        goto out;
+        return EXIT_FAILURE;
 
-    if (unmount && !setup_auto_unmount_only) {
-        exit_status = do_unmount(mnt, lazy) < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
-        goto out;
-    }
+    if (unmount && !setup_auto_unmount_only)
+        return do_unmount(mnt, lazy) < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 
     if (commfd_str == NULL)
         commfd_str = getenv(FUSE_COMMFD_ENV);
     if (commfd_str == NULL) {
         fprintf(stderr, "%s: old style mounting not supported\n", progname);
-        goto out;
+        return EXIT_FAILURE;
     }
 
     long cfd_long;
     if (libfuse_strtol(commfd_str, &cfd_long) < 0 || cfd_long < 0 ||
         cfd_long > INT_MAX) {
         fprintf(stderr, "%s: invalid _FUSE_COMMFD: %s\n", progname, commfd_str);
-        goto out;
+        return EXIT_FAILURE;
     }
     int cfd = (int)cfd_long;
 
@@ -217,31 +214,22 @@ int main(int argc, char *argv[]) {
     if (fstat(cfd, &st) == -1) {
         fprintf(stderr, "%s: fstat of comm fd %d failed: %s\n", progname, cfd,
                 strerror(errno));
-        goto out;
+        return EXIT_FAILURE;
     }
 
     if (!S_ISSOCK(st.st_mode)) {
         fprintf(stderr, "%s: file descriptor %d is not a socket\n", progname,
                 cfd);
-        goto out;
+        return EXIT_FAILURE;
     }
 
     if (!setup_auto_unmount_only) {
-        if (do_mount(mnt, opts, cfd) < 0) {
-            exit_status = EXIT_FAILURE;
-            goto out;
-        }
-        if (!auto_unmount) {
-            exit_status = EXIT_SUCCESS;
-            goto out;
-        }
+        if (do_mount(mnt, opts, cfd) < 0)
+            return EXIT_FAILURE;
+        if (!auto_unmount)
+            return EXIT_SUCCESS;
     }
-    exit_status =
-        wait_and_auto_unmount(cfd, mnt) < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
-
-out:
-    free(mnt);
-    return exit_status;
+    return wait_and_auto_unmount(cfd, mnt) < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }
 
 static bool caller_is_root(void) {
@@ -258,34 +246,32 @@ static int do_mount(const char *mnt, const char *opts, int cfd) {
     int ret = parse_mount_opts(opts, &u.mount);
     if (ret < 0)
         return ret;
-    int mnt_fd = -1;
-    int fuse_fd = -1;
 
     /* Resolve the mountpoint to a file descriptor.
      * This file descriptor is sent to the service to perform the mount. */
-    mnt_fd = open(mnt, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    _cleanup_close_ int mnt_fd = open(mnt, O_PATH | O_NOFOLLOW | O_CLOEXEC);
     if (mnt_fd == -1) {
         ret = -errno;
         fprintf(stderr, "%s: failed to access mountpoint %s: %s\n", progname,
                 mnt, strerror(errno));
-        goto out;
+        return ret;
     }
 
     const char *dev_path = getenv("DEFUSED_FUSE_DEVICE");
     if (!dev_path || !*dev_path)
         dev_path = "/dev/fuse";
-    fuse_fd = open(dev_path, O_RDWR | O_CLOEXEC);
+    _cleanup_close_ int fuse_fd = open(dev_path, O_RDWR | O_CLOEXEC);
     if (fuse_fd == -1) {
         ret = -errno;
         fprintf(stderr, "%s: failed to open %s: %s\n", progname, dev_path,
                 strerror(errno));
-        goto out;
+        return ret;
     }
 
     int fds[] = {fuse_fd, mnt_fd};
     ret = transact(DEFUSED_OP_MOUNT, &u, fds, 2, mnt);
     if (ret < 0)
-        goto out;
+        return ret;
 
     ret = send_fd(cfd, fuse_fd);
     if (ret < 0) {
@@ -293,15 +279,10 @@ static int do_mount(const char *mnt, const char *opts, int cfd) {
          * mounted -- same cleanup fusermount3 does, via the service. */
         quiet = true;
         (void)do_unmount(mnt, true);
-        goto out;
+        return ret;
     }
 
-out:
-    if (mnt_fd >= 0)
-        close(mnt_fd);
-    if (fuse_fd >= 0)
-        close(fuse_fd);
-    return ret;
+    return 0;
 }
 
 static int do_unmount(const char *mnt, bool lazy) {
@@ -309,54 +290,40 @@ static int do_unmount(const char *mnt, bool lazy) {
         fprintf(stderr, "%s: refusing to unmount /\n", progname);
         return -EINVAL;
     }
-    int ret = 0;
-    char *dir_copy = NULL;
-    char *base_copy = NULL;
-    int parent_fd = -1;
 
     /* dirname()/basename() may modify their argument in place and may
      * return a pointer into it, so each gets its own copy to work on. */
-    dir_copy = strdup(mnt);
-    base_copy = strdup(mnt);
+    _cleanup_free_ char *dir_copy = strdup(mnt);
+    _cleanup_free_ char *base_copy = strdup(mnt);
     if (!dir_copy || !base_copy) {
         fprintf(stderr, "%s: failed to allocate memory\n", progname);
-        ret = -ENOMEM;
-        goto out;
+        return -ENOMEM;
     }
     const char *parent = dirname(dir_copy);
     const char *name = basename(base_copy);
     if (strlen(name) >= DEFUSED_MAX_FILENAME) {
         fprintf(stderr, "%s: mountpoint name too long: %s\n", progname, name);
-        ret = -ENAMETOOLONG;
-        goto out;
+        return -ENAMETOOLONG;
     }
 
     /* Open the parent directory, not the FUSE mount directory itself.
      * This is to make sure the umount2() call doesn't fail due to a held
      * file descriptor. */
-    parent_fd = open(parent, O_PATH | O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC);
+    _cleanup_close_ int parent_fd =
+        open(parent, O_PATH | O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC);
     if (parent_fd == -1) {
-        ret = -errno;
+        int ret = -errno;
         if (!quiet)
             fprintf(stderr, "%s: failed to access %s: %s\n", progname, parent,
                     strerror(errno));
-        goto out;
+        return ret;
     }
 
     union defused_req u = {.umount = {.lazy = lazy}};
     (void)strlcpy(u.umount.name, name, sizeof(u.umount.name));
 
     int fds[] = {parent_fd};
-    ret = transact(DEFUSED_OP_UNMOUNT, &u, fds, 1, mnt);
-    if (ret < 0)
-        goto out;
-
-out:
-    if (parent_fd >= 0)
-        close(parent_fd);
-    free(dir_copy);
-    free(base_copy);
-    return ret;
+    return transact(DEFUSED_OP_UNMOUNT, &u, fds, 1, mnt);
 }
 
 /*
@@ -396,7 +363,7 @@ static int connect_service(sd_varlink **ret) {
     if (path == NULL || *path == '\0')
         path = DEFUSED_SOCKET_PATH;
 
-    sd_varlink *link = NULL;
+    _cleanup_(sd_varlink_close_unrefp) sd_varlink *link = NULL;
     int r = sd_varlink_connect_address(&link, path);
     if (r < 0) {
         fprintf(stderr, "%s: cannot connect to the defused service at %s: %s\n",
@@ -405,15 +372,12 @@ static int connect_service(sd_varlink **ret) {
     }
     r = sd_varlink_set_allow_fd_passing_input(link, true);
     if (r < 0)
-        goto fail;
+        return r;
     r = sd_varlink_set_allow_fd_passing_output(link, true);
     if (r < 0)
-        goto fail;
-    *ret = link;
+        return r;
+    *ret = TAKE_PTR(link);
     return 0;
-fail:
-    sd_varlink_close_unref(link);
-    return r;
 }
 
 /* One request/response with the service. Returns 0, -EPERM if the service
@@ -425,7 +389,7 @@ static int transact(uint32_t op, const union defused_req *req, const int *fds,
     if (fd_count > 2)
         return -EINVAL;
 
-    sd_varlink *link = NULL;
+    _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *link = NULL;
     int ret = connect_service(&link);
     if (ret < 0)
         return ret;
@@ -433,10 +397,10 @@ static int transact(uint32_t op, const union defused_req *req, const int *fds,
     for (size_t i = 0; i < fd_count; i++) {
         ret = sd_varlink_push_dup_fd(link, fds[i]);
         if (ret < 0)
-            goto out_close;
+            return ret;
     }
 
-    sd_json_variant *reply = NULL;
+    _cleanup_(sd_json_variant_unrefp) sd_json_variant *reply = NULL;
     const char *error_id = NULL;
     if (op == DEFUSED_OP_MOUNT)
         ret = sd_varlink_callbo(
@@ -457,12 +421,11 @@ static int transact(uint32_t op, const union defused_req *req, const int *fds,
     else
         ret = -EINVAL;
     if (ret < 0)
-        goto out_unref_reply;
+        return ret;
     if (error_id != NULL) {
         fprintf(stderr, "%s: defused service returned a Varlink error: %s\n",
                 progname, error_id);
-        ret = -EBADMSG;
-        goto out_unref_reply;
+        return -EBADMSG;
     }
 
     struct defused_resp resp = {0};
@@ -474,14 +437,6 @@ static int transact(uint32_t op, const union defused_req *req, const int *fds,
         {},
     };
     ret = sd_json_dispatch(reply, dispatch_table, 0, &resp);
-    if (ret < 0)
-        goto out_unref_reply;
-    ret = 0;
-
-out_unref_reply:
-    sd_json_variant_unref(reply);
-out_close:
-    sd_varlink_flush_close_unref(link);
     if (ret < 0)
         return ret;
     if (resp.status != DEFUSED_OK) {

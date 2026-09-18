@@ -11,6 +11,7 @@
  * The process exits after processing the operation.
  */
 #define _GNU_SOURCE
+#include "common.h"
 #include "defused-sandbox.h"
 #include "defused_proto.h"
 #include "util.h"
@@ -107,7 +108,8 @@ static int parse_args(int argc, char *argv[])
     __attribute__((__nonnull__(2), __warn_unused_result__));
 static int socket_activation_fd(int *out_fd)
     __attribute__((__nonnull__(1), __warn_unused_result__));
-static int handle_connection(int sock) __attribute__((__warn_unused_result__));
+static int handle_connection(int sock_fd)
+    __attribute__((__warn_unused_result__));
 static int run_fork_daemon(void) __attribute__((__warn_unused_result__));
 static int create_listening_socket(void)
     __attribute__((__warn_unused_result__));
@@ -138,7 +140,7 @@ int main(int argc, char *argv[]) {
     if (cfg_daemon)
         return run_fork_daemon() == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 
-    int sock = -1;
+    int sock = -EBADF;
     ret = socket_activation_fd(&sock);
     if (ret < 0)
         return EXIT_FAILURE;
@@ -147,21 +149,21 @@ int main(int argc, char *argv[]) {
 }
 
 /* Handles a single already-connected Varlink socket to completion (one
- * mount/unmount request), then closes it. Used both for the
- * systemd-Accept=yes case in main() (sock is the handed-off connection) and
- * for each forked child in run_fork_daemon() (sock is the accepted
- * connection). */
-static int handle_connection(int sock) {
-    int exit_status = EXIT_FAILURE;
+ * mount/unmount request), then closes it. Takes ownership of sock_fd. Used
+ * both for the systemd-Accept=yes case in main() (the handed-off connection)
+ * and for each forked child in run_fork_daemon() (the accepted connection).
+ */
+static int handle_connection(int sock_fd) {
+    _cleanup_close_ int sock = sock_fd;
+    _cleanup_(sd_event_unrefp) sd_event *event = NULL;
+    _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *server = NULL;
     int ret;
 
-    sd_event *event = NULL;
-    sd_varlink_server *server = NULL;
     ret = sd_event_new(&event);
     if (ret < 0) {
         fprintf(stderr, "defused: failed to create event loop: %s\n",
                 strerror(-ret));
-        goto out;
+        return EXIT_FAILURE;
     }
     ret = sd_varlink_server_new(&server,
                                 SD_VARLINK_SERVER_ALLOW_FD_PASSING_INPUT |
@@ -170,14 +172,14 @@ static int handle_connection(int sock) {
     if (ret < 0) {
         fprintf(stderr, "defused: failed to create Varlink server: %s\n",
                 strerror(-ret));
-        goto out;
+        return EXIT_FAILURE;
     }
     ret = sd_varlink_server_add_interface(server,
                                           &vl_interface_website_soss_defused);
     if (ret < 0) {
         fprintf(stderr, "defused: failed to add Varlink interface: %s\n",
                 strerror(-ret));
-        goto out_unref_server;
+        return EXIT_FAILURE;
     }
     ret = sd_varlink_server_bind_method_many(
         server, DEFUSED_VARLINK_METHOD_MOUNT, varlink_mount,
@@ -185,7 +187,7 @@ static int handle_connection(int sock) {
     if (ret < 0) {
         fprintf(stderr, "defused: failed to bind Varlink methods: %s\n",
                 strerror(-ret));
-        goto out_unref_server;
+        return EXIT_FAILURE;
     }
 
     struct request_context ctx = {.sock = sock};
@@ -194,35 +196,29 @@ static int handle_connection(int sock) {
     if (ret < 0) {
         fprintf(stderr, "defused: failed to configure Varlink server: %s\n",
                 strerror(-ret));
-        goto out_unref_server;
+        return EXIT_FAILURE;
     }
     ret = sd_varlink_server_attach_event(server, event, 0);
     if (ret < 0) {
         fprintf(stderr, "defused: failed to attach Varlink server: %s\n",
                 strerror(-ret));
-        goto out_unref_server;
+        return EXIT_FAILURE;
     }
+    /* The server owns the fd once added; on failure it is still ours. */
     ret = sd_varlink_server_add_connection(server, sock, NULL);
     if (ret < 0) {
         fprintf(stderr, "defused: failed to add Varlink connection: %s\n",
                 strerror(-ret));
-        goto out_unref_server;
+        return EXIT_FAILURE;
     }
-    sock = -1;
+    TAKE_FD(sock);
     ret = sd_event_loop(event);
     if (ret < 0) {
         fprintf(stderr, "defused: Varlink server failed: %s\n", strerror(-ret));
-        goto out_unref_server;
+        return EXIT_FAILURE;
     }
 
-    exit_status = EXIT_SUCCESS;
-out_unref_server:
-    sd_varlink_server_unref(server);
-    sd_event_unref(event);
-out:
-    if (sock >= 0)
-        close(sock);
-    return exit_status;
+    return EXIT_SUCCESS;
 }
 
 static int reply_response(sd_varlink *link, uint32_t status, int sys_errno) {
@@ -241,7 +237,6 @@ static int varlink_mount(sd_varlink *link, sd_json_variant *parameters,
     struct request_context *ctx = userdata;
     struct defused_mount_req req = {0};
     int ret = 0;
-    int dev_fd = -1, mnt_fd = -1;
 
     struct mount_parameters {
         uint32_t fuse_fd_index;
@@ -290,26 +285,18 @@ static int varlink_mount(sd_varlink *link, sd_json_variant *parameters,
     if (sd_varlink_get_n_fds(link) != 2)
         return sd_varlink_error_invalid_parameter_name(link,
                                                        "fuseFileDescriptor");
-    dev_fd = sd_varlink_take_fd(link, parsed.fuse_fd_index);
-    mnt_fd = sd_varlink_take_fd(link, parsed.mnt_fd_index);
-    if (dev_fd < 0 || mnt_fd < 0) {
-        if (dev_fd >= 0)
-            close(dev_fd);
-        if (mnt_fd >= 0)
-            close(mnt_fd);
+    _cleanup_close_ int dev_fd = sd_varlink_take_fd(link, parsed.fuse_fd_index);
+    _cleanup_close_ int mnt_fd = sd_varlink_take_fd(link, parsed.mnt_fd_index);
+    if (dev_fd < 0 || mnt_fd < 0)
         return sd_varlink_error_invalid_parameter_name(
             link,
             dev_fd < 0 ? "fuseFileDescriptor" : "mountpointFileDescriptor");
-    }
 
     struct ucred cred;
     ret = get_peer_cred(ctx->sock, &cred);
-    if (ret == 0)
-        ret = handle_mount(link, ctx->sock, &req, mnt_fd, dev_fd, &cred);
-
-    close(dev_fd);
-    close(mnt_fd);
-    return ret;
+    if (ret < 0)
+        return ret;
+    return handle_mount(link, ctx->sock, &req, mnt_fd, dev_fd, &cred);
 }
 
 static int varlink_unmount(sd_varlink *link, sd_json_variant *parameters,
@@ -317,7 +304,6 @@ static int varlink_unmount(sd_varlink *link, sd_json_variant *parameters,
     (void)flags;
     struct request_context *ctx = userdata;
     struct defused_umount_req req = {0};
-    int parent_fd = -1;
     int ret = 0;
 
     struct unmount_parameters {
@@ -349,18 +335,17 @@ static int varlink_unmount(sd_varlink *link, sd_json_variant *parameters,
     if (sd_varlink_get_n_fds(link) != 1)
         return sd_varlink_error_invalid_parameter_name(link,
                                                        "parentFileDescriptor");
-    parent_fd = sd_varlink_take_fd(link, parsed.parent_fd_index);
+    _cleanup_close_ int parent_fd =
+        sd_varlink_take_fd(link, parsed.parent_fd_index);
     if (parent_fd < 0)
         return sd_varlink_error_invalid_parameter_name(link,
                                                        "parentFileDescriptor");
 
     struct ucred cred;
     ret = get_peer_cred(ctx->sock, &cred);
-    if (ret == 0)
-        ret = handle_umount(link, ctx->sock, &req, parent_fd, &cred);
-
-    close(parent_fd);
-    return ret;
+    if (ret < 0)
+        return ret;
+    return handle_umount(link, ctx->sock, &req, parent_fd, &cred);
 }
 
 static const char *status_name(uint32_t status) {
@@ -481,21 +466,21 @@ check_polkit_authorized(int sock, const struct ucred *cred,
                         const char *action_id, long current_mounts,
                         const char *privileged_flags) {
     bool have_privileged_flags = privileged_flags && privileged_flags[0];
-    int pidfd = peer_pidfd(sock);
+    _cleanup_close_ int pidfd = peer_pidfd(sock);
     if (pidfd < 0)
         return pidfd;
 
-    sd_bus *bus = NULL;
-    sd_bus_message *call = NULL;
-    sd_bus_message *reply = NULL;
-    sd_bus_error error = SD_BUS_ERROR_NULL;
+    _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+    _cleanup_(sd_bus_message_unrefp) sd_bus_message *call = NULL;
+    _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+    _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
     int ret;
 
     ret = sd_bus_open_system(&bus);
     if (ret < 0) {
         fprintf(stderr, "defused: failed to connect to the system bus: %s\n",
                 strerror(-ret));
-        goto out;
+        return ret;
     }
 
     ret = sd_bus_message_new_method_call(
@@ -503,7 +488,7 @@ check_polkit_authorized(int sock, const struct ucred *cred,
         "/org/freedesktop/PolicyKit1/Authority",
         "org.freedesktop.PolicyKit1.Authority", "CheckAuthorization");
     if (ret < 0)
-        goto out;
+        return ret;
 
     /* subject: (sa{sv}) = ("unix-process", {"uid": <i>, "pidfd": <h>}).
      * Passing both "uid" and "pidfd" (rather than "pid"/"start-time") makes
@@ -514,7 +499,7 @@ check_polkit_authorized(int sock, const struct ucred *cred,
                                 "i", (int32_t)cred->uid, "pidfd", "h", pidfd,
                                 action_id);
     if (ret < 0)
-        goto out;
+        return ret;
 
     /* details: a{ss}. uid, gid, and pid are deliberately not included: a
      * rule already gets those from the subject polkit itself constructs
@@ -526,23 +511,23 @@ check_polkit_authorized(int sock, const struct ucred *cred,
      * uses both. */
     ret = sd_bus_message_open_container(call, 'a', "{ss}");
     if (ret < 0)
-        goto out;
+        return ret;
     char mounts_buf[32];
     if (current_mounts >= 0) {
         snprintf(mounts_buf, sizeof(mounts_buf), "%ld", current_mounts);
         ret = sd_bus_message_append(call, "{ss}", "current-mounts", mounts_buf);
         if (ret < 0)
-            goto out;
+            return ret;
     }
     if (have_privileged_flags) {
         ret = sd_bus_message_append(call, "{ss}", "privileged-flags",
                                     privileged_flags);
         if (ret < 0)
-            goto out;
+            return ret;
     }
     ret = sd_bus_message_close_container(call);
     if (ret < 0)
-        goto out;
+        return ret;
 
     /* flags: CHECK_AUTHORIZATION_FLAGS_ALLOW_USER_INTERACTION (1), so that
      * an agent in the caller's session can answer an AUTH_ADMIN_KEEP-style
@@ -550,46 +535,36 @@ check_polkit_authorized(int sock, const struct ucred *cred,
      * never call CancelCheckAuthorization. */
     ret = sd_bus_message_append(call, "us", (uint32_t)1, "");
     if (ret < 0)
-        goto out;
+        return ret;
 
     ret = sd_bus_call(bus, call, 0, &error, &reply);
     if (ret < 0) {
         fprintf(stderr, "defused: polkit CheckAuthorization failed: %s\n",
                 error.message ? error.message : strerror(-ret));
-        goto out;
+        return ret;
     }
 
     int is_authorized = 0;
     int is_challenge = 0;
     ret = sd_bus_message_enter_container(reply, 'r', "bba{ss}");
     if (ret < 0)
-        goto out;
+        return ret;
     ret = sd_bus_message_read(reply, "bb", &is_authorized, &is_challenge);
     if (ret < 0)
-        goto out;
+        return ret;
     ret = sd_bus_message_skip(reply, "a{ss}");
     if (ret < 0)
-        goto out;
+        return ret;
     ret = sd_bus_message_exit_container(reply);
     if (ret < 0)
-        goto out;
+        return ret;
 
     if (!is_authorized) {
         fprintf(stderr, "defused: polkit denied %s to uid %u (challenge=%d)\n",
                 action_id, (unsigned)cred->uid, is_challenge);
-        ret = -EACCES;
-        goto out;
+        return -EACCES;
     }
-    ret = 0;
-
-out:
-    sd_bus_error_free(&error);
-    sd_bus_message_unref(call);
-    sd_bus_message_unref(reply);
-    sd_bus_flush_close_unref(bus);
-    if (pidfd >= 0)
-        close(pidfd);
-    return ret;
+    return 0;
 }
 
 static __attribute__((__warn_unused_result__)) int
@@ -660,12 +635,9 @@ prepare_mount(const struct defused_mount_req *req, int dev_fd,
 
 static __attribute__((__nonnull__(1), __warn_unused_result__)) int
 create_detached_mount(const struct prepared_mount *mnt) {
-    int fsfd = fsopen(mnt->type, FSOPEN_CLOEXEC);
+    _cleanup_close_ int fsfd = fsopen(mnt->type, FSOPEN_CLOEXEC);
     if (fsfd == -1)
         return neg_errno();
-
-    int mountfd = -1;
-    int ret = 0;
 
     const struct {
         const char *key;
@@ -684,9 +656,9 @@ create_detached_mount(const struct prepared_mount *mnt) {
     for (size_t i = 0; i < sizeof(strings) / sizeof(strings[0]); i++) {
         if (!strings[i].present)
             continue;
-        ret = mount_fsconfig_string(fsfd, strings[i].key, strings[i].value);
+        int ret = mount_fsconfig_string(fsfd, strings[i].key, strings[i].value);
         if (ret < 0)
-            goto out;
+            return ret;
     }
 
     const struct {
@@ -702,92 +674,73 @@ create_detached_mount(const struct prepared_mount *mnt) {
     for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
         if (!flags[i].present)
             continue;
-        ret = mount_fsconfig_flag(fsfd, flags[i].key);
+        int ret = mount_fsconfig_flag(fsfd, flags[i].key);
         if (ret < 0)
-            goto out;
+            return ret;
     }
 
-    if (fsconfig(fsfd, FSCONFIG_CMD_CREATE, NULL, NULL, 0) == -1) {
-        ret = neg_errno();
-        goto out;
-    }
+    if (fsconfig(fsfd, FSCONFIG_CMD_CREATE, NULL, NULL, 0) == -1)
+        return neg_errno();
 
-    mountfd = fsmount(fsfd, FSMOUNT_CLOEXEC, mnt->mount_attrs);
-    if (mountfd == -1) {
-        ret = neg_errno();
-        goto out;
-    }
-
-    ret = mountfd;
-    mountfd = -1;
-
-out:
-    if (mountfd >= 0)
-        close(mountfd);
-    if (fsfd >= 0)
-        close(fsfd);
-    return ret;
+    int mountfd = fsmount(fsfd, FSMOUNT_CLOEXEC, mnt->mount_attrs);
+    if (mountfd == -1)
+        return neg_errno();
+    return mountfd;
 }
 
-static int handle_mount(sd_varlink *link, int sock,
-                        const struct defused_mount_req *req, int mnt_fd,
-                        int dev_fd, const struct ucred *cred) {
-    uint32_t status;
-    int sys_errno = 0;
-    int ret = 0;
-    int mountfd = -1;
-
+/* Validates and performs a mount request. On failure, *status and
+ * *sys_errno describe what to report to the client; the caller logs and
+ * replies. */
+static __attribute__((__nonnull__(2, 5, 6, 7), __warn_unused_result__)) int
+mount_request(int sock, const struct defused_mount_req *req, int mnt_fd,
+              int dev_fd, const struct ucred *cred, uint32_t *status,
+              int *sys_errno) {
     /* varlink_mount() already bounds-checked these before copying them out
      * of the JSON payload. */
     assert(strnlen(req->fsname, DEFUSED_MAX_NAME) < DEFUSED_MAX_NAME);
     assert(strnlen(req->subtype, DEFUSED_MAX_NAME) < DEFUSED_MAX_NAME);
     if (strchr(req->fsname, '/') || strchr(req->subtype, '/')) {
-        status = DEFUSED_ERR_MALFORMED;
-        ret = -EINVAL;
-        goto fail;
+        *status = DEFUSED_ERR_MALFORMED;
+        return -EINVAL;
     }
 
     /* Policy questions like whether this caller may use allow_other are
      * answered entirely by polkit (see check_polkit_authorized()); this
      * only validates protocol shape. */
     if ((req->mount_flags & ~(uint32_t)DEFUSED_MOUNT_FLAGS_MASK) != 0) {
-        status = DEFUSED_ERR_BAD_OPTION;
-        ret = -EINVAL;
-        goto fail;
+        *status = DEFUSED_ERR_BAD_OPTION;
+        return -EINVAL;
     }
 
     struct stat st;
     if (fstat(mnt_fd, &st) == -1) {
-        status = DEFUSED_ERR_MALFORMED;
-        sys_errno = errno;
-        ret = -errno;
-        goto fail;
+        *status = DEFUSED_ERR_MALFORMED;
+        *sys_errno = errno;
+        return -errno;
     }
     if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) {
-        status = DEFUSED_ERR_MALFORMED;
-        sys_errno = S_ISLNK(st.st_mode) ? ELOOP : ENOTDIR;
-        ret = -sys_errno;
-        goto fail;
+        *status = DEFUSED_ERR_MALFORMED;
+        *sys_errno = S_ISLNK(st.st_mode) ? ELOOP : ENOTDIR;
+        return -*sys_errno;
     }
     /* Ownership policy diverges from libfuse's setuid fusermount3 here --
      * see doc/protocol.md. */
     if (st.st_uid != cred->uid || !(st.st_mode & S_IWUSR) ||
         (S_ISDIR(st.st_mode) && !(st.st_mode & S_IXUSR))) {
-        status = DEFUSED_ERR_NOT_ALLOWED;
-        ret = -EPERM;
-        goto fail;
+        *status = DEFUSED_ERR_NOT_ALLOWED;
+        return -EPERM;
     }
-    ret = check_mountpoint_fstype(mnt_fd);
+    int ret = check_mountpoint_fstype(mnt_fd);
     if (ret < 0) {
-        status = DEFUSED_ERR_NOT_ALLOWED;
-        goto fail;
+        *status = DEFUSED_ERR_NOT_ALLOWED;
+        return ret;
     }
 
     ret = check_fuse_device_fd(dev_fd);
     if (ret < 0) {
-        status = DEFUSED_ERR_MALFORMED;
-        sys_errno = -ret;
-        goto fail;
+        *status = DEFUSED_ERR_MALFORMED;
+        *sys_errno = -ret;
+        return ret;
     }
 
     /* Handed to polkit below so a rule can implement its own mount-count
@@ -795,11 +748,9 @@ static int handle_mount(sd_varlink *link, int sock,
     errno = 0;
     int current_mounts = count_fuse_fs("defused");
     if (current_mounts < 0) {
-        int saved_errno = errno ? errno : EIO;
-        status = DEFUSED_ERR_MOUNT_FAILED;
-        sys_errno = saved_errno;
-        ret = -saved_errno;
-        goto fail;
+        *status = DEFUSED_ERR_MOUNT_FAILED;
+        *sys_errno = errno ? errno : EIO;
+        return -*sys_errno;
     }
 
     char privileged_flags[128];
@@ -809,95 +760,91 @@ static int handle_mount(sd_varlink *link, int sock,
     ret = check_polkit_authorized(sock, cred, DEFUSED_POLKIT_ACTION_MOUNT,
                                   current_mounts, privileged_flags);
     if (ret < 0) {
-        status =
+        *status =
             ret == -EACCES ? DEFUSED_ERR_NOT_ALLOWED : DEFUSED_ERR_MOUNT_FAILED;
-        sys_errno = -ret;
-        goto fail;
+        *sys_errno = -ret;
+        return ret;
     }
 
-    int pidfd = peer_pidfd(sock);
+    _cleanup_close_ int pidfd = peer_pidfd(sock);
     if (pidfd < 0) {
-        status = DEFUSED_ERR_MOUNT_FAILED;
-        sys_errno = -pidfd;
-        ret = pidfd;
-        goto fail;
+        *status = DEFUSED_ERR_MOUNT_FAILED;
+        *sys_errno = -pidfd;
+        return pidfd;
     }
 
     struct prepared_mount prepared;
     prepare_mount(req, dev_fd, &st, cred, &prepared);
 
-    mountfd = create_detached_mount(&prepared);
+    _cleanup_close_ int mountfd = create_detached_mount(&prepared);
     if (mountfd < 0) {
-        status = DEFUSED_ERR_MOUNT_FAILED;
-        sys_errno = -mountfd;
-        ret = mountfd;
-        close(pidfd);
-        goto fail;
+        *status = DEFUSED_ERR_MOUNT_FAILED;
+        *sys_errno = -mountfd;
+        return mountfd;
     }
 
-    ret = defused_sandbox_mount(pidfd, mountfd, mnt_fd, &status, &sys_errno);
-    close(pidfd);
-    close(mountfd);
-    mountfd = -1;
-    if (ret < 0)
-        goto fail;
+    return defused_sandbox_mount(pidfd, mountfd, mnt_fd, status, sys_errno);
+}
 
-    return reply_response(link, DEFUSED_OK, 0);
-
-fail:
-    if (mountfd >= 0)
-        close(mountfd);
-    fprintf(stderr,
+static int handle_mount(sd_varlink *link, int sock,
+                        const struct defused_mount_req *req, int mnt_fd,
+                        int dev_fd, const struct ucred *cred) {
+    uint32_t status = DEFUSED_OK;
+    int sys_errno = 0;
+    int ret =
+        mount_request(sock, req, mnt_fd, dev_fd, cred, &status, &sys_errno);
+    if (ret < 0) {
+        fprintf(
+            stderr,
             "defused: mount request failed with %s (ret=%d, errno=%d: %s)\n",
             status_name(status), ret, sys_errno,
             sys_errno ? strerror(sys_errno) : "none");
-    (void)reply_response(link, status, sys_errno);
-    return ret;
+        (void)reply_response(link, status, sys_errno);
+        return ret;
+    }
+
+    return reply_response(link, DEFUSED_OK, 0);
 }
 
-static int handle_umount(sd_varlink *link, int sock,
-                         const struct defused_umount_req *req, int parent_fd,
-                         const struct ucred *cred) {
-    uint32_t status = DEFUSED_OK;
-    int sys_errno = 0;
-    int ret = 0;
-    int mnt_fd = -1;
-    int proc_fd = -1;
-
+/* Validates and performs an unmount request. On failure, *status and
+ * *sys_errno describe what to report to the client; the caller logs and
+ * replies. */
+static __attribute__((__nonnull__(2, 4, 5, 6), __warn_unused_result__)) int
+umount_request(int sock, const struct defused_umount_req *req, int parent_fd,
+               const struct ucred *cred, uint32_t *status, int *sys_errno) {
     /* varlink_unmount() already bounds-checked this before copying it out
      * of the JSON payload. */
     assert(strnlen(req->name, DEFUSED_MAX_FILENAME) < DEFUSED_MAX_FILENAME);
     if (req->name[0] == '\0' || strchr(req->name, '/') ||
         !strcmp(req->name, ".") || !strcmp(req->name, "..")) {
-        status = DEFUSED_ERR_MALFORMED;
-        ret = -EINVAL;
-        goto out;
+        *status = DEFUSED_ERR_MALFORMED;
+        return -EINVAL;
     }
 
     /* Keep a handle to the service's procfs before entering the client's
      * mount namespace. */
-    proc_fd = open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    _cleanup_close_ int proc_fd =
+        open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (proc_fd == -1) {
-        status = DEFUSED_ERR_UNMOUNT_FAILED;
-        sys_errno = errno;
-        ret = -errno;
-        goto out;
+        *status = DEFUSED_ERR_UNMOUNT_FAILED;
+        *sys_errno = errno;
+        return -errno;
     }
 
-    mnt_fd = openat(parent_fd, req->name, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    _cleanup_close_ int mnt_fd =
+        openat(parent_fd, req->name, O_PATH | O_NOFOLLOW | O_CLOEXEC);
     if (mnt_fd == -1) {
-        status = DEFUSED_ERR_MALFORMED;
-        sys_errno = errno;
-        ret = -errno;
-        goto out;
+        *status = DEFUSED_ERR_MALFORMED;
+        *sys_errno = errno;
+        return -errno;
     }
 
     long parent_mnt_id = -1;
-    ret = fd_mnt_id(proc_fd, parent_fd, &parent_mnt_id);
+    int ret = fd_mnt_id(proc_fd, parent_fd, &parent_mnt_id);
     if (ret < 0) {
-        status = DEFUSED_ERR_MALFORMED;
-        sys_errno = -ret;
-        goto out;
+        *status = DEFUSED_ERR_MALFORMED;
+        *sys_errno = -ret;
+        return ret;
     }
 
     /* Identify the mount that the fd refers to *without* calling into the
@@ -907,21 +854,19 @@ static int handle_umount(sd_varlink *link, int sock,
     long mnt_id = -1;
     ret = fd_mnt_id(proc_fd, mnt_fd, &mnt_id);
     if (ret < 0) {
-        status = DEFUSED_ERR_MALFORMED;
-        sys_errno = -ret;
-        goto out;
+        *status = DEFUSED_ERR_MALFORMED;
+        *sys_errno = -ret;
+        return ret;
     }
     if (mnt_id == parent_mnt_id) {
-        status = DEFUSED_ERR_NOT_A_FUSE_MOUNT;
-        ret = -EINVAL;
-        goto out;
+        *status = DEFUSED_ERR_NOT_A_FUSE_MOUNT;
+        return -EINVAL;
     }
 
     /* From here on the target is identified by mnt_id. Close the fd now: an
      * open reference to the mount, here or inherited by the sandboxed child,
      * makes a non-lazy umount2() fail with EBUSY. */
-    close(mnt_fd);
-    mnt_fd = -1;
+    mnt_fd = safe_close(mnt_fd);
 
     /* Before the sandboxed child installs seccomp: the filter has no room for
      * the syscalls talking to polkit over D-Bus needs. This asks only whether
@@ -931,32 +876,30 @@ static int handle_umount(sd_varlink *link, int sock,
     ret = check_polkit_authorized(sock, cred, DEFUSED_POLKIT_ACTION_UNMOUNT, -1,
                                   NULL);
     if (ret < 0) {
-        status = ret == -EACCES ? DEFUSED_ERR_NOT_ALLOWED
-                                : DEFUSED_ERR_UNMOUNT_FAILED;
-        sys_errno = -ret;
-        goto out;
+        *status = ret == -EACCES ? DEFUSED_ERR_NOT_ALLOWED
+                                 : DEFUSED_ERR_UNMOUNT_FAILED;
+        *sys_errno = -ret;
+        return ret;
     }
 
-    int pidfd = peer_pidfd(sock);
+    _cleanup_close_ int pidfd = peer_pidfd(sock);
     if (pidfd < 0) {
-        status = DEFUSED_ERR_UNMOUNT_FAILED;
-        sys_errno = -pidfd;
-        ret = pidfd;
-        goto out;
+        *status = DEFUSED_ERR_UNMOUNT_FAILED;
+        *sys_errno = -pidfd;
+        return pidfd;
     }
 
-    ret =
-        defused_sandbox_unmount(pidfd, proc_fd, parent_fd, req->name, req->lazy,
-                                mnt_id, cred->uid, &status, &sys_errno);
-    close(pidfd);
-    if (ret < 0)
-        goto out;
+    return defused_sandbox_unmount(pidfd, proc_fd, parent_fd, req->name,
+                                   req->lazy, mnt_id, cred->uid, status,
+                                   sys_errno);
+}
 
-out:
-    if (mnt_fd >= 0)
-        close(mnt_fd);
-    if (proc_fd >= 0)
-        close(proc_fd);
+static int handle_umount(sd_varlink *link, int sock,
+                         const struct defused_umount_req *req, int parent_fd,
+                         const struct ucred *cred) {
+    uint32_t status = DEFUSED_OK;
+    int sys_errno = 0;
+    int ret = umount_request(sock, req, parent_fd, cred, &status, &sys_errno);
     if (ret < 0)
         fprintf(
             stderr,
@@ -968,7 +911,6 @@ out:
         ret = send_ret;
     return ret;
 }
-
 static __attribute__((__nonnull__(1))) void usage(const char *prog) {
     fprintf(
         stderr,
@@ -1035,7 +977,7 @@ static void sigchld_handler(int sig) {
  * so a client sees a dropped connection (a retryable failure) instead of
  * hanging. */
 static int run_fork_daemon(void) {
-    int listen_fd = create_listening_socket();
+    _cleanup_close_ int listen_fd = create_listening_socket();
     if (listen_fd < 0)
         return listen_fd;
 
@@ -1049,12 +991,11 @@ static int run_fork_daemon(void) {
     if (sigaction(SIGCHLD, &sa, NULL) == -1) {
         int ret = -errno;
         fprintf(stderr, "defused: sigaction(SIGCHLD): %s\n", strerror(errno));
-        close(listen_fd);
         return ret;
     }
 
     for (;;) {
-        int conn = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
+        _cleanup_close_ int conn = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
         if (conn == -1) {
             /* EINTR is routine (SA_RESTART still lets other signals
              * interrupt); EMFILE/ENFILE/ECONNABORTED are transient resource
@@ -1069,27 +1010,22 @@ static int run_fork_daemon(void) {
             }
             int ret = -errno;
             fprintf(stderr, "defused: accept4: %s\n", strerror(errno));
-            close(listen_fd);
             return ret;
         }
 
-        if (live_children >= DEFUSED_DAEMON_MAX_CONNECTIONS) {
-            close(conn);
+        if (live_children >= DEFUSED_DAEMON_MAX_CONNECTIONS)
             continue;
-        }
 
         pid_t pid = fork();
         if (pid == -1) {
             fprintf(stderr, "defused: fork: %s\n", strerror(errno));
-            close(conn);
             continue;
         }
         if (pid == 0) {
-            close(listen_fd);
-            _exit(handle_connection(conn));
+            listen_fd = safe_close(listen_fd);
+            _exit(handle_connection(TAKE_FD(conn)));
         }
         live_children++;
-        close(conn);
     }
 }
 
@@ -1108,7 +1044,7 @@ static int create_listening_socket(void) {
     }
     (void)strlcpy(sa.sun_path, path, sizeof(sa.sun_path));
 
-    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    _cleanup_close_ int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd == -1) {
         fprintf(stderr, "defused: socket: %s\n", strerror(errno));
         return -errno;
@@ -1116,28 +1052,26 @@ static int create_listening_socket(void) {
 
     int ret = bind_unix_socket(fd, &sa, sizeof(sa), path);
     if (ret < 0)
-        goto out_close;
+        return ret;
 
     tag_varlink_entrypoint(path);
 
     if (chmod(path, 0666) == -1) {
         ret = -errno;
         fprintf(stderr, "defused: chmod(%s): %s\n", path, strerror(errno));
-        goto out_unlink;
+        goto fail_unlink;
     }
 
     if (listen(fd, SOMAXCONN) == -1) {
         ret = -errno;
         fprintf(stderr, "defused: listen(%s): %s\n", path, strerror(errno));
-        goto out_unlink;
+        goto fail_unlink;
     }
 
-    return fd;
+    return TAKE_FD(fd);
 
-out_unlink:
+fail_unlink:
     unlink(path);
-out_close:
-    close(fd);
     return ret;
 }
 
@@ -1167,41 +1101,37 @@ static int bind_unix_socket(int fd, const struct sockaddr_un *sa,
         return ret;
     }
 
-    int probe = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    _cleanup_close_ int probe = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (probe == -1) {
         int ret = -errno;
         fprintf(stderr, "defused: socket probe: %s\n", strerror(errno));
         return ret;
     }
 
-    int ret = 0;
     if (connect(probe, (const struct sockaddr *)sa, sa_len) == 0) {
         fprintf(stderr, "defused: socket already in use: %s\n", path);
-        ret = -EADDRINUSE;
-        goto out;
+        return -EADDRINUSE;
     }
     if (errno != ECONNREFUSED) {
-        ret = -errno;
+        int ret = -errno;
         fprintf(stderr, "defused: cannot connect to existing socket %s: %s\n",
                 path, strerror(errno));
-        goto out;
+        return ret;
     }
 
     if (unlink(path) == -1) {
-        ret = -errno;
+        int ret = -errno;
         fprintf(stderr, "defused: unlink stale socket %s: %s\n", path,
                 strerror(errno));
-        goto out;
+        return ret;
     }
     if (bind(fd, (const struct sockaddr *)sa, sa_len) == -1) {
-        ret = -errno;
+        int ret = -errno;
         fprintf(stderr, "defused: bind(%s): %s\n", path, strerror(errno));
-        goto out;
+        return ret;
     }
 
-out:
-    close(probe);
-    return ret;
+    return 0;
 }
 
 /* Implements systemd socket activation */
@@ -1243,25 +1173,20 @@ static int socket_activation_fd(int *out_fd) {
 static int fd_mnt_id(int proc_fd, int fd, long *out_id) {
     char path[48];
     snprintf(path, sizeof(path), "self/fdinfo/%d", fd);
-    int info_fd = openat(proc_fd, path, O_RDONLY | O_CLOEXEC);
-
+    _cleanup_close_ int info_fd = openat(proc_fd, path, O_RDONLY | O_CLOEXEC);
     if (info_fd == -1)
         return -errno;
 
-    FILE *f = fdopen(info_fd, "r");
-    if (!f) {
-        int saved_errno = errno;
-        close(info_fd);
-        errno = saved_errno;
+    _cleanup_fclose_ FILE *f = fdopen(info_fd, "r");
+    if (!f)
         return -errno;
-    }
+    TAKE_FD(info_fd); /* now owned by the stream */
 
     char line[256];
     long id = -1;
     while (fgets(line, sizeof(line), f))
         if (sscanf(line, "mnt_id:%ld", &id) == 1)
             break;
-    fclose(f);
     if (id < 0)
         return -ENODATA;
     *out_id = id;
