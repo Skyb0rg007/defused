@@ -109,7 +109,7 @@ static int transact(uint32_t op, const union defused_req *req, const int *fds,
                     size_t fd_count, const char *mnt)
     __attribute__((__nonnull__(2, 3, 5), __warn_unused_result__));
 static void print_service_error(uint32_t op, const char *mnt,
-                                const struct defused_resp *resp)
+                                const struct defused_error *err)
     __attribute__((__nonnull__(2, 3)));
 static int parse_mount_opts(const char *opts, struct defused_mount_req *req)
     __attribute__((__nonnull__(1, 2), __warn_unused_result__));
@@ -380,10 +380,9 @@ static int connect_service(sd_varlink **ret) {
     return 0;
 }
 
-/* One request/response with the service. Returns 0, -EPERM if the service
- * accepted the request but reported a non-OK status (also printed via
- * print_service_error(), unless quiet), or whatever negative errno the RPC
- * itself failed with. */
+/* One request/response with the service. Returns 0, -EPERM if the call came
+ * back as a Varlink error (also printed via print_service_error(), unless
+ * quiet), or whatever negative errno the RPC itself failed with. */
 static int transact(uint32_t op, const union defused_req *req, const int *fds,
                     size_t fd_count, const char *mnt) {
     if (fd_count > 2)
@@ -422,70 +421,48 @@ static int transact(uint32_t op, const union defused_req *req, const int *fds,
         ret = -EINVAL;
     if (ret < 0)
         return ret;
-    if (error_id != NULL) {
-        fprintf(stderr, "%s: defused service returned a Varlink error: %s\n",
-                progname, error_id);
-        return -EBADMSG;
-    }
 
-    struct defused_resp resp = {0};
-    static const sd_json_dispatch_field dispatch_table[] = {
-        {"status", SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uint32,
-         offsetof(struct defused_resp, status), SD_JSON_MANDATORY},
-        {"sysErrno", SD_JSON_VARIANT_INTEGER, sd_json_dispatch_int32,
-         offsetof(struct defused_resp, sys_errno), SD_JSON_MANDATORY},
-        {},
-    };
-    ret = sd_json_dispatch(reply, dispatch_table, 0, &resp);
-    if (ret < 0)
-        return ret;
-    if (resp.status != DEFUSED_OK) {
-        print_service_error(op, mnt, &resp);
+    if (error_id != NULL) {
+        struct defused_error err;
+        ret = defused_error_from_reply(error_id, reply, &err);
+        if (ret < 0)
+            return ret;
+        print_service_error(op, mnt, &err);
         return -EPERM;
     }
+
     return 0;
 }
 
 static void print_service_error(uint32_t op, const char *mnt,
-                                const struct defused_resp *resp) {
+                                const struct defused_error *err) {
     if (quiet)
         return;
     const char *what = op == DEFUSED_OP_MOUNT ? "mount" : "unmount";
-    switch (resp->status) {
-    case DEFUSED_ERR_BAD_OPTION:
+    const char *reason = err->sys_errno ? strerror(err->sys_errno)
+                                        : "no reason given by the service";
+
+    if (!strcmp(err->id, DEFUSED_VARLINK_ERROR_MALFORMED))
+        fprintf(stderr, "%s: %s request rejected by the defused service: %s\n",
+                progname, what, reason);
+    else if (!strcmp(err->id, DEFUSED_VARLINK_ERROR_BAD_OPTION))
         fprintf(stderr, "%s: mount options rejected by the defused service\n",
                 progname);
-        break;
-    case DEFUSED_ERR_NOT_ALLOWED:
-        if (op == DEFUSED_OP_MOUNT)
-            fprintf(stderr,
-                    "%s: mount of %s not allowed by the defused service\n",
-                    progname, mnt);
-        else
-            fprintf(stderr,
-                    "%s: not allowed to unmount %s: not mounted by you\n",
-                    progname, mnt);
-        break;
-    case DEFUSED_ERR_NOT_A_FUSE_MOUNT:
+    else if (!strcmp(err->id, DEFUSED_VARLINK_ERROR_NOT_ALLOWED))
+        fprintf(stderr,
+                op == DEFUSED_OP_MOUNT
+                    ? "%s: mount of %s not allowed by the defused service\n"
+                    : "%s: not allowed to unmount %s: not mounted by you\n",
+                progname, mnt);
+    else if (!strcmp(err->id, DEFUSED_VARLINK_ERROR_NOT_A_FUSE_MOUNT))
         fprintf(stderr, "%s: %s is not a FUSE mount\n", progname, mnt);
-        break;
-    case DEFUSED_ERR_MOUNT_FAILED:
-    case DEFUSED_ERR_UNMOUNT_FAILED:
+    else if (!strcmp(err->id, DEFUSED_VARLINK_ERROR_MOUNT_FAILED) ||
+             !strcmp(err->id, DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED))
         fprintf(stderr, "%s: failed to %s %s: %s\n", progname, what, mnt,
-                strerror(resp->sys_errno));
-        break;
-    case DEFUSED_ERR_SETNS_FAILED:
-        fprintf(stderr,
-                "%s: defused service could not join this mount namespace: %s\n",
-                progname, strerror(resp->sys_errno));
-        break;
-    default:
-        fprintf(stderr,
-                "%s: %s request rejected by the defused service "
-                "(status %u)\n",
-                progname, what, resp->status);
-        break;
-    }
+                reason);
+    else
+        /* A Varlink-level error, e.g. one of libsystemd's own. */
+        fprintf(stderr, "%s: %s request failed: %s\n", progname, what, err->id);
 }
 
 static void die(const char *fmt, ...) {

@@ -14,19 +14,18 @@
  *    own namespace B, a descendant of A. defused should be able to setns()
  *    into B (it has CAP_SYS_ADMIN there) and proceed with the request; we
  *    prove the join happened by sending an unmount request for a non-FUSE
- *    bind mount and checking the response is DEFUSED_ERR_NOT_A_FUSE_MOUNT
- *    rather than DEFUSED_ERR_SETNS_FAILED.
+ *    bind mount and checking the response is NotAFuseMount rather than
+ *    UnmountFailed.
  *
  *  - test_cannot_join: defused runs unprivileged in the plain host
  *    namespace, like every other test in this suite. The client
  *    unshare(CLONE_NEWUSER|CLONE_NEWNS)'s into a namespace of its own that
  *    defused has no ancestry over. defused cannot legitimately setns()
  *    into it (no CAP_SYS_ADMIN there), and the test checks that this
- *    surfaces cleanly as DEFUSED_ERR_SETNS_FAILED/EPERM -- never as a
- *    silent fallback to operating on defused's own namespace instead,
- *    which would be a namespace-confusion bug (e.g. counting FUSE mounts or
- *    mounting against the wrong mount table while believing it's the
- *    client's).
+ *    surfaces cleanly as UnmountFailed/EPERM -- never as a silent
+ *    fallback to operating on defused's own namespace instead, which would
+ *    be a namespace-confusion bug (e.g. counting FUSE mounts or mounting
+ *    against the wrong mount table while believing it's the client's).
  *
  * Neither test reaches a real FUSE mount/unmount. The client creates only a
  * private bind mount inside its own mount namespace.
@@ -37,17 +36,16 @@
  * a *trusted* caller (uid 0, or an action's declared owner) check another
  * identity's authorization at all, and neither defused nor its simulated
  * client is real uid 0 in this unprivileged harness, so both scenarios
- * are expected to be turned away there with DEFUSED_ERR_UNMOUNT_FAILED,
- * before ever reaching the setns() logic these tests were written to
- * distinguish -- so, unprivileged, the two scenarios are no longer
- * distinguishable from each other via this harness, and neither actually
- * exercises setns() at all. Both CHECKs below accept
- * DEFUSED_ERR_UNMOUNT_FAILED alongside each test's original expected
- * status so they still pass unprivileged (and still verify the polkit
- * gate really runs before anything namespace-sensitive). test_cannot_join
- * still catches the bug it cares most about either way: silently falling
- * back to defused's own namespace instead of failing would show up as
- * neither of its two accepted statuses. Real, trusted-caller (root)
+ * are expected to be turned away there with UnmountFailed, before ever
+ * reaching the setns() logic these tests were written to distinguish -- so,
+ * unprivileged, the two scenarios are no longer distinguishable from each
+ * other via this harness, and neither actually exercises setns() at all.
+ * Both CHECKs below accept UnmountFailed alongside each test's originally
+ * expected error so they still pass unprivileged (and still verify the
+ * polkit gate really runs before anything namespace-sensitive).
+ * test_cannot_join still catches the bug it cares most about either way:
+ * silently falling back to defused's own namespace instead of failing would
+ * show up as neither of its two accepted errors. Real, trusted-caller (root)
  * coverage of both mount and unmount across mount namespaces lives in
  * packaging/nixos/tests/mount-namespace.nix instead.
  */
@@ -158,11 +156,11 @@ static int scratch_mount_create(struct scratch_mount *m) {
 
 /* Sends an unmount request for a bind mount that is intentionally not FUSE.
  * A service that can enter the client's namespace should therefore return
- * DEFUSED_ERR_NOT_A_FUSE_MOUNT; a service that cannot enter it should fail
- * earlier with DEFUSED_ERR_SETNS_FAILED. In this unprivileged harness both
- * are instead expected to be turned away even earlier, by polkit -- see
- * the file-level comment above. Takes ownership of sock_fd. */
-static int send_non_fuse_umount_request(int sock_fd) {
+ * NotAFuseMount; one that cannot should fail earlier with UnmountFailed. In
+ * this unprivileged harness both are instead turned away even earlier, by
+ * polkit -- see the file-level comment above. Takes ownership of sock_fd. */
+static int send_non_fuse_umount_request(int sock_fd,
+                                        struct defused_error *err) {
     _cleanup_close_ int sock = sock_fd;
     _cleanup_(scratch_mount_done) struct scratch_mount scratch = {};
     int ret = scratch_mount_create(&scratch);
@@ -200,24 +198,10 @@ static int send_non_fuse_umount_request(int sock_fd) {
         SD_JSON_BUILD_PAIR_BOOLEAN("lazy", true));
     if (ret < 0)
         return ret;
-    if (error_id != NULL)
-        return -EBADMSG;
-
-    struct defused_resp parsed = {0};
-    static const sd_json_dispatch_field dispatch_table[] = {
-        {"status", SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uint32,
-         offsetof(struct defused_resp, status), SD_JSON_MANDATORY},
-        {"sysErrno", SD_JSON_VARIANT_INTEGER, sd_json_dispatch_int32,
-         offsetof(struct defused_resp, sys_errno), SD_JSON_MANDATORY},
-        {},
-    };
-    ret = sd_json_dispatch(reply, dispatch_table, 0, &parsed);
+    ret = defused_error_from_reply(error_id, reply, err);
     if (ret < 0)
         return ret;
-    if (parsed.status == DEFUSED_ERR_SETNS_FAILED)
-        fprintf(stderr, "(setns failed, sys_errno=%d: %s)\n", parsed.sys_errno,
-                strerror(parsed.sys_errno));
-    return (int)parsed.status;
+    return 0;
 }
 
 static int abstract_addr(struct sockaddr_un *sa, socklen_t *len,
@@ -331,11 +315,15 @@ static int test_can_join(const char *defused_path) {
             int client_sock = connect_addr(&sa, salen);
             if (client_sock < 0)
                 _exit(1);
-            int status = send_non_fuse_umount_request(client_sock);
-            _exit(status == DEFUSED_ERR_NOT_A_FUSE_MOUNT ||
-                          status == DEFUSED_ERR_UNMOUNT_FAILED
-                      ? 0
-                      : 1);
+            struct defused_error err;
+            int ret = send_non_fuse_umount_request(client_sock, &err);
+            _exit(
+                ret == 0 &&
+                        (!strcmp(err.id,
+                                 DEFUSED_VARLINK_ERROR_NOT_A_FUSE_MOUNT) ||
+                         !strcmp(err.id, DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED))
+                    ? 0
+                    : 1);
         }
 
         _cleanup_close_ int conn = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
@@ -370,9 +358,8 @@ static int test_can_join(const char *defused_path) {
     CHECK(n == 1);
     CHECK(byte == 1);
     if (n != 1 || byte != 1)
-        fprintf(stderr,
-                "test_can_join: got a status other than "
-                "DEFUSED_ERR_NOT_A_FUSE_MOUNT/DEFUSED_ERR_UNMOUNT_FAILED\n");
+        fprintf(stderr, "test_can_join: got an error other than "
+                        "NotAFuseMount/UnmountFailed\n");
     return failures ? -EINVAL : 0;
 }
 
@@ -403,16 +390,14 @@ static int test_cannot_join(const char *defused_path) {
         int client_sock = connect_addr(&sa, salen);
         if (client_sock < 0)
             _exit(1);
-        int status = send_non_fuse_umount_request(client_sock);
-        bool accepted = status == DEFUSED_ERR_SETNS_FAILED ||
-                        status == DEFUSED_ERR_UNMOUNT_FAILED;
+        struct defused_error err;
+        int ret = send_non_fuse_umount_request(client_sock, &err);
+        bool accepted =
+            ret == 0 && !strcmp(err.id, DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED);
         if (!accepted)
-            fprintf(stderr,
-                    "test_cannot_join: got status %d, expected "
-                    "DEFUSED_ERR_SETNS_FAILED (%d) or "
-                    "DEFUSED_ERR_UNMOUNT_FAILED (%d)\n",
-                    status, DEFUSED_ERR_SETNS_FAILED,
-                    DEFUSED_ERR_UNMOUNT_FAILED);
+            fprintf(stderr, "test_cannot_join: got %s, expected %s\n",
+                    err.id[0] ? err.id : "a successful reply",
+                    DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED);
         _exit(accepted ? 0 : 1);
     }
 

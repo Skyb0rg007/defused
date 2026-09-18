@@ -56,7 +56,7 @@ method Mount(
   blockSize: int,
   fsName: string,
   subtype: string
-) -> (status: int, sysErrno: int)
+) -> ()
 ```
 
 The client attaches exactly two fds to the Varlink call:
@@ -75,12 +75,12 @@ bitmask is the fusermount3-compatible unprivileged default: `nosuid` and
 Policy applied before the mount is attempted:
 
 - The mountpoint must be a directory or regular file
-  (`DEFUSED_ERR_MALFORMED` otherwise).
+  (`MalformedRequest` otherwise).
 - The FUSE device fd must really name `/dev/fuse` and be open read/write
-  (`DEFUSED_ERR_MALFORMED` otherwise).
+  (`MalformedRequest` otherwise).
 - The mountpoint fd must name a caller-owned writable mountpoint on a backing
   filesystem type that libfuse permits for unprivileged mounts
-  (`DEFUSED_ERR_NOT_ALLOWED` otherwise). Directories must also be searchable by
+  (`NotAllowed` otherwise). Directories must also be searchable by
   the caller.
 - The service asks polkit (`org.freedesktop.PolicyKit1.Authority
   .CheckAuthorization`) whether the caller may create this mount
@@ -90,7 +90,7 @@ Policy applied before the mount is attempted:
 
 On success, the service creates the mount with Linux's file-descriptor-based
 mount API (`fsopen()`/`fsconfig()`/`fsmount()`), attaches it to the received
-mountpoint fd with `move_mount()`, and replies `DEFUSED_OK`.
+mountpoint fd with `move_mount()`, and replies with an empty object.
 
 ### Unmount
 
@@ -99,7 +99,7 @@ method Unmount(
   parentFileDescriptor: int,
   name: string,
   lazy: bool
-) -> (status: int, sysErrno: int)
+) -> ()
 ```
 
 The client attaches a file descriptor for the mountpoint's parent directory.
@@ -130,31 +130,36 @@ It closes that fd again and calls `umount2(name, UMOUNT_NOFOLLOW)`, adding
 No defused process holds an fd on the mount at that point, since any such
 reference would make a non-lazy unmount fail with `EBUSY`.
 
-## Response Status
+## Errors
 
-Every successful Varlink method reply contains:
+A method that succeeds replies with an empty object; a failure is one of:
 
 ```varlink
-status: int
-sysErrno: int
+error MalformedRequest(errno: int)
+error BadMountOption()
+error NotAllowed()
+error NotAFuseMount()
+error MountFailed(errno: int)
+error UnmountFailed(errno: int)
 ```
 
-`status` uses `enum defused_status`:
+| Error | Meaning |
+| --- | --- |
+| `MalformedRequest` | Request-level validation failure after Varlink parsing and fd binding; `errno` says what was wrong with it |
+| `BadMountOption` | `mountFlags` outside its allowed mask |
+| `NotAllowed` | The mountpoint/mount is not the caller's to use, or polkit denied the operation |
+| `NotAFuseMount` | Unmount target is not a FUSE mount |
+| `MountFailed` | Mount setup, joining the caller's mount namespace, or attachment failed, or polkit could not be reached |
+| `UnmountFailed` | Joining the caller's mount namespace or `umount2(2)` failed, or polkit could not be reached |
 
-| Value | Name | Meaning |
-| --- | --- | --- |
-| 0 | `DEFUSED_OK` | Success |
-| 1 | `DEFUSED_ERR_MALFORMED` | Request-level validation failure after Varlink parsing and fd binding |
-| 2 | `DEFUSED_ERR_BAD_OPTION` | `mountFlags` outside its allowed mask |
-| 3 | `DEFUSED_ERR_NOT_ALLOWED` | The mountpoint/mount is not the caller's to use, or polkit denied the operation |
-| 4 | `DEFUSED_ERR_NOT_A_FUSE_MOUNT` | Unmount target is not a FUSE mount |
-| 5 | `DEFUSED_ERR_MOUNT_FAILED` | Mount setup or attachment failed, or polkit could not be reached; see `sysErrno` |
-| 6 | `DEFUSED_ERR_UNMOUNT_FAILED` | `umount2(2)` failed, or polkit could not be reached; see `sysErrno` |
-| 7 | `DEFUSED_ERR_SETNS_FAILED` | Could not join the caller's mount namespace; see `sysErrno` |
+`errno` is the Linux error number behind the failure, following the
+`io.systemd.System` convention.
+Which function produced it is a debugging detail the service keeps to its own
+log rather than putting on the wire.
 
 Varlink protocol-level problems, such as missing fields, wrong field types, bad
 fd indices, or wrong fd count, are returned as standard Varlink errors by
-libsystemd rather than as a `defused_status`.
+libsystemd instead.
 
 ## Why Varlink
 
