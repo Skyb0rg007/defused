@@ -33,6 +33,9 @@ It must be started as root.
 - **Discovery**: the socket inode is tagged with the extended attribute
   `user.varlink=entrypoint` as recommended by the [Varlink UAPI Spec][].
   This only works on Linux 7.0 and above.
+- **`--child`**: the connected socket arrives the same way, but from
+  `sd_varlink_connect_exec(3)` in `fusermount3` rather than from systemd;
+  see [Privileged callers](#privileged-callers).
 
 The service handles one Varlink method call and exits when the connection goes
 idle.
@@ -72,7 +75,8 @@ bitmask is the fusermount3-compatible unprivileged default: `nosuid` and
 `nodev` are enforced unless the client explicitly sets
 `DEFUSED_MOUNT_ALLOW_DEV`.
 
-Policy applied before the mount is attempted:
+Policy applied before the mount is attempted (only the first two for a
+[privileged caller](#privileged-callers)):
 
 - The mountpoint must be a directory or regular file
   (`MalformedRequest` otherwise).
@@ -129,6 +133,25 @@ It closes that fd again and calls `umount2(name, UMOUNT_NOFOLLOW)`, adding
 `MNT_DETACH` if `lazy` is true.
 No defused process holds an fd on the mount at that point, since any such
 reference would make a non-lazy unmount fail with `EBUSY`.
+
+## Privileged callers
+
+A `fusermount3` caller that is root or holds `CAP_SYS_ADMIN` can mount by
+itself, and the service's policy would only get in its way: root could not
+mount on a directory it does not own, or on a filesystem type outside
+libfuse's allowlist, or without a polkit rule.
+
+Such a caller never connects to the socket.
+`fusermount3` instead spawns `defused --child` with
+`sd_varlink_connect_exec(3)` and speaks the same protocol to it over a
+socketpair.
+The child validates the request for shape as the service does, then skips the
+ownership rule, the filesystem-type allowlist, polkit, and the unmount
+`user_id=` check, and calls `move_mount()` or `umount2()` directly: it
+already runs in the caller's mount namespace with the caller's privileges, so
+there is no namespace to join and nothing to sandbox against.
+Like root's `umount`, it will unmount any mount below the parent directory,
+not only FUSE ones.
 
 ## Errors
 

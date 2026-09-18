@@ -9,6 +9,9 @@
  * This program is designed to be called via systemd Accept=yes
  * socket activation, on an AF_UNIX SOCK_STREAM Varlink socket.
  * The process exits after processing the operation.
+ *
+ * With --child (spawned by fusermount3 for a privileged caller), policy is
+ * skipped and the mount/unmount is done in-process.
  */
 #define _GNU_SOURCE
 #include "common.h"
@@ -66,6 +69,7 @@ static const struct {
 
 struct request_context {
     int sock;
+    bool privileged;
 };
 
 struct prepared_mount {
@@ -94,19 +98,19 @@ static int varlink_unmount(sd_varlink *link, sd_json_variant *parameters,
     __attribute__((__nonnull__(1, 4), __warn_unused_result__));
 static int get_peer_cred(int sock, struct ucred *cred)
     __attribute__((__nonnull__(2), __warn_unused_result__));
-static int handle_mount(sd_varlink *link, int sock,
+static int handle_mount(sd_varlink *link, const struct request_context *ctx,
                         const struct defused_mount_req *req, int mnt_fd,
                         int dev_fd, const struct ucred *cred)
-    __attribute__((__nonnull__(1, 3, 6), __warn_unused_result__));
-static int handle_umount(sd_varlink *link, int sock,
+    __attribute__((__nonnull__(1, 2, 3, 6), __warn_unused_result__));
+static int handle_umount(sd_varlink *link, const struct request_context *ctx,
                          const struct defused_umount_req *req, int parent_fd,
                          const struct ucred *cred)
-    __attribute__((__nonnull__(1, 3, 5), __warn_unused_result__));
+    __attribute__((__nonnull__(1, 2, 3, 5), __warn_unused_result__));
 static int parse_args(int argc, char *argv[])
     __attribute__((__nonnull__(2), __warn_unused_result__));
 static int socket_activation_fd(int *out_fd)
     __attribute__((__nonnull__(1), __warn_unused_result__));
-static int handle_connection(int sock_fd)
+static int handle_connection(int sock_fd, bool privileged)
     __attribute__((__warn_unused_result__));
 static int run_fork_daemon(void) __attribute__((__warn_unused_result__));
 static int create_listening_socket(void)
@@ -120,6 +124,7 @@ static int fd_mnt_id(int proc_fd, int fd, long *out_id)
     __attribute__((__nonnull__(3), __warn_unused_result__));
 
 static bool cfg_daemon = false;
+static bool cfg_child = false;
 
 /* Cap on concurrent --daemon children, so that a mode-0666 socket doesn't
  * let an unprivileged local user exhaust the process table/memory by
@@ -143,7 +148,7 @@ int main(int argc, char *argv[]) {
     if (ret < 0)
         return EXIT_FAILURE;
 
-    return handle_connection(sock);
+    return handle_connection(sock, cfg_child);
 }
 
 /* Handles a single already-connected Varlink socket to completion (one
@@ -151,7 +156,7 @@ int main(int argc, char *argv[]) {
  * both for the systemd-Accept=yes case in main() (the handed-off connection)
  * and for each forked child in run_fork_daemon() (the accepted connection).
  */
-static int handle_connection(int sock_fd) {
+static int handle_connection(int sock_fd, bool privileged) {
     _cleanup_close_ int sock = sock_fd;
     _cleanup_(sd_event_unrefp) sd_event *event = NULL;
     _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *server = NULL;
@@ -188,7 +193,7 @@ static int handle_connection(int sock_fd) {
         return EXIT_FAILURE;
     }
 
-    struct request_context ctx = {.sock = sock};
+    struct request_context ctx = {.sock = sock, .privileged = privileged};
     sd_varlink_server_set_userdata(server, &ctx);
     ret = sd_varlink_server_set_exit_on_idle(server, true);
     if (ret < 0) {
@@ -295,7 +300,7 @@ static int varlink_mount(sd_varlink *link, sd_json_variant *parameters,
     ret = get_peer_cred(ctx->sock, &cred);
     if (ret < 0)
         return ret;
-    return handle_mount(link, ctx->sock, &req, mnt_fd, dev_fd, &cred);
+    return handle_mount(link, ctx, &req, mnt_fd, dev_fd, &cred);
 }
 
 static int varlink_unmount(sd_varlink *link, sd_json_variant *parameters,
@@ -344,7 +349,7 @@ static int varlink_unmount(sd_varlink *link, sd_json_variant *parameters,
     ret = get_peer_cred(ctx->sock, &cred);
     if (ret < 0)
         return ret;
-    return handle_umount(link, ctx->sock, &req, parent_fd, &cred);
+    return handle_umount(link, ctx, &req, parent_fd, &cred);
 }
 
 static __attribute__((__warn_unused_result__)) int peer_pidfd(int sock) {
@@ -664,11 +669,40 @@ create_detached_mount(const struct prepared_mount *mnt) {
     return mountfd;
 }
 
+static __attribute__((__nonnull__(3, 4), __warn_unused_result__)) int
+authorize_mount(int sock, uint32_t mount_flags, const struct ucred *cred,
+                struct defused_error *err) {
+    /* Handed to polkit so a rule can implement its own mount-count policy. */
+    errno = 0;
+    int current_mounts = count_fuse_fs("defused");
+    if (current_mounts < 0) {
+        defused_error_set(err, DEFUSED_VARLINK_ERROR_MOUNT_FAILED,
+                          errno ? errno : EIO);
+        return -err->sys_errno;
+    }
+
+    char privileged_flags[128];
+    format_privileged_flags(mount_flags, privileged_flags,
+                            sizeof(privileged_flags));
+
+    int ret = check_polkit_authorized(sock, cred, DEFUSED_POLKIT_ACTION_MOUNT,
+                                      current_mounts, privileged_flags);
+    if (ret < 0) {
+        /* -EACCES is polkit's answer, not a failure to ask it. */
+        if (ret == -EACCES)
+            defused_error_set(err, DEFUSED_VARLINK_ERROR_NOT_ALLOWED, 0);
+        else
+            defused_error_set(err, DEFUSED_VARLINK_ERROR_MOUNT_FAILED, -ret);
+    }
+    return ret;
+}
+
 /* Validates and performs a mount request. On failure, *err describes what to
  * report to the client; the caller logs and replies. */
-static __attribute__((__nonnull__(2, 5, 6), __warn_unused_result__)) int
-mount_request(int sock, const struct defused_mount_req *req, int mnt_fd,
-              int dev_fd, const struct ucred *cred, struct defused_error *err) {
+static __attribute__((__nonnull__(1, 2, 5, 6), __warn_unused_result__)) int
+mount_request(const struct request_context *ctx,
+              const struct defused_mount_req *req, int mnt_fd, int dev_fd,
+              const struct ucred *cred, struct defused_error *err) {
     /* varlink_mount() already bounds-checked these before copying them out
      * of the JSON payload. */
     assert(strnlen(req->fsname, DEFUSED_MAX_NAME) < DEFUSED_MAX_NAME);
@@ -696,17 +730,20 @@ mount_request(int sock, const struct defused_mount_req *req, int mnt_fd,
         defused_error_set(err, DEFUSED_VARLINK_ERROR_MALFORMED, sys_errno);
         return -sys_errno;
     }
-    /* Ownership policy diverges from libfuse's setuid fusermount3 here --
-     * see doc/protocol.md. */
-    if (st.st_uid != cred->uid || !(st.st_mode & S_IWUSR) ||
-        (S_ISDIR(st.st_mode) && !(st.st_mode & S_IXUSR))) {
-        defused_error_set(err, DEFUSED_VARLINK_ERROR_NOT_ALLOWED, 0);
-        return -EPERM;
-    }
-    int ret = check_mountpoint_fstype(mnt_fd);
-    if (ret < 0) {
-        defused_error_set(err, DEFUSED_VARLINK_ERROR_NOT_ALLOWED, 0);
-        return ret;
+    int ret;
+    if (!ctx->privileged) {
+        /* Ownership policy diverges from libfuse's setuid fusermount3 here
+         * -- see doc/protocol.md. */
+        if (st.st_uid != cred->uid || !(st.st_mode & S_IWUSR) ||
+            (S_ISDIR(st.st_mode) && !(st.st_mode & S_IXUSR))) {
+            defused_error_set(err, DEFUSED_VARLINK_ERROR_NOT_ALLOWED, 0);
+            return -EPERM;
+        }
+        ret = check_mountpoint_fstype(mnt_fd);
+        if (ret < 0) {
+            defused_error_set(err, DEFUSED_VARLINK_ERROR_NOT_ALLOWED, 0);
+            return ret;
+        }
     }
 
     ret = check_fuse_device_fd(dev_fd);
@@ -715,35 +752,10 @@ mount_request(int sock, const struct defused_mount_req *req, int mnt_fd,
         return ret;
     }
 
-    /* Handed to polkit below so a rule can implement its own mount-count
-     * policy. */
-    errno = 0;
-    int current_mounts = count_fuse_fs("defused");
-    if (current_mounts < 0) {
-        defused_error_set(err, DEFUSED_VARLINK_ERROR_MOUNT_FAILED,
-                          errno ? errno : EIO);
-        return -err->sys_errno;
-    }
-
-    char privileged_flags[128];
-    format_privileged_flags(req->mount_flags, privileged_flags,
-                            sizeof(privileged_flags));
-
-    ret = check_polkit_authorized(sock, cred, DEFUSED_POLKIT_ACTION_MOUNT,
-                                  current_mounts, privileged_flags);
-    if (ret < 0) {
-        /* -EACCES is polkit's answer, not a failure to ask it. */
-        if (ret == -EACCES)
-            defused_error_set(err, DEFUSED_VARLINK_ERROR_NOT_ALLOWED, 0);
-        else
-            defused_error_set(err, DEFUSED_VARLINK_ERROR_MOUNT_FAILED, -ret);
-        return ret;
-    }
-
-    _cleanup_close_ int pidfd = peer_pidfd(sock);
-    if (pidfd < 0) {
-        defused_error_set(err, DEFUSED_VARLINK_ERROR_MOUNT_FAILED, -pidfd);
-        return pidfd;
+    if (!ctx->privileged) {
+        ret = authorize_mount(ctx->sock, req->mount_flags, cred, err);
+        if (ret < 0)
+            return ret;
     }
 
     struct prepared_mount prepared;
@@ -755,6 +767,19 @@ mount_request(int sock, const struct defused_mount_req *req, int mnt_fd,
         return mountfd;
     }
 
+    if (ctx->privileged) {
+        if (move_mount(mountfd, "", mnt_fd, "",
+                       MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH) == 0)
+            return 0;
+        defused_error_set(err, DEFUSED_VARLINK_ERROR_MOUNT_FAILED, errno);
+        return -errno;
+    }
+
+    _cleanup_close_ int pidfd = peer_pidfd(ctx->sock);
+    if (pidfd < 0) {
+        defused_error_set(err, DEFUSED_VARLINK_ERROR_MOUNT_FAILED, -pidfd);
+        return pidfd;
+    }
     return defused_sandbox_mount(pidfd, mountfd, mnt_fd, err);
 }
 
@@ -766,12 +791,12 @@ log_request_error(const char *what, const struct defused_error *err, int ret) {
             err->sys_errno ? strerror(err->sys_errno) : "none");
 }
 
-static int handle_mount(sd_varlink *link, int sock,
+static int handle_mount(sd_varlink *link, const struct request_context *ctx,
                         const struct defused_mount_req *req, int mnt_fd,
                         int dev_fd, const struct ucred *cred) {
     struct defused_error err = {};
 
-    int ret = mount_request(sock, req, mnt_fd, dev_fd, cred, &err);
+    int ret = mount_request(ctx, req, mnt_fd, dev_fd, cred, &err);
     if (ret < 0) {
         log_request_error("mount", &err, ret);
         (void)reply_error(link, &err);
@@ -783,8 +808,9 @@ static int handle_mount(sd_varlink *link, int sock,
 
 /* Validates and performs an unmount request. On failure, *err describes what
  * to report to the client; the caller logs and replies. */
-static __attribute__((__nonnull__(2, 4, 5), __warn_unused_result__)) int
-umount_request(int sock, const struct defused_umount_req *req, int parent_fd,
+static __attribute__((__nonnull__(1, 2, 4, 5), __warn_unused_result__)) int
+umount_request(const struct request_context *ctx,
+               const struct defused_umount_req *req, int parent_fd,
                const struct ucred *cred, struct defused_error *err) {
     /* varlink_unmount() already bounds-checked this before copying it out
      * of the JSON payload. */
@@ -838,13 +864,22 @@ umount_request(int sock, const struct defused_umount_req *req, int parent_fd,
      * makes a non-lazy umount2() fail with EBUSY. */
     mnt_fd = safe_close(mnt_fd);
 
+    if (ctx->privileged) {
+        if (fchdir(parent_fd) == 0 &&
+            umount2(req->name,
+                    UMOUNT_NOFOLLOW | (req->lazy ? MNT_DETACH : 0)) == 0)
+            return 0;
+        defused_error_set(err, DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED, errno);
+        return -errno;
+    }
+
     /* Before the sandboxed child installs seccomp: the filter has no room for
      * the syscalls talking to polkit over D-Bus needs. This asks only whether
      * the caller may use unmount at all -- whether this specific mount is
      * theirs to tear down is checked separately, inside
      * defused_sandbox_unmount(). */
-    ret = check_polkit_authorized(sock, cred, DEFUSED_POLKIT_ACTION_UNMOUNT, -1,
-                                  NULL);
+    ret = check_polkit_authorized(ctx->sock, cred,
+                                  DEFUSED_POLKIT_ACTION_UNMOUNT, -1, NULL);
     if (ret < 0) {
         if (ret == -EACCES)
             defused_error_set(err, DEFUSED_VARLINK_ERROR_NOT_ALLOWED, 0);
@@ -853,7 +888,7 @@ umount_request(int sock, const struct defused_umount_req *req, int parent_fd,
         return ret;
     }
 
-    _cleanup_close_ int pidfd = peer_pidfd(sock);
+    _cleanup_close_ int pidfd = peer_pidfd(ctx->sock);
     if (pidfd < 0) {
         defused_error_set(err, DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED, -pidfd);
         return pidfd;
@@ -863,12 +898,12 @@ umount_request(int sock, const struct defused_umount_req *req, int parent_fd,
                                    req->lazy, mnt_id, cred->uid, err);
 }
 
-static int handle_umount(sd_varlink *link, int sock,
+static int handle_umount(sd_varlink *link, const struct request_context *ctx,
                          const struct defused_umount_req *req, int parent_fd,
                          const struct ucred *cred) {
     struct defused_error err = {};
 
-    int ret = umount_request(sock, req, parent_fd, cred, &err);
+    int ret = umount_request(ctx, req, parent_fd, cred, &err);
     if (ret < 0) {
         log_request_error("unmount", &err, ret);
         (void)reply_error(link, &err);
@@ -881,7 +916,7 @@ static int handle_umount(sd_varlink *link, int sock,
 static __attribute__((__nonnull__(1))) void usage(const char *prog) {
     fprintf(
         stderr,
-        "usage: %s [--daemon]\n"
+        "usage: %s [--daemon | --child]\n"
         "\n"
         "By default, handles one mount/unmount request on the\n"
         "socket-activation fd (see defused_proto.h); meant to be spawned by\n"
@@ -892,15 +927,19 @@ static __attribute__((__nonnull__(1))) void usage(const char *prog) {
         "made per request by polkit; see doc/protocol.md.\n"
         "\n"
         "  --daemon  listen on $DEFUSED_SOCKET (or the default socket\n"
-        "            path) and fork a child for each connection\n",
+        "            path) and fork a child for each connection\n"
+        "  --child   same, but with this process's own privileges and no\n"
+        "            policy at all; spawned by fusermount3 for root and\n"
+        "            CAP_SYS_ADMIN callers, never for a service unit\n",
         prog);
 }
 
 static int parse_args(int argc, char *argv[]) {
-    enum { OPT_DAEMON = 256 };
+    enum { OPT_DAEMON = 256, OPT_CHILD };
 
     static const struct option opts[] = {
         {"daemon", no_argument, NULL, OPT_DAEMON},
+        {"child", no_argument, NULL, OPT_CHILD},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -913,6 +952,9 @@ static int parse_args(int argc, char *argv[]) {
         case OPT_DAEMON:
             cfg_daemon = true;
             break;
+        case OPT_CHILD:
+            cfg_child = true;
+            break;
         case 'h':
             usage(argv[0]);
             exit(0);
@@ -920,6 +962,10 @@ static int parse_args(int argc, char *argv[]) {
             usage(argv[0]);
             return -EINVAL;
         }
+    }
+    if (cfg_daemon && cfg_child) {
+        fprintf(stderr, "defused: --daemon and --child are exclusive\n");
+        return -EINVAL;
     }
     return 0;
 }
@@ -996,7 +1042,7 @@ static int run_fork_daemon(void) {
             struct sigaction dfl = {.sa_handler = SIG_DFL};
             sigemptyset(&dfl.sa_mask);
             (void)sigaction(SIGCHLD, &dfl, NULL);
-            _exit(handle_connection(TAKE_FD(conn)));
+            _exit(handle_connection(TAKE_FD(conn), false));
         }
         live_children++;
     }

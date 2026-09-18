@@ -28,6 +28,7 @@ let
     non-lazy-unmount = ./non-lazy-unmount.nix;
     polkit = ./polkit.nix;
     apparmor = ./apparmor.nix;
+    privileged = ./privileged.nix;
   };
 
   # "linux-6_12": stable across point releases.

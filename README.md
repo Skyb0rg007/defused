@@ -41,6 +41,7 @@ Defused requires Linux 6.5 or later, for `SO_PEERPIDFD`. To authorize
 unmounts, the service resolves a client's pidfd to its pid with the
 `PIDFD_GET_INFO` ioctl on Linux 6.13 or later, and falls back to the `Pid:`
 line of `/proc/self/fdinfo/<pidfd>` on older kernels.
+Privileged callers (see below) have neither requirement.
 
 ## Project structure
 
@@ -55,10 +56,11 @@ For testing or on systems without systemd, `defused --daemon` can be used
 to create the Varlink socket and fork off child processes to handle
 accepted connections.
 
-Root callers are delegated directly to libfuse's `fusermount3`, since they do
-not need the unprivileged service path.
-This means libfuse's `fusermount3` should still be installed, just not in
-`/usr/bin` (ex. `/usr/lib/fuse3/fusermount3`).
+A caller that is root or holds `CAP_SYS_ADMIN` does not need the service:
+`fusermount3` instead spawns `defused --child`, which performs the request
+with the caller's own privileges and none of the service's policy (no polkit,
+no mountpoint ownership rule, no filesystem-type allowlist).
+libfuse's own `fusermount3` is therefore not needed at all.
 
 ## Mountpoint ownership model
 

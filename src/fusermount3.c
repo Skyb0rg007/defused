@@ -22,7 +22,9 @@
 #include <getopt.h>
 #include <libgen.h>
 #include <limits.h>
+#include <linux/capability.h>
 #include <signal.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -45,8 +47,8 @@
 #define DEFUSED_VERSION "unknown"
 #endif
 
-#ifndef LIBFUSE_FUSERMOUNT3
-#define LIBFUSE_FUSERMOUNT3 "fusermount3"
+#ifndef DEFUSED_PATH
+#define DEFUSED_PATH "/usr/lib/defused/defused"
 #endif
 
 /* This table is copied from libfuse */
@@ -123,20 +125,17 @@ static int parse_u32(const char *s, unsigned len, const char *pfx,
 static noreturn void usage(void) __attribute__((__noreturn__));
 static noreturn void die(const char *fmt, ...)
     __attribute__((__noreturn__, __format__(__printf__, 1, 2)));
-static bool caller_is_root(void);
+static bool caller_is_privileged(void);
 
 static const char *progname;
 static bool quiet;
 static bool auto_unmount;
+static bool privileged;
 
 int main(int argc, char *argv[]) {
     progname = argc > 0 ? argv[0] : "fusermount3";
 
-    if (caller_is_root()) {
-        execv(LIBFUSE_FUSERMOUNT3, argv);
-        die("cannot execute libfuse helper %s: %s", LIBFUSE_FUSERMOUNT3,
-            strerror(errno));
-    }
+    privileged = caller_is_privileged();
 
     bool unmount = false;
     bool lazy = false;
@@ -222,7 +221,6 @@ int main(int argc, char *argv[]) {
                 cfd);
         return EXIT_FAILURE;
     }
-
     if (!setup_auto_unmount_only) {
         if (do_mount(mnt, opts, cfd) < 0)
             return EXIT_FAILURE;
@@ -232,13 +230,17 @@ int main(int argc, char *argv[]) {
     return wait_and_auto_unmount(cfd, mnt) < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }
 
-static bool caller_is_root(void) {
+/* A non-root caller keeps CAP_SYS_ADMIN across exec only via the ambient set.
+ */
+static bool caller_is_privileged(void) {
 #ifdef DEFUSED_TEST
     const char *forced_uid = getenv("DEFUSED_TEST_UID");
     if (forced_uid != NULL)
         return strcmp(forced_uid, "0") == 0;
 #endif
-    return getuid() == 0 || geteuid() == 0;
+    return getuid() == 0 || geteuid() == 0 ||
+           prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_SYS_ADMIN, 0, 0) ==
+               0;
 }
 
 static int do_mount(const char *mnt, const char *opts, int cfd) {
@@ -359,16 +361,29 @@ static int wait_and_auto_unmount(int cfd, const char *mnt) {
 }
 
 static int connect_service(sd_varlink **ret) {
-    const char *path = getenv("DEFUSED_SOCKET");
-    if (path == NULL || *path == '\0')
-        path = DEFUSED_SOCKET_PATH;
-
     _cleanup_(sd_varlink_close_unrefp) sd_varlink *link = NULL;
-    int r = sd_varlink_connect_address(&link, path);
-    if (r < 0) {
-        fprintf(stderr, "%s: cannot connect to the defused service at %s: %s\n",
-                progname, path, strerror(-r));
-        return r;
+    int r;
+
+    if (privileged) {
+        char *argv[] = {(char *)"defused", (char *)"--child", NULL};
+        r = sd_varlink_connect_exec(&link, DEFUSED_PATH, argv);
+        if (r < 0) {
+            fprintf(stderr, "%s: cannot spawn %s: %s\n", progname, DEFUSED_PATH,
+                    strerror(-r));
+            return r;
+        }
+    } else {
+        const char *path = getenv("DEFUSED_SOCKET");
+        if (path == NULL || *path == '\0')
+            path = DEFUSED_SOCKET_PATH;
+
+        r = sd_varlink_connect_address(&link, path);
+        if (r < 0) {
+            fprintf(stderr,
+                    "%s: cannot connect to the defused service at %s: %s\n",
+                    progname, path, strerror(-r));
+            return r;
+        }
     }
     r = sd_varlink_set_allow_fd_passing_input(link, true);
     if (r < 0)
@@ -419,8 +434,13 @@ static int transact(uint32_t op, const union defused_req *req, const int *fds,
             SD_JSON_BUILD_PAIR_BOOLEAN("lazy", req->umount.lazy != 0));
     else
         ret = -EINVAL;
-    if (ret < 0)
+    if (ret < 0) {
+        if (!quiet)
+            fprintf(stderr, "%s: %s request to %s failed: %s\n", progname,
+                    op == DEFUSED_OP_MOUNT ? "mount" : "unmount",
+                    privileged ? DEFUSED_PATH : "the service", strerror(-ret));
         return ret;
+    }
 
     if (error_id != NULL) {
         struct defused_error err;
@@ -523,7 +543,7 @@ static int parse_mount_opts(const char *opts, struct defused_mount_req *req) {
             if (ret < 0)
                 return ret;
         } else if (opt_eq(s, len, "blkdev")) {
-            fprintf(stderr, "%s: option blkdev is privileged\n", progname);
+            fprintf(stderr, "%s: option blkdev is not supported\n", progname);
             return -EPERM;
         } else if (opt_eq(s, len, "auto_unmount")) {
             auto_unmount = true;
