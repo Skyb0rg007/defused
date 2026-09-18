@@ -13,7 +13,12 @@ project(
 cc = meson.get_compiler('c')
 seccomp_dep = dependency('libseccomp')
 systemd_dep = dependency('libsystemd')
-libfuse_fusermount3 = find_program(get_option('libfuse_fusermount3'))
+libfuse_fusermount3_opt = get_option('libfuse_fusermount3')
+if libfuse_fusermount3_opt.startswith('/')
+  libfuse_fusermount3_path = libfuse_fusermount3_opt
+else
+  libfuse_fusermount3_path = find_program(libfuse_fusermount3_opt).full_path()
+endif
 
 common_c_args = []
 if cc.has_function('close_range', prefix : '#include <unistd.h>', args : ['-D_GNU_SOURCE'])
@@ -21,7 +26,7 @@ if cc.has_function('close_range', prefix : '#include <unistd.h>', args : ['-D_GN
 endif
 fusermount3_c_args = common_c_args + [
   '-DDEFUSED_VERSION="@0@"'.format(meson.project_version()),
-  '-DLIBFUSE_FUSERMOUNT3="@0@"'.format(libfuse_fusermount3.full_path()),
+  '-DLIBFUSE_FUSERMOUNT3="@0@"'.format(libfuse_fusermount3_path),
 ]
 
 sandbox_lib = static_library(
