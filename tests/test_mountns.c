@@ -56,6 +56,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sched.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -100,17 +101,12 @@ static int map_root(uid_t real_uid, gid_t real_gid) {
 
     char buf[64];
     int len = snprintf(buf, sizeof(buf), "0 %d 1\n", (int)real_uid);
-    if (write_file("/proc/self/uid_map", buf, (size_t)len) < 0) {
-        perror("write uid_map");
-        _exit(1);
-    }
+    int ret = write_file("/proc/self/uid_map", buf, (size_t)len);
+    if (ret < 0)
+        return ret;
 
     len = snprintf(buf, sizeof(buf), "0 %d 1\n", (int)real_gid);
-    if (write_file("/proc/self/gid_map", buf, (size_t)len) < 0) {
-        perror("write gid_map");
-        _exit(1);
-    }
-    return 0;
+    return write_file("/proc/self/gid_map", buf, (size_t)len);
 }
 
 /* A temporary directory holding a private, intentionally non-FUSE bind
@@ -240,6 +236,21 @@ static int connect_addr(const struct sockaddr_un *sa, socklen_t len) {
     return TAKE_FD(fd);
 }
 
+/* A client that dies before connecting would otherwise leave accept()
+ * blocked for the rest of the test. */
+static int accept_client(int listen_fd) {
+    struct pollfd pfd = {.fd = listen_fd, .events = POLLIN};
+    int n = poll(&pfd, 1, 30000);
+    if (n < 0)
+        return -errno;
+    if (n == 0) {
+        fprintf(stderr, "FAIL: client never connected\n");
+        return -ETIMEDOUT;
+    }
+    int conn = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
+    return conn == -1 ? -errno : conn;
+}
+
 /* Runs @defused_path against @conn_fd, handed over via the same
  * $LISTEN_PID/$LISTEN_FDS protocol systemd's Accept=yes uses. */
 static int spawn_defused(const char *defused_path, int conn_fd,
@@ -295,7 +306,10 @@ static int test_can_join(const char *defused_path) {
             perror("unshare(NEWUSER|NEWNS)");
             _exit(1);
         }
-        (void)map_root(real_uid, real_gid);
+        if (map_root(real_uid, real_gid) < 0) {
+            perror("map root");
+            _exit(1);
+        }
 
         struct sockaddr_un sa;
         socklen_t salen;
@@ -327,11 +341,9 @@ static int test_can_join(const char *defused_path) {
                     : 1);
         }
 
-        _cleanup_close_ int conn = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
-        if (conn == -1) {
-            perror("accept");
+        _cleanup_close_ int conn = accept_client(listen_fd);
+        if (conn < 0)
             _exit(1);
-        }
         pid_t defused_pid;
         if (spawn_defused(defused_path, conn, &defused_pid) < 0)
             _exit(1);
@@ -387,7 +399,10 @@ static int test_cannot_join(const char *defused_path) {
             perror("unshare(NEWUSER|NEWNS)");
             _exit(1);
         }
-        (void)map_root(real_uid, real_gid);
+        if (map_root(real_uid, real_gid) < 0) {
+            perror("map root");
+            _exit(1);
+        }
         int client_sock = connect_addr(&sa, salen);
         if (client_sock < 0)
             _exit(1);
@@ -402,10 +417,11 @@ static int test_cannot_join(const char *defused_path) {
         _exit(accepted ? 0 : 1);
     }
 
-    _cleanup_close_ int conn = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
-    if (conn == -1) {
-        perror("accept");
-        _exit(1);
+    _cleanup_close_ int conn = accept_client(listen_fd);
+    if (conn < 0) {
+        CHECK(conn >= 0);
+        waitpid(client, NULL, 0);
+        return conn;
     }
     pid_t defused_pid;
     if (spawn_defused(defused_path, conn, &defused_pid) < 0)
@@ -429,15 +445,21 @@ static int test_cannot_join(const char *defused_path) {
 /* Meson reads 77 as a skip. */
 #define MESON_EXIT_SKIP 77
 
-/* Both tests below need a nested user namespace. */
+/* Both tests below need a nested user namespace they can map themselves
+ * root in; under AppArmor's unprivileged-userns restriction the unshare()
+ * succeeds but the uid_map write does not. */
 static int userns_available(void) {
+    uid_t real_uid = getuid();
+    gid_t real_gid = getgid();
+
     pid_t pid = fork();
     if (pid < 0)
         return -errno;
     if (pid == 0) {
         if (unshare(CLONE_NEWUSER | CLONE_NEWNS) == -1)
             _exit(errno ? errno : EPERM);
-        _exit(0);
+        int ret = map_root(real_uid, real_gid);
+        _exit(ret < 0 ? -ret : 0);
     }
 
     int status;
@@ -456,9 +478,9 @@ int main(int argc, char *argv[]) {
     int ret = userns_available();
     if (ret < 0) {
         fprintf(stderr,
-                "SKIP: unshare(CLONE_NEWUSER|CLONE_NEWNS) is unavailable "
-                "here (%s); this test needs it to place the client and the "
-                "service in namespaces of its own\n",
+                "SKIP: cannot create a mapped user namespace here (%s); "
+                "this test needs one to place the client and the service in "
+                "namespaces of its own\n",
                 strerror(-ret));
         return MESON_EXIT_SKIP;
     }
