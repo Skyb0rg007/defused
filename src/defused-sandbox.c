@@ -338,14 +338,15 @@ static int mountinfo_feed(struct mountinfo_parser *parser, char ch) {
     return -EINVAL;
 }
 
-/* Linux 6.13+. */
+/* Linux 6.13+. ENODATA, not EINVAL, for a useless reply: EINVAL means the
+ * kernel lacks the ioctl (see pidfd_to_pid()). */
 static pid_t pidfd_to_pid_ioctl(int pidfd) {
     struct pidfd_info info = {0};
     if (ioctl(pidfd, PIDFD_GET_INFO, &info) == -1)
         return -errno;
     if (!(info.mask & PIDFD_INFO_PID) || info.pid == 0 ||
         info.pid > (unsigned int)INT_MAX)
-        return -EINVAL;
+        return -ENODATA;
     return (pid_t)info.pid;
 }
 
@@ -379,11 +380,13 @@ static pid_t pidfd_to_pid_fdinfo(int pidfd) {
     return fdinfo_pid(f);
 }
 
-/* Kernels before 6.13 fail PIDFD_GET_INFO with ENOTTY. open_peer_mountinfo()
- * below closes the pid-recycling race this alone doesn't. */
+/* Kernels before 6.13 fail PIDFD_GET_INFO with ENOTTY (no pidfd_ioctl()) or
+ * EINVAL (6.11/6.12 reject any ioctl with an argument outright).
+ * open_peer_mountinfo() below closes the pid-recycling race this alone
+ * doesn't. */
 static pid_t pidfd_to_pid(int pidfd) {
     pid_t pid = pidfd_to_pid_ioctl(pidfd);
-    if (pid == -ENOTTY)
+    if (pid == -ENOTTY || pid == -EINVAL)
         pid = pidfd_to_pid_fdinfo(pidfd);
     return pid;
 }
