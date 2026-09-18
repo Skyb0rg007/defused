@@ -52,6 +52,7 @@
  * packaging/nixos/tests/mount-namespace.nix instead.
  */
 #define _GNU_SOURCE
+#include "common.h"
 #include "defused_proto.h"
 
 #include <errno.h>
@@ -85,30 +86,73 @@ static int failures;
  * unshare(CLONE_NEWUSER)'d into -- the standard rootless-container dance.
  * @real_uid/@real_gid must be captured *before* unshare(), since getuid()
  * inside an unmapped new user namespace reads back as the overflow uid. */
+static int write_file(const char *path, const char *buf, size_t len) {
+    _cleanup_close_ int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -errno;
+    if (write(fd, buf, len) != (ssize_t)len)
+        return -errno;
+    return 0;
+}
+
 static int map_root(uid_t real_uid, gid_t real_gid) {
-    int fd = open("/proc/self/setgroups", O_WRONLY);
-    if (fd >= 0) {
-        if (write(fd, "deny", 4) < 0) { /* best-effort on old kernels */
-        }
-        close(fd);
-    }
+    /* best-effort on old kernels */
+    (void)write_file("/proc/self/setgroups", "deny", 4);
 
     char buf[64];
     int len = snprintf(buf, sizeof(buf), "0 %d 1\n", (int)real_uid);
-    fd = open("/proc/self/uid_map", O_WRONLY);
-    if (fd < 0 || write(fd, buf, len) != len) {
+    if (write_file("/proc/self/uid_map", buf, (size_t)len) < 0) {
         perror("write uid_map");
         _exit(1);
     }
-    close(fd);
 
     len = snprintf(buf, sizeof(buf), "0 %d 1\n", (int)real_gid);
-    fd = open("/proc/self/gid_map", O_WRONLY);
-    if (fd < 0 || write(fd, buf, len) != len) {
+    if (write_file("/proc/self/gid_map", buf, (size_t)len) < 0) {
         perror("write gid_map");
         _exit(1);
     }
-    close(fd);
+    return 0;
+}
+
+/* A temporary directory holding a private, intentionally non-FUSE bind
+ * mount at <dir>/target, torn down when it goes out of scope. */
+struct scratch_mount {
+    char dir[sizeof("/tmp/defused-mountns-XXXXXX")];
+    char target[sizeof("/tmp/defused-mountns-XXXXXX") + sizeof("/target")];
+    bool have_dir;
+    bool have_target;
+    bool mounted;
+};
+
+static void scratch_mount_done(struct scratch_mount *m) {
+    if (m->mounted)
+        umount2(m->target, MNT_DETACH);
+    if (m->have_target)
+        rmdir(m->target);
+    if (m->have_dir)
+        rmdir(m->dir);
+}
+
+static int scratch_mount_create(struct scratch_mount *m) {
+    strcpy(m->dir, "/tmp/defused-mountns-XXXXXX");
+    if (mkdtemp(m->dir) == NULL) {
+        perror("mkdtemp");
+        return -errno;
+    }
+    m->have_dir = true;
+
+    snprintf(m->target, sizeof(m->target), "%s/target", m->dir);
+    if (mkdir(m->target, 0700) == -1) {
+        perror("mkdir target");
+        return -errno;
+    }
+    m->have_target = true;
+
+    if (mount(m->target, m->target, NULL, MS_BIND, NULL) == -1) {
+        perror("bind mount target");
+        return -errno;
+    }
+    m->mounted = true;
     return 0;
 }
 
@@ -117,78 +161,47 @@ static int map_root(uid_t real_uid, gid_t real_gid) {
  * DEFUSED_ERR_NOT_A_FUSE_MOUNT; a service that cannot enter it should fail
  * earlier with DEFUSED_ERR_SETNS_FAILED. In this unprivileged harness both
  * are instead expected to be turned away even earlier, by polkit -- see
- * the file-level comment above. */
-static int send_non_fuse_umount_request(int sock) {
-    char dir_template[] = "/tmp/defused-mountns-XXXXXX";
-    char *dir = mkdtemp(dir_template);
-    if (!dir) {
-        perror("mkdtemp");
-        return -errno;
-    }
-
-    char target[sizeof(dir_template) + sizeof("/target")];
-    snprintf(target, sizeof(target), "%s/target", dir);
-    if (mkdir(target, 0700) == -1) {
-        int ret = -errno;
-        perror("mkdir target");
-        rmdir(dir);
+ * the file-level comment above. Takes ownership of sock_fd. */
+static int send_non_fuse_umount_request(int sock_fd) {
+    _cleanup_close_ int sock = sock_fd;
+    _cleanup_(scratch_mount_done) struct scratch_mount scratch = {};
+    int ret = scratch_mount_create(&scratch);
+    if (ret < 0)
         return ret;
-    }
 
-    if (mount(target, target, NULL, MS_BIND, NULL) == -1) {
-        int ret = -errno;
-        perror("bind mount target");
-        rmdir(target);
-        rmdir(dir);
-        return ret;
-    }
-
-    int parent_fd = open(dir, O_PATH | O_DIRECTORY | O_CLOEXEC);
+    _cleanup_close_ int parent_fd =
+        open(scratch.dir, O_PATH | O_DIRECTORY | O_CLOEXEC);
     if (parent_fd < 0) {
-        int ret = -errno;
+        ret = -errno;
         perror("open parent");
-        umount2(target, MNT_DETACH);
-        rmdir(target);
-        rmdir(dir);
         return ret;
     }
 
-    sd_varlink *link = NULL;
-    sd_json_variant *reply = NULL;
+    _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *link = NULL;
+    _cleanup_(sd_json_variant_unrefp) sd_json_variant *reply = NULL;
     const char *error_id = NULL;
-    int status = -EBADMSG;
-    int ret = sd_varlink_connect_fd(&link, sock);
-    if (ret < 0) {
-        status = ret;
-        goto out;
-    }
-    sock = -1;
+    ret = sd_varlink_connect_fd(&link, sock);
+    if (ret < 0)
+        return ret;
+    TAKE_FD(sock);
     ret = sd_varlink_set_allow_fd_passing_input(link, true);
-    if (ret < 0) {
-        status = ret;
-        goto out;
-    }
+    if (ret < 0)
+        return ret;
     ret = sd_varlink_set_allow_fd_passing_output(link, true);
-    if (ret < 0) {
-        status = ret;
-        goto out;
-    }
+    if (ret < 0)
+        return ret;
     ret = sd_varlink_push_dup_fd(link, parent_fd);
-    if (ret < 0) {
-        status = ret;
-        goto out;
-    }
+    if (ret < 0)
+        return ret;
     ret = sd_varlink_callbo(
         link, DEFUSED_VARLINK_METHOD_UNMOUNT, &reply, &error_id,
         SD_JSON_BUILD_PAIR_UNSIGNED("parentFileDescriptor", 0),
         SD_JSON_BUILD_PAIR_STRING("name", "target"),
         SD_JSON_BUILD_PAIR_BOOLEAN("lazy", true));
-    if (ret < 0) {
-        status = ret;
-        goto out;
-    }
+    if (ret < 0)
+        return ret;
     if (error_id != NULL)
-        goto out;
+        return -EBADMSG;
 
     struct defused_resp parsed = {0};
     static const sd_json_dispatch_field dispatch_table[] = {
@@ -199,25 +212,12 @@ static int send_non_fuse_umount_request(int sock) {
         {},
     };
     ret = sd_json_dispatch(reply, dispatch_table, 0, &parsed);
-    if (ret < 0) {
-        status = ret;
-        goto out;
-    }
+    if (ret < 0)
+        return ret;
     if (parsed.status == DEFUSED_ERR_SETNS_FAILED)
         fprintf(stderr, "(setns failed, sys_errno=%d: %s)\n", parsed.sys_errno,
                 strerror(parsed.sys_errno));
-    status = (int)parsed.status;
-
-out:
-    sd_json_variant_unref(reply);
-    sd_varlink_flush_close_unref(link);
-    if (sock >= 0)
-        close(sock);
-    close(parent_fd);
-    umount2(target, MNT_DETACH);
-    rmdir(target);
-    rmdir(dir);
-    return status;
+    return (int)parsed.status;
 }
 
 static int abstract_addr(struct sockaddr_un *sa, socklen_t *len,
@@ -237,22 +237,22 @@ static int listen_addr(struct sockaddr_un *sa, socklen_t *len,
     if (ret < 0)
         return ret;
 
-    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    _cleanup_close_ int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd == -1 || bind(fd, (struct sockaddr *)sa, *len) == -1 ||
         listen(fd, 1) == -1) {
         perror("listen");
         return -errno;
     }
-    return fd;
+    return TAKE_FD(fd);
 }
 
 static int connect_addr(const struct sockaddr_un *sa, socklen_t len) {
-    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    _cleanup_close_ int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd == -1 || connect(fd, (const struct sockaddr *)sa, len) == -1) {
         perror("connect");
         return -errno;
     }
-    return fd;
+    return TAKE_FD(fd);
 }
 
 /* Runs @defused_path against @conn_fd, handed over via the same
@@ -294,7 +294,7 @@ static int test_can_join(const char *defused_path) {
     uid_t real_uid = getuid();
     gid_t real_gid = getgid();
 
-    int result_pipe[2];
+    _cleanup_close_pair_ int result_pipe[2] = EBADF_PAIR;
     if (pipe(result_pipe) == -1) {
         perror("pipe");
         return -errno;
@@ -304,7 +304,7 @@ static int test_can_join(const char *defused_path) {
     if (outer < 0)
         return -errno;
     if (outer == 0) {
-        close(result_pipe[0]);
+        result_pipe[0] = safe_close(result_pipe[0]);
 
         if (unshare(CLONE_NEWUSER | CLONE_NEWNS) == -1) {
             perror("unshare(NEWUSER|NEWNS)");
@@ -314,13 +314,13 @@ static int test_can_join(const char *defused_path) {
 
         struct sockaddr_un sa;
         socklen_t salen;
-        int listen_fd = listen_addr(&sa, &salen, "can");
+        _cleanup_close_ int listen_fd = listen_addr(&sa, &salen, "can");
         if (listen_fd < 0)
             _exit(1);
 
         pid_t inner = fork();
         if (inner == 0) {
-            close(result_pipe[1]);
+            result_pipe[1] = safe_close(result_pipe[1]);
             /* Namespace B: a plain CLONE_NEWNS, no new user namespace, so it
              * stays inside A and defused (also in A) has CAP_SYS_ADMIN over
              * it -- but it is still a genuinely distinct mount namespace. */
@@ -332,14 +332,13 @@ static int test_can_join(const char *defused_path) {
             if (client_sock < 0)
                 _exit(1);
             int status = send_non_fuse_umount_request(client_sock);
-            close(client_sock);
             _exit(status == DEFUSED_ERR_NOT_A_FUSE_MOUNT ||
                           status == DEFUSED_ERR_UNMOUNT_FAILED
                       ? 0
                       : 1);
         }
 
-        int conn = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
+        _cleanup_close_ int conn = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
         if (conn == -1) {
             perror("accept");
             _exit(1);
@@ -347,8 +346,8 @@ static int test_can_join(const char *defused_path) {
         pid_t defused_pid;
         if (spawn_defused(defused_path, conn, &defused_pid) < 0)
             _exit(1);
-        close(conn);
-        close(listen_fd);
+        conn = safe_close(conn);
+        listen_fd = safe_close(listen_fd);
 
         int inner_status;
         waitpid(inner, &inner_status, 0);
@@ -359,14 +358,13 @@ static int test_can_join(const char *defused_path) {
 
         char byte = ok ? 1 : 0;
         write(result_pipe[1], &byte, 1);
-        close(result_pipe[1]);
+        result_pipe[1] = safe_close(result_pipe[1]);
         _exit(0);
     }
 
-    close(result_pipe[1]);
+    result_pipe[1] = safe_close(result_pipe[1]);
     char byte = 0;
     ssize_t n = read(result_pipe[0], &byte, 1);
-    close(result_pipe[0]);
     waitpid(outer, NULL, 0);
 
     CHECK(n == 1);
@@ -387,7 +385,7 @@ static int test_can_join(const char *defused_path) {
 static int test_cannot_join(const char *defused_path) {
     struct sockaddr_un sa;
     socklen_t salen;
-    int listen_fd = listen_addr(&sa, &salen, "cannot");
+    _cleanup_close_ int listen_fd = listen_addr(&sa, &salen, "cannot");
     if (listen_fd < 0)
         return listen_fd;
 
@@ -406,7 +404,6 @@ static int test_cannot_join(const char *defused_path) {
         if (client_sock < 0)
             _exit(1);
         int status = send_non_fuse_umount_request(client_sock);
-        close(client_sock);
         bool accepted = status == DEFUSED_ERR_SETNS_FAILED ||
                         status == DEFUSED_ERR_UNMOUNT_FAILED;
         if (!accepted)
@@ -419,7 +416,7 @@ static int test_cannot_join(const char *defused_path) {
         _exit(accepted ? 0 : 1);
     }
 
-    int conn = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
+    _cleanup_close_ int conn = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
     if (conn == -1) {
         perror("accept");
         _exit(1);
@@ -427,8 +424,8 @@ static int test_cannot_join(const char *defused_path) {
     pid_t defused_pid;
     if (spawn_defused(defused_path, conn, &defused_pid) < 0)
         return -errno;
-    close(conn);
-    close(listen_fd);
+    conn = safe_close(conn);
+    listen_fd = safe_close(listen_fd);
 
     int client_status;
     waitpid(client, &client_status, 0);

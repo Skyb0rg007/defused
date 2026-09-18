@@ -36,6 +36,18 @@ This will build the project, run the normal tests, and then also
 run the NixOS VM test suite (in `packaging/nixos/tests/`).
 It will also run `reuse lint` to ensure that all files have SPDX headers.
 
+## Coding style
+
+C code follows the systemd coding style for resource management: a resource
+is released by a `_cleanup_` attribute on the variable holding it, not by a
+`goto out` label. `src/common.h` provides `_cleanup_close_`,
+`_cleanup_free_`, `_cleanup_fclose_`, `_cleanup_close_pair_`, and
+`DEFINE_TRIVIAL_CLEANUP_FUNC()` for other release functions; libsystemd's own
+`*_unrefp` helpers work with `_cleanup_()` directly. Hand a resource off with
+`TAKE_FD()`/`TAKE_PTR()`, close one early with `fd = safe_close(fd);`, and
+initialize unset fds to `-EBADF`. `src/util.c` is copied from libfuse and
+keeps libfuse's style instead.
+
 ## Formatting and licensing
 
 `treefmt` runs `clang-format` and `nixfmt` to format the code.

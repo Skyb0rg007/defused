@@ -22,6 +22,7 @@
  *    the configured libfuse helper before parsing it.
  */
 #define _GNU_SOURCE
+#include "common.h"
 #include "defused_proto.h"
 
 #include <errno.h>
@@ -178,19 +179,17 @@ static int method_mount(sd_varlink *link, sd_json_variant *parameters,
     CHECK(strcmp(p.fsname, "test,fs") == 0);
     CHECK(strcmp(p.subtype, "mem,fs") == 0);
 
-    int fuse_fd = sd_varlink_take_fd(link, p.fuse_fd_index);
+    _cleanup_close_ int fuse_fd = sd_varlink_take_fd(link, p.fuse_fd_index);
     CHECK(fuse_fd >= 0);
     struct stat fuse_in_st;
     CHECK(fstat(fuse_fd, &fuse_in_st) == 0 && S_ISCHR(fuse_in_st.st_mode));
-    close(fuse_fd);
 
-    int mnt_fd = sd_varlink_take_fd(link, p.mnt_fd_index);
+    _cleanup_close_ int mnt_fd = sd_varlink_take_fd(link, p.mnt_fd_index);
     CHECK(mnt_fd >= 0);
     struct stat fd_st, dot_st;
     CHECK(fstat(mnt_fd, &fd_st) == 0 && stat(".", &dot_st) == 0);
     CHECK(S_ISDIR(fd_st.st_mode));
     CHECK(fd_st.st_dev == dot_st.st_dev && fd_st.st_ino == dot_st.st_ino);
-    close(mnt_fd);
 
     return reply_status(link, DEFUSED_OK);
 }
@@ -223,20 +222,21 @@ static int method_unmount(sd_varlink *link, sd_json_variant *parameters,
     CHECK(sd_varlink_get_n_fds(link) == 1);
     CHECK(p.lazy);
     CHECK(strcmp(p.name, expect->name) == 0);
-    int parent_fd = sd_varlink_take_fd(link, p.parent_fd_index);
+    _cleanup_close_ int parent_fd = sd_varlink_take_fd(link, p.parent_fd_index);
     CHECK(parent_fd >= 0);
     struct stat fd_st, parent_st;
     CHECK(fstat(parent_fd, &fd_st) == 0 &&
           stat(expect->parent, &parent_st) == 0);
     CHECK(fd_st.st_dev == parent_st.st_dev && fd_st.st_ino == parent_st.st_ino);
-    close(parent_fd);
     return reply_status(link, DEFUSED_ERR_NOT_A_FUSE_MOUNT);
 }
 
-static int serve_connection(int conn, sd_varlink_method_t method,
+/* Serves one accepted connection to completion. Takes ownership of conn_fd. */
+static int serve_connection(int conn_fd, sd_varlink_method_t method,
                             void *userdata) {
-    sd_event *event = NULL;
-    sd_varlink_server *server = NULL;
+    _cleanup_close_ int conn = conn_fd;
+    _cleanup_(sd_event_unrefp) sd_event *event = NULL;
+    _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *server = NULL;
     int ret = sd_event_new(&event);
     if (ret < 0)
         return ret;
@@ -244,39 +244,32 @@ static int serve_connection(int conn, sd_varlink_method_t method,
                                 SD_VARLINK_SERVER_ALLOW_FD_PASSING_INPUT |
                                     SD_VARLINK_SERVER_INHERIT_USERDATA);
     if (ret < 0)
-        goto out;
+        return ret;
     ret = sd_varlink_server_add_interface(server,
                                           &vl_interface_website_soss_defused);
     if (ret < 0)
-        goto out;
+        return ret;
     ret = sd_varlink_server_bind_method_many(
         server, DEFUSED_VARLINK_METHOD_MOUNT, method,
         DEFUSED_VARLINK_METHOD_UNMOUNT, method);
     if (ret < 0)
-        goto out;
+        return ret;
     sd_varlink_server_set_userdata(server, userdata);
     ret = sd_varlink_server_set_exit_on_idle(server, true);
     if (ret < 0)
-        goto out;
+        return ret;
     ret = sd_varlink_server_attach_event(server, event, 0);
     if (ret < 0)
-        goto out;
+        return ret;
     ret = sd_varlink_server_add_connection(server, conn, NULL);
     if (ret < 0)
-        goto out;
-    conn = -1;
-    ret = sd_event_loop(event);
-
-out:
-    if (conn >= 0)
-        close(conn);
-    sd_varlink_server_unref(server);
-    sd_event_unref(event);
-    return ret;
+        return ret;
+    TAKE_FD(conn);
+    return sd_event_loop(event);
 }
 
 static int test_mount(const char *client, int listen_fd) {
-    int comm[2];
+    _cleanup_close_pair_ int comm[2] = EBADF_PAIR;
     CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, comm) == 0);
 
     char *args[] = {
@@ -288,17 +281,17 @@ static int test_mount(const char *client, int listen_fd) {
     };
     pid_t pid;
     CHECK(spawn_client(client, comm[1], args, 3, &pid) == 0);
-    close(comm[1]);
+    comm[1] = safe_close(comm[1]);
 
-    int conn = accept(listen_fd, NULL, NULL);
+    _cleanup_close_ int conn = accept(listen_fd, NULL, NULL);
     CHECK(conn >= 0);
 
     /* Play the service's success path. The client already opened the device
      * fd it sent to the service, so the response carries no fd. */
-    CHECK(serve_connection(conn, method_mount, NULL) == 0);
+    CHECK(serve_connection(TAKE_FD(conn), method_mount, NULL) == 0);
 
     char byte = 0x7f;
-    int fuse_fd;
+    _cleanup_close_ int fuse_fd = -EBADF;
     ssize_t n = -1;
     CHECK(recv_with_fd(comm[0], &byte, 1, &n, &fuse_fd) == 0);
     CHECK(n == 1);
@@ -306,8 +299,6 @@ static int test_mount(const char *client, int listen_fd) {
     CHECK(fuse_fd >= 0);
     struct stat fuse_st;
     CHECK(fstat(fuse_fd, &fuse_st) == 0 && S_ISCHR(fuse_st.st_mode));
-    close(fuse_fd);
-    close(comm[0]);
 
     CHECK(wait_exit_code(pid) == 0);
     return failures ? -EINVAL : 0;
@@ -320,8 +311,8 @@ static int test_unmount(const char *client, int listen_fd) {
      * hence its realpath(".")) is this process's cwd. */
     char cwd[PATH_MAX];
     CHECK(getcwd(cwd, sizeof(cwd)) != NULL);
-    char *dir_copy = strdup(cwd);
-    char *base_copy = strdup(cwd);
+    _cleanup_free_ char *dir_copy = strdup(cwd);
+    _cleanup_free_ char *base_copy = strdup(cwd);
     CHECK(dir_copy != NULL && base_copy != NULL);
     const char *expect_parent = dirname(dir_copy);
     const char *expect_name = basename(base_copy);
@@ -330,7 +321,7 @@ static int test_unmount(const char *client, int listen_fd) {
     pid_t pid;
     CHECK(spawn_client(client, -1, args, 3, &pid) == 0);
 
-    int conn = accept(listen_fd, NULL, NULL);
+    _cleanup_close_ int conn = accept(listen_fd, NULL, NULL);
     CHECK(conn >= 0);
 
     /* The received fd must be the *parent* directory, never the mountpoint
@@ -342,9 +333,7 @@ static int test_unmount(const char *client, int listen_fd) {
         const char *parent;
         const char *name;
     } expect = {.parent = expect_parent, .name = expect_name};
-    CHECK(serve_connection(conn, method_unmount, &expect) == 0);
-    free(dir_copy);
-    free(base_copy);
+    CHECK(serve_connection(TAKE_FD(conn), method_unmount, &expect) == 0);
 
     CHECK(wait_exit_code(pid) == 1);
     return failures ? -EINVAL : 0;
@@ -386,7 +375,8 @@ int main(int argc, char *argv[]) {
 
     struct sockaddr_un sa = {.sun_family = AF_UNIX};
     strcpy(sa.sun_path, sock_path);
-    int listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    _cleanup_close_ int listen_fd =
+        socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (listen_fd < 0 || bind(listen_fd, (struct sockaddr *)&sa, sizeof(sa)) ||
         listen(listen_fd, 2)) {
         perror("listen socket");
@@ -397,7 +387,6 @@ int main(int argc, char *argv[]) {
     (void)test_mount(argv[1], listen_fd);
     (void)test_unmount(argv[1], listen_fd);
 
-    close(listen_fd);
     unlink(sock_path);
     rmdir(dir);
     unsetenv("DEFUSED_TEST_UID");
