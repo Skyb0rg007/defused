@@ -66,6 +66,9 @@ install_data(
 
 ## Tests ##
 
+# Backstop above each test's own alarm() (see tests/test_timeout.h).
+test_timeout = 120
+
 test_protocol_exe = executable(
   'test-protocol',
   'tests/test_protocol.c',
@@ -74,7 +77,7 @@ test_protocol_exe = executable(
   include_directories : include_directories('src'),
 )
 
-test('protocol', test_protocol_exe, args : [defused_exe])
+test('protocol', test_protocol_exe, args : [defused_exe], timeout : test_timeout)
 
 test_client_exe = executable(
   'test-client',
@@ -97,7 +100,7 @@ test_fusermount3_exe = executable(
   dependencies : [systemd_dep],
 )
 
-test('client', test_client_exe, args : [test_fusermount3_exe])
+test('client', test_client_exe, args : [test_fusermount3_exe], timeout : test_timeout)
 
 test_mountns_exe = executable(
   'test-mountns',
@@ -107,7 +110,7 @@ test_mountns_exe = executable(
   include_directories : include_directories('src'),
 )
 
-test('mountns', test_mountns_exe, args : [defused_exe])
+test('mountns', test_mountns_exe, args : [defused_exe], timeout : test_timeout)
 
 test_sandbox_exe = executable(
   'test-sandbox',
@@ -118,4 +121,4 @@ test_sandbox_exe = executable(
   include_directories : include_directories('src'),
 )
 
-test('sandbox', test_sandbox_exe)
+test('sandbox', test_sandbox_exe, timeout : test_timeout)

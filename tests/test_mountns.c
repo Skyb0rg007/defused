@@ -52,6 +52,7 @@
 #define _GNU_SOURCE
 #include "common.h"
 #include "defused_proto.h"
+#include "test_timeout.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -450,6 +451,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "usage: %s /path/to/defused\n", argv[0]);
         return 2;
     }
+    test_set_timeout();
 
     int ret = userns_available();
     if (ret < 0) {

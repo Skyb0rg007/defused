@@ -30,6 +30,10 @@ as a skip rather than a pass: `mountns` needs nested user namespaces,
 `/dev/null`. A skip means that case was not checked at all, so a change to
 those areas still wants a run somewhere they are available.
 
+Every test bounds its own runtime with `alarm()` (see `tests/test_timeout.h`)
+and has a Meson timeout above that, so a hang fails the test instead of
+running until CI kills the job.
+
 Before considering a change verified, run the full check, not just
 `meson test`:
 
