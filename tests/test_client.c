@@ -46,6 +46,9 @@ static int failures;
 
 #define FALLBACK_EXIT_STATUS 42
 
+/* Meson reads 77 as a skip. */
+#define MESON_EXIT_SKIP 77
+
 #define CHECK(cond)                                                            \
     do {                                                                       \
         if (!(cond)) {                                                         \
@@ -346,6 +349,17 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "usage: %s /path/to/fusermount3\n", argv[0]);
         return 2;
     }
+
+    /* spawn_client() hands the client /dev/null as the FUSE device. */
+    int devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
+    if (devnull < 0) {
+        fprintf(stderr,
+                "SKIP: /dev/null is not usable as a stand-in FUSE device "
+                "here (%s)\n",
+                strerror(errno));
+        return MESON_EXIT_SKIP;
+    }
+    (void)safe_close(devnull);
 
     (void)test_root_fallback(argv[1]);
     setenv("DEFUSED_TEST_UID", "1", 1);

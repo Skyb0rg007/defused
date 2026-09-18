@@ -48,6 +48,35 @@ static int read_full(int fd, void *buf, size_t size) {
     return 0;
 }
 
+/* Meson reads 77 as a skip. */
+#define MESON_EXIT_SKIP 77
+
+/* Probes in a child so the filter never lands on the test process. */
+static int seccomp_available(void) {
+    _cleanup_close_pair_ int pipefd[2] = EBADF_PAIR;
+    if (pipe2(pipefd, O_CLOEXEC) == -1)
+        return -errno;
+
+    pid_t pid = fork();
+    if (pid < 0)
+        return -errno;
+    if (pid == 0) {
+        pipefd[0] = safe_close(pipefd[0]);
+        int install_ret = defused_test_install_seccomp(DEFUSED_OP_MOUNT);
+        (void)syscall(SYS_write, pipefd[1], &install_ret, sizeof(install_ret));
+        (void)syscall(SYS_exit_group, 0);
+        for (;;)
+            (void)syscall(SYS_exit, 1);
+    }
+
+    pipefd[1] = safe_close(pipefd[1]);
+    int install_ret = 0;
+    int ret = read_full(pipefd[0], &install_ret, sizeof(install_ret));
+    if (waitpid(pid, NULL, 0) != pid)
+        return -ECHILD;
+    return ret < 0 ? ret : install_ret;
+}
+
 static void test_filter_syscall(enum defused_op op, long syscall_number,
                                 int expected_errno) {
     _cleanup_close_pair_ int pipefd[2] = EBADF_PAIR;
@@ -186,6 +215,15 @@ static void test_fdinfo_parser(void) {
 }
 
 int main(void) {
+    int ret = seccomp_available();
+    if (ret < 0) {
+        fprintf(stderr,
+                "SKIP: seccomp filters cannot be installed here (%s); this "
+                "test needs to load the real filters\n",
+                strerror(-ret));
+        return MESON_EXIT_SKIP;
+    }
+
     test_filter_syscall(DEFUSED_OP_MOUNT, SYS_getpid, EPERM);
     test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_getpid, EPERM);
     test_filter_syscall(DEFUSED_OP_MOUNT, SYS_read, EPERM);

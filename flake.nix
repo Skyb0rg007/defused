@@ -39,6 +39,9 @@
           inherit self pkgs system;
         })
         // {
+          # doCheck = true, so building the package runs `meson test`.
+          meson-tests = self.packages.${system}.defused;
+
           reuse-lint = pkgs.runCommand "defused-reuse-lint" { nativeBuildInputs = [ pkgs.reuse ]; } ''
             cd ${src}
             reuse lint
@@ -70,6 +73,8 @@
             mesonFlags = [
               (lib.mesonOption "libfuse_fusermount3" (lib.getExe' pkgs.fuse3 "fusermount3"))
             ];
+
+            doCheck = true;
 
             meta = {
               description = "SETUID-less fusermount3 implementation";

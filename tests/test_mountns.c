@@ -425,10 +425,40 @@ static int test_cannot_join(const char *defused_path) {
     return failures ? -EINVAL : 0;
 }
 
+/* Meson reads 77 as a skip. */
+#define MESON_EXIT_SKIP 77
+
+/* Both tests below need a nested user namespace. */
+static int userns_available(void) {
+    pid_t pid = fork();
+    if (pid < 0)
+        return -errno;
+    if (pid == 0) {
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) == -1)
+            _exit(errno ? errno : EPERM);
+        _exit(0);
+    }
+
+    int status;
+    if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status))
+        return -ECHILD;
+    return WEXITSTATUS(status) == 0 ? 0 : -WEXITSTATUS(status);
+}
+
 int main(int argc, char *argv[]) {
     if (argc != 2) {
         fprintf(stderr, "usage: %s /path/to/defused\n", argv[0]);
         return 2;
+    }
+
+    int ret = userns_available();
+    if (ret < 0) {
+        fprintf(stderr,
+                "SKIP: unshare(CLONE_NEWUSER|CLONE_NEWNS) is unavailable "
+                "here (%s); this test needs it to place the client and the "
+                "service in namespaces of its own\n",
+                strerror(-ret));
+        return MESON_EXIT_SKIP;
     }
 
     (void)test_can_join(argv[1]);
