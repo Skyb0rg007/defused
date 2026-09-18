@@ -41,7 +41,7 @@ Before considering a change verified, run the full check, not just
 nix flake check
 ```
 
-This is what CI runs, and it covers three things:
+This covers three things:
 
 - `checks.<system>.meson-tests` builds the package, which runs `meson test`
   in the Nix build sandbox (the package sets `doCheck = true`).
@@ -51,6 +51,9 @@ This is what CI runs, and it covers three things:
   kernel-version fallbacks are exercised on a kernel that really lacks the
   newer interface.
 - `reuse lint`, to ensure that all files have SPDX headers.
+
+CI runs the first and third, but only evaluates the VM tests rather than
+running them, so this local run is the only thing that exercises them.
 
 Pass `--print-build-logs` (`-L`) to see the Meson test output as it runs;
 without it a passing build prints nothing.

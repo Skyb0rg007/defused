@@ -17,8 +17,10 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
+            system: x86_64-linux
             system-features: benchmark big-parallel nixos-test uid-range kvm
           - os: ubuntu-24.04-arm
+            system: aarch64-linux
             system-features: benchmark big-parallel nixos-test uid-range
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -30,12 +32,13 @@ jobs:
         with:
           name: defused
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-      - name: Run full Nix checks
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          nix flake check --option keep-going true
-      - name: Evaluate flake and build native ARM checks
-        if: matrix.os == 'ubuntu-24.04-arm'
+      # --no-build, so the NixOS VM tests are evaluated but not run: a full
+      # run is the cross product of every test and every kernel, which is
+      # more than a hosted runner is worth. They are run locally instead --
+      # see doc/contributing.md. Drop --no-build to put them back.
+      - name: Evaluate the flake and build the checks that are not VM tests
         run: |
           nix flake check --no-build
-          nix build .#default .#checks.aarch64-linux.reuse-lint
+          nix build -L \
+            .#checks.${{ matrix.system }}.meson-tests \
+            .#checks.${{ matrix.system }}.reuse-lint
