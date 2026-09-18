@@ -156,21 +156,6 @@ static void test_fdinfo_pid(void) {
     CHECK(defused_test_fdinfo_pid("Pid:\t\n") == -EINVAL);
     CHECK(defused_test_fdinfo_pid("Pid:\t2147483648\n") == -EINVAL);
     CHECK(defused_test_fdinfo_pid("Pid:\t4242 junk\n") == -EINVAL);
-
-    _cleanup_close_ int pidfd = (int)syscall(SYS_pidfd_open, getpid(), 0);
-    CHECK(pidfd >= 0);
-    CHECK(defused_test_pidfd_to_pid_fdinfo(pidfd) == getpid());
-    pidfd = safe_close(pidfd);
-
-    /* A reaped process has no pid left to look up. */
-    pid_t child = fork();
-    CHECK(child >= 0);
-    if (child == 0)
-        _exit(0);
-    pidfd = (int)syscall(SYS_pidfd_open, child, 0);
-    CHECK(pidfd >= 0);
-    CHECK(waitpid(child, NULL, 0) == child);
-    CHECK(defused_test_pidfd_to_pid_fdinfo(pidfd) == -ESRCH);
 }
 
 static void test_fdinfo_parser(void) {

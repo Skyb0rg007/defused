@@ -6,14 +6,22 @@
   self,
   pkgs,
   system,
+  kernelPackages,
 }:
 
 let
-  common = import ./common.nix { inherit self pkgs system; };
+  common = import ./common.nix {
+    inherit
+      self
+      pkgs
+      system
+      kernelPackages
+      ;
+  };
   package = common.package;
 in
 pkgs.testers.nixosTest {
-  name = "defused-daemon";
+  name = "defused-daemon-${kernelPackages.kernel.version}";
 
   # This test deliberately does not use services.defused.enable (see
   # common.nix's baseNode) -- the whole point of --daemon is running without
@@ -25,6 +33,7 @@ pkgs.testers.nixosTest {
   nodes.machine =
     { ... }:
     {
+      boot.kernelPackages = kernelPackages;
       boot.kernelModules = [ "fuse" ];
 
       environment.systemPackages = [

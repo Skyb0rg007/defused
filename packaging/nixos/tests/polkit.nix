@@ -6,10 +6,18 @@
   self,
   pkgs,
   system,
+  kernelPackages,
 }:
 
 let
-  common = import ./common.nix { inherit self pkgs system; };
+  common = import ./common.nix {
+    inherit
+      self
+      pkgs
+      system
+      kernelPackages
+      ;
+  };
   inherit (common) package mountHelper;
 
   # Deliberately not common.baseNode: that node grants
@@ -20,6 +28,7 @@ let
     { ... }:
     {
       imports = [ self.nixosModules.defused ];
+      boot.kernelPackages = kernelPackages;
       boot.kernelModules = [ "fuse" ];
       services.defused.enable = true;
       services.defused.package = package;
@@ -30,7 +39,7 @@ let
     };
 in
 pkgs.testers.nixosTest {
-  name = "defused-polkit";
+  name = "defused-polkit-${kernelPackages.kernel.version}";
 
   nodes = {
     # No polkit rule beyond the shipped .policy file's AUTH_ADMIN_KEEP

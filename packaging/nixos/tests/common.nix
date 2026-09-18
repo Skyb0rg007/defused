@@ -6,6 +6,7 @@
   self,
   pkgs,
   system,
+  kernelPackages,
 }:
 
 let
@@ -234,6 +235,7 @@ let
     {
       imports = [ self.nixosModules.defused ];
 
+      boot.kernelPackages = kernelPackages;
       boot.kernelModules = [ "fuse" ];
 
       services.defused = {

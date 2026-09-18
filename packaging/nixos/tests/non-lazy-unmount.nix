@@ -6,13 +6,21 @@
   self,
   pkgs,
   system,
+  kernelPackages,
 }:
 
 let
-  common = import ./common.nix { inherit self pkgs system; };
+  common = import ./common.nix {
+    inherit
+      self
+      pkgs
+      system
+      kernelPackages
+      ;
+  };
 in
 pkgs.testers.nixosTest {
-  name = "defused-non-lazy-unmount";
+  name = "defused-non-lazy-unmount-${kernelPackages.kernel.version}";
 
   nodes.machine = common.baseNode;
 
