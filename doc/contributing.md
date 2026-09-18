@@ -24,6 +24,12 @@ via the wire protocol/namespaces (`test_mountns.c` uses
 `unshare(CLONE_NEWUSER|CLONE_NEWNS)` to obtain the privileges needed to run
 defused within its namespace).
 
+A test that cannot run in a given environment exits 77, which Meson reports
+as a skip rather than a pass: `mountns` needs nested user namespaces,
+`sandbox` needs loadable seccomp filters, and `client` needs a usable
+`/dev/null`. A skip means that case was not checked at all, so a change to
+those areas still wants a run somewhere they are available.
+
 Before considering a change verified, run the full check, not just
 `meson test`:
 
@@ -31,13 +37,19 @@ Before considering a change verified, run the full check, not just
 nix flake check
 ```
 
-This is what CI runs.
-This will build the project, run the normal tests, and then also
-run the NixOS VM test suite (in `packaging/nixos/tests/`).
-Every VM test runs once per kernel listed in
-`packaging/nixos/tests/default.nix`, so the kernel-version fallbacks are
-exercised on a kernel that really lacks the newer interface.
-It will also run `reuse lint` to ensure that all files have SPDX headers.
+This is what CI runs, and it covers three things:
+
+- `checks.<system>.meson-tests` builds the package, which runs `meson test`
+  in the Nix build sandbox (the package sets `doCheck = true`).
+- The NixOS VM test suite in `packaging/nixos/tests/`, which is where the
+  privileged mount and unmount paths are actually exercised. Every VM test
+  runs once per kernel listed in `packaging/nixos/tests/default.nix`, so the
+  kernel-version fallbacks are exercised on a kernel that really lacks the
+  newer interface.
+- `reuse lint`, to ensure that all files have SPDX headers.
+
+Pass `--print-build-logs` (`-L`) to see the Meson test output as it runs;
+without it a passing build prints nothing.
 
 ## Coding style
 

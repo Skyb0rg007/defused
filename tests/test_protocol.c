@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <systemd/sd-json.h>
@@ -180,6 +181,21 @@ static int run_mount_req_expect(const char *defused_path,
         return -EINVAL;
     }
     return 0;
+}
+
+/* "/" is not foreign-owned everywhere: inside an unprivileged user
+ * namespace it belongs to the caller. */
+static const char *find_unowned_dir(void) {
+    static const char *const candidates[] = {"/", "/proc", "/sys", "/usr",
+                                             "/etc"};
+    uid_t self = getuid();
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        struct stat st;
+        if (stat(candidates[i], &st) == 0 && S_ISDIR(st.st_mode) &&
+            st.st_uid != self)
+            return candidates[i];
+    }
+    return NULL;
 }
 
 /* The mountpoint ownership check happens before the polkit check, so it
@@ -531,10 +547,17 @@ int main(int argc, char *argv[]) {
         return 1;
 
     if (getuid() != 0) {
-        struct defused_mount_req root_owned = {};
-        if (run_mount_req_expect(argv[1], &root_owned, "/",
-                                 DEFUSED_VARLINK_ERROR_NOT_ALLOWED) != 0)
-            return 1;
+        const char *unowned = find_unowned_dir();
+        if (unowned == NULL) {
+            fprintf(stderr,
+                    "SKIP: no directory owned by another user is visible "
+                    "here, skipping the mountpoint ownership test\n");
+        } else {
+            struct defused_mount_req not_owned = {};
+            if (run_mount_req_expect(argv[1], &not_owned, unowned,
+                                     DEFUSED_VARLINK_ERROR_NOT_ALLOWED) != 0)
+                return 1;
+        }
 
         if (test_polkit_gate(argv[1]) != 0)
             return 1;
