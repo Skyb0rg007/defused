@@ -6,13 +6,21 @@
   self,
   pkgs,
   system,
+  kernelPackages,
 }:
 
 let
-  common = import ./common.nix { inherit self pkgs system; };
+  common = import ./common.nix {
+    inherit
+      self
+      pkgs
+      system
+      kernelPackages
+      ;
+  };
 in
 pkgs.testers.nixosTest {
-  name = "defused-mount-options";
+  name = "defused-mount-options-${kernelPackages.kernel.version}";
 
   nodes.machine = common.baseNode;
 

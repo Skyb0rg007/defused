@@ -34,6 +34,9 @@ nix flake check
 This is what CI runs.
 This will build the project, run the normal tests, and then also
 run the NixOS VM test suite (in `packaging/nixos/tests/`).
+Every VM test runs once per kernel listed in
+`packaging/nixos/tests/default.nix`, so the kernel-version fallbacks are
+exercised on a kernel that really lacks the newer interface.
 It will also run `reuse lint` to ensure that all files have SPDX headers.
 
 ## Coding style

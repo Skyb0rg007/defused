@@ -777,10 +777,6 @@ pid_t defused_test_fdinfo_pid(const char *text) {
     return fdinfo_pid(f);
 }
 
-pid_t defused_test_pidfd_to_pid_fdinfo(int pidfd) {
-    return pidfd_to_pid_fdinfo(pidfd);
-}
-
 int defused_test_fdinfo_mnt_id(const char *buf, size_t len, long *out_id) {
     return parse_fdinfo_mnt_id(buf, len, out_id);
 }

@@ -6,18 +6,21 @@
   self,
   pkgs,
   system,
+  kernelPackages,
 }:
 
 let
   package = self.packages.${system}.defused;
 in
 pkgs.testers.nixosTest {
-  name = "defused";
+  name = "defused-${kernelPackages.kernel.version}";
 
   nodes.machine =
     { ... }:
     {
       imports = [ self.nixosModules.defused ];
+
+      boot.kernelPackages = kernelPackages;
 
       services.defused = {
         enable = true;
