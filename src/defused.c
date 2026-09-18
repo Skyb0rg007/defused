@@ -1023,6 +1023,12 @@ static int run_fork_daemon(void) {
         }
         if (pid == 0) {
             listen_fd = safe_close(listen_fd);
+            /* Back to the default disposition: this child forks a sandbox
+             * child of its own and waits for it, so it must not inherit a
+             * handler that reaps every child out from under that wait(). */
+            struct sigaction dfl = {.sa_handler = SIG_DFL};
+            sigemptyset(&dfl.sa_mask);
+            (void)sigaction(SIGCHLD, &dfl, NULL);
             _exit(handle_connection(TAKE_FD(conn)));
         }
         live_children++;
