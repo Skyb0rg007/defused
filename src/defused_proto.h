@@ -20,6 +20,8 @@
 #define DEFUSED_PROTO_H
 
 #include <stdint.h>
+#include <string.h>
+#include <systemd/sd-json.h>
 #include <systemd/sd-varlink-idl.h>
 
 #define DEFUSED_SOCKET_PATH "/run/defused/defused.sock"
@@ -34,17 +36,23 @@ enum defused_op {
     DEFUSED_OP_UNMOUNT = 2,
 };
 
-/* Result codes for each operation */
-enum defused_status {
-    DEFUSED_OK = 0,
-    DEFUSED_ERR_MALFORMED = 1,
-    DEFUSED_ERR_BAD_OPTION = 2,
-    DEFUSED_ERR_NOT_ALLOWED = 3,
-    DEFUSED_ERR_NOT_A_FUSE_MOUNT = 4,
-    DEFUSED_ERR_MOUNT_FAILED = 5,
-    DEFUSED_ERR_UNMOUNT_FAILED = 6,
-    DEFUSED_ERR_SETNS_FAILED = 7,
-};
+/* The Varlink errors a failed request is reported as; a successful one gets
+ * an empty reply. Defined in defused-varlink.c. */
+#define DEFUSED_VARLINK_ERROR_MALFORMED                                        \
+    DEFUSED_VARLINK_INTERFACE ".MalformedRequest"
+#define DEFUSED_VARLINK_ERROR_BAD_OPTION                                       \
+    DEFUSED_VARLINK_INTERFACE ".BadMountOption"
+#define DEFUSED_VARLINK_ERROR_NOT_ALLOWED                                      \
+    DEFUSED_VARLINK_INTERFACE ".NotAllowed"
+#define DEFUSED_VARLINK_ERROR_NOT_A_FUSE_MOUNT                                 \
+    DEFUSED_VARLINK_INTERFACE ".NotAFuseMount"
+#define DEFUSED_VARLINK_ERROR_MOUNT_FAILED                                     \
+    DEFUSED_VARLINK_INTERFACE ".MountFailed"
+#define DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED                                   \
+    DEFUSED_VARLINK_INTERFACE ".UnmountFailed"
+
+/* Max length of an error id in struct defused_error */
+#define DEFUSED_MAX_ERROR_ID 64
 
 /* Max length of fsname and subtype */
 #define DEFUSED_MAX_NAME 32
@@ -124,13 +132,24 @@ union defused_req {
     struct defused_umount_req umount;
 };
 
-/* Responses to mount or unmount requests */
-struct defused_resp {
-    /* enum defused_status */
-    uint32_t status;
-    /* errno from mount setup/umount2(), when relevant */
+/* Why an operation failed; an empty id means it did not. sys_errno is the
+ * error's "errno" field, 0 for the errors that don't carry one. */
+struct defused_error {
+    char id[DEFUSED_MAX_ERROR_ID];
     int32_t sys_errno;
 };
+
+static inline void defused_error_set(struct defused_error *err, const char *id,
+                                     int sys_errno) {
+    strncpy(err->id, id ? id : "", sizeof(err->id) - 1);
+    err->id[sizeof(err->id) - 1] = '\0';
+    err->sys_errno = sys_errno;
+}
+
+/* Fills in *err from an sd_varlink_call() result; a NULL error_id is
+ * success. */
+int defused_error_from_reply(const char *error_id, sd_json_variant *parameters,
+                             struct defused_error *err);
 
 extern const sd_varlink_interface vl_interface_website_soss_defused;
 

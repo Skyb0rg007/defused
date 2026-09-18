@@ -82,9 +82,10 @@ static int spawn_defused(const char *defused_path, int *client_sock,
     return 0;
 }
 
-/* Takes ownership of sock_fd. */
+/* Takes ownership of sock_fd. Reports the outcome through *err: an empty
+ * err->id for a successful reply, otherwise the error the service sent. */
 static int send_mount_req(int sock_fd, const struct defused_mount_req *req,
-                          int dev_fd, int mnt_fd, struct defused_resp *resp) {
+                          int dev_fd, int mnt_fd, struct defused_error *err) {
     _cleanup_close_ int sock = sock_fd;
     _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *link = NULL;
     _cleanup_(sd_json_variant_unrefp) sd_json_variant *reply = NULL;
@@ -118,27 +119,14 @@ static int send_mount_req(int sock_fd, const struct defused_mount_req *req,
         SD_JSON_BUILD_PAIR_STRING("subtype", req->subtype));
     if (ret < 0)
         return ret;
-    if (error_id != NULL) {
-        fprintf(stderr, "FAIL: Varlink error %s\n", error_id);
-        return -EBADMSG;
-    }
-
-    static const sd_json_dispatch_field dispatch_table[] = {
-        {"status", SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uint32,
-         offsetof(struct defused_resp, status), SD_JSON_MANDATORY},
-        {"sysErrno", SD_JSON_VARIANT_INTEGER, sd_json_dispatch_int32,
-         offsetof(struct defused_resp, sys_errno), SD_JSON_MANDATORY},
-        {},
-    };
-    return sd_json_dispatch(reply, dispatch_table, 0, resp);
+    return defused_error_from_reply(error_id, reply, err);
 }
 
 /* Runs one mount request against a fresh defused instance and reports the
- * response status via *out_status, without asserting what it should be --
- * callers decide what counts as a pass. */
+ * error it came back with via *err; callers decide what counts as a pass. */
 static int run_mount_req(const char *defused_path,
                          const struct defused_mount_req *req, const char *path,
-                         const char *dev_path, uint32_t *out_status) {
+                         const char *dev_path, struct defused_error *err) {
     _cleanup_close_ int sock = -EBADF;
     pid_t pid;
     int ret = spawn_defused(defused_path, &sock, &pid);
@@ -159,8 +147,7 @@ static int run_mount_req(const char *defused_path,
         return ret;
     }
 
-    struct defused_resp resp;
-    ret = send_mount_req(TAKE_FD(sock), req, dev_fd, mnt_fd, &resp);
+    ret = send_mount_req(TAKE_FD(sock), req, dev_fd, mnt_fd, err);
 
     int wstatus;
     waitpid(pid, &wstatus, 0);
@@ -177,20 +164,19 @@ static int run_mount_req(const char *defused_path,
         fprintf(stderr, "FAIL: service did not exit normally\n");
         return -ECHILD;
     }
-    *out_status = resp.status;
     return 0;
 }
 
 static int run_mount_req_expect(const char *defused_path,
                                 const struct defused_mount_req *req,
-                                const char *path, uint32_t expect_status) {
-    uint32_t status;
-    int ret = run_mount_req(defused_path, req, path, "/dev/null", &status);
+                                const char *path, const char *expect_id) {
+    struct defused_error err;
+    int ret = run_mount_req(defused_path, req, path, "/dev/null", &err);
     if (ret < 0)
         return ret;
-    if (status != expect_status) {
-        fprintf(stderr, "FAIL: expected status %u, got %u\n", expect_status,
-                status);
+    if (strcmp(err.id, expect_id) != 0) {
+        fprintf(stderr, "FAIL: expected %s, got %s\n", expect_id,
+                err.id[0] ? err.id : "a successful reply");
         return -EINVAL;
     }
     return 0;
@@ -226,23 +212,22 @@ static int test_polkit_gate(const char *defused_path) {
     }
 
     struct defused_mount_req req = {};
-    uint32_t status = DEFUSED_OK;
-    int ret = run_mount_req(defused_path, &req, dir, "/dev/fuse", &status);
+    struct defused_error err;
+    int ret = run_mount_req(defused_path, &req, dir, "/dev/fuse", &err);
     if (ret < 0)
         return ret;
 
     /* Without an interactive polkit agent, an AUTH_ADMIN_KEEP action can
-     * never succeed; either polkit is reachable and says no
-     * (DEFUSED_ERR_NOT_ALLOWED), or it isn't reachable at all in this
-     * sandbox and the check fails closed (DEFUSED_ERR_MOUNT_FAILED). Either
-     * is a pass -- DEFUSED_OK (or any earlier, deterministic error) would
-     * mean the gate was skipped or something regressed before it. */
-    if (status != DEFUSED_ERR_NOT_ALLOWED &&
-        status != DEFUSED_ERR_MOUNT_FAILED) {
+     * never succeed; either polkit is reachable and says no (NotAllowed), or
+     * it isn't reachable at all in this sandbox and the check fails closed
+     * (MountFailed). Either is a pass -- a successful reply (or any earlier,
+     * deterministic error) would mean the gate was skipped or something
+     * regressed before it. */
+    if (strcmp(err.id, DEFUSED_VARLINK_ERROR_NOT_ALLOWED) != 0 &&
+        strcmp(err.id, DEFUSED_VARLINK_ERROR_MOUNT_FAILED) != 0) {
         fprintf(stderr,
-                "FAIL: expected the polkit gate to block the mount (got "
-                "status %u)\n",
-                status);
+                "FAIL: expected the polkit gate to block the mount (got %s)\n",
+                err.id[0] ? err.id : "a successful reply");
         return -EINVAL;
     }
     return 0;
@@ -292,11 +277,11 @@ static int connect_daemon_socket(const char *sock_path) {
 
 /* Connects to an already-running --daemon instance's socket at sock_path
  * (retrying while it isn't up yet, see connect_daemon_socket()) and runs
- * one mount request through it, failing unless the response status is
- * exactly expect_status. */
+ * one mount request through it, failing unless the reply is exactly the
+ * Varlink error expect_id. */
 static int run_daemon_mount_req(const char *sock_path,
                                 const struct defused_mount_req *req,
-                                const char *path, uint32_t expect_status) {
+                                const char *path, const char *expect_id) {
     _cleanup_close_ int sock = connect_daemon_socket(sock_path);
     if (sock < 0) {
         fprintf(stderr, "FAIL: could not connect to daemon socket: %s\n",
@@ -313,13 +298,13 @@ static int run_daemon_mount_req(const char *sock_path,
         return ret;
     }
 
-    struct defused_resp resp;
-    int ret = send_mount_req(TAKE_FD(sock), req, dev_fd, mnt_fd, &resp);
+    struct defused_error err;
+    int ret = send_mount_req(TAKE_FD(sock), req, dev_fd, mnt_fd, &err);
     if (ret < 0)
         return ret;
-    if (resp.status != expect_status) {
-        fprintf(stderr, "FAIL: expected status %u, got %u\n", expect_status,
-                resp.status);
+    if (strcmp(err.id, expect_id) != 0) {
+        fprintf(stderr, "FAIL: expected %s, got %s\n", expect_id,
+                err.id[0] ? err.id : "a successful reply");
         return -EINVAL;
     }
     return 0;
@@ -356,12 +341,12 @@ static int test_daemon_mode(const char *defused_path) {
     struct defused_mount_req bad_opt = {
         .mount_flags = 1u << 31, /* never in DEFUSED_MOUNT_FLAGS_MASK */
     };
-    ret =
-        run_daemon_mount_req(sock_path, &bad_opt, ".", DEFUSED_ERR_BAD_OPTION);
+    ret = run_daemon_mount_req(sock_path, &bad_opt, ".",
+                               DEFUSED_VARLINK_ERROR_BAD_OPTION);
     if (ret < 0)
         return ret;
     return run_daemon_mount_req(sock_path, &bad_opt, ".",
-                                DEFUSED_ERR_BAD_OPTION);
+                                DEFUSED_VARLINK_ERROR_BAD_OPTION);
 }
 
 /* --daemon does not create the socket's parent directory -- it just binds
@@ -541,14 +526,14 @@ int main(int argc, char *argv[]) {
     struct defused_mount_req bad_opt = {
         .mount_flags = 1u << 31, /* never in DEFUSED_MOUNT_FLAGS_MASK */
     };
-    if (run_mount_req_expect(argv[1], &bad_opt, ".", DEFUSED_ERR_BAD_OPTION) !=
-        0)
+    if (run_mount_req_expect(argv[1], &bad_opt, ".",
+                             DEFUSED_VARLINK_ERROR_BAD_OPTION) != 0)
         return 1;
 
     if (getuid() != 0) {
         struct defused_mount_req root_owned = {};
         if (run_mount_req_expect(argv[1], &root_owned, "/",
-                                 DEFUSED_ERR_NOT_ALLOWED) != 0)
+                                 DEFUSED_VARLINK_ERROR_NOT_ALLOWED) != 0)
             return 1;
 
         if (test_polkit_gate(argv[1]) != 0)

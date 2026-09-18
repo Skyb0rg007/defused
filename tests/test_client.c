@@ -127,12 +127,6 @@ static int test_root_fallback(const char *client) {
     return failures ? -EINVAL : 0;
 }
 
-static int reply_status(sd_varlink *link, uint32_t status) {
-    return sd_varlink_replybo(link,
-                              SD_JSON_BUILD_PAIR_UNSIGNED("status", status),
-                              SD_JSON_BUILD_PAIR_INTEGER("sysErrno", 0));
-}
-
 static int method_mount(sd_varlink *link, sd_json_variant *parameters,
                         sd_varlink_method_flags_t flags, void *userdata) {
     (void)flags;
@@ -191,7 +185,7 @@ static int method_mount(sd_varlink *link, sd_json_variant *parameters,
     CHECK(S_ISDIR(fd_st.st_mode));
     CHECK(fd_st.st_dev == dot_st.st_dev && fd_st.st_ino == dot_st.st_ino);
 
-    return reply_status(link, DEFUSED_OK);
+    return sd_varlink_reply(link, NULL);
 }
 
 static int method_unmount(sd_varlink *link, sd_json_variant *parameters,
@@ -228,7 +222,7 @@ static int method_unmount(sd_varlink *link, sd_json_variant *parameters,
     CHECK(fstat(parent_fd, &fd_st) == 0 &&
           stat(expect->parent, &parent_st) == 0);
     CHECK(fd_st.st_dev == parent_st.st_dev && fd_st.st_ino == parent_st.st_ino);
-    return reply_status(link, DEFUSED_ERR_NOT_A_FUSE_MOUNT);
+    return sd_varlink_error(link, DEFUSED_VARLINK_ERROR_NOT_A_FUSE_MOUNT, NULL);
 }
 
 /* Serves one accepted connection to completion. Takes ownership of conn_fd. */

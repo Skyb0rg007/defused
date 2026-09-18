@@ -30,8 +30,7 @@
 #include <linux/pidfd.h>
 
 struct sandbox_result {
-    uint32_t status;
-    int32_t sys_errno;
+    struct defused_error err;
     int32_t ret;
 };
 
@@ -143,16 +142,12 @@ static __attribute__((__noreturn__)) void sandbox_exit(int status) {
 }
 
 /* Sends the sandboxed child's result back to the parent over out_fd and
- * exits; sys_errno is taken as given rather than derived from ret, since
- * some statuses (e.g. DEFUSED_ERR_NOT_ALLOWED) deliberately don't surface a
- * syscall errno. */
+ * exits; sys_errno is taken as given rather than derived from
+ * ret, since a refusal deliberately surfaces no syscall errno. */
 static __attribute__((__noreturn__)) void
-sandbox_done(int out_fd, uint32_t status, int sys_errno, int ret) {
-    struct sandbox_result result = {
-        .status = status,
-        .sys_errno = sys_errno,
-        .ret = ret,
-    };
+sandbox_done(int out_fd, const char *error_id, int sys_errno, int ret) {
+    struct sandbox_result result = {.ret = ret};
+    defused_error_set(&result.err, error_id, sys_errno);
     const char *p = (const char *)&result;
     size_t left = sizeof(result);
 
@@ -639,37 +634,26 @@ static pid_t fork_with_pipe(int pipefd[2]) {
     return pid;
 }
 
-/* Reads the child's sandbox_result off pipefd_read and waits for pid,
- * folding a pipe-read failure or an abnormal exit into the result so the
- * caller doesn't have to special-case them. fail_status is reported if the
- * child never got to send a result at all. */
-static int reap_sandbox(int pipefd_read, pid_t pid, uint32_t fail_status,
-                        uint32_t *status, int *sys_errno) {
-    struct sandbox_result result = {
-        .status = fail_status,
-        .sys_errno = EIO,
-        .ret = -EIO,
-    };
+/* Reads the child's sandbox_result off pipefd_read and waits for pid.
+ * fail_id is reported when no result arrived; once one has, it is the answer
+ * whatever the wait says, since the child writes it immediately before
+ * exiting and something else may already have reaped the child. */
+static int reap_sandbox(int pipefd_read, pid_t pid, const char *fail_id,
+                        struct defused_error *err) {
+    struct sandbox_result result;
     int ret = read_sandbox_result(pipefd_read, &result);
-    int wait_status = wait_sandbox(pid);
+    (void)wait_sandbox(pid);
     if (ret < 0) {
-        result.sys_errno = -ret;
-        result.ret = ret;
-    } else if (wait_status < 0) {
-        result.sys_errno = -wait_status;
-        result.ret = wait_status;
-    } else if (!WIFEXITED(wait_status)) {
-        result.sys_errno = EIO;
-        result.ret = -EIO;
+        defused_error_set(err, fail_id, -ret);
+        return ret;
     }
 
-    *status = result.status;
-    *sys_errno = result.sys_errno;
+    *err = result.err;
     return result.ret;
 }
 
-int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd, uint32_t *status,
-                          int *sys_errno) {
+int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd,
+                          struct defused_error *err) {
     _cleanup_close_pair_ int pipefd[2] = EBADF_PAIR;
     pid_t pid = fork_with_pipe(pipefd);
     if (pid < 0)
@@ -680,11 +664,13 @@ int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd, uint32_t *status,
 
         int ret = install_seccomp(DEFUSED_OP_MOUNT);
         if (ret < 0)
-            sandbox_done(pipefd[1], DEFUSED_ERR_MOUNT_FAILED, -ret, ret);
+            sandbox_done(pipefd[1], DEFUSED_VARLINK_ERROR_MOUNT_FAILED, -ret,
+                         ret);
 
         if (sandbox_setns(pidfd, CLONE_NEWNS) == -1) {
             ret = -errno;
-            sandbox_done(pipefd[1], DEFUSED_ERR_SETNS_FAILED, -ret, ret);
+            sandbox_done(pipefd[1], DEFUSED_VARLINK_ERROR_MOUNT_FAILED, -ret,
+                         ret);
         }
 
         ret = sandbox_move_mount(mountfd, "", mnt_fd, "",
@@ -692,30 +678,29 @@ int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd, uint32_t *status,
                                      MOVE_MOUNT_T_EMPTY_PATH) == -1
                   ? -errno
                   : 0;
-        sandbox_done(pipefd[1], ret < 0 ? DEFUSED_ERR_MOUNT_FAILED : DEFUSED_OK,
+        sandbox_done(pipefd[1],
+                     ret < 0 ? DEFUSED_VARLINK_ERROR_MOUNT_FAILED : NULL,
                      ret < 0 ? -ret : 0, ret);
     }
 
     pipefd[1] = safe_close(pipefd[1]);
-    return reap_sandbox(pipefd[0], pid, DEFUSED_ERR_MOUNT_FAILED, status,
-                        sys_errno);
+    return reap_sandbox(pipefd[0], pid, DEFUSED_VARLINK_ERROR_MOUNT_FAILED,
+                        err);
 }
 
 int defused_sandbox_unmount(int pidfd, int proc_fd, int parent_fd,
                             const char *name, bool lazy, long mnt_id, uid_t uid,
-                            uint32_t *status, int *sys_errno) {
+                            struct defused_error *err) {
     /* Checked here, before forking, so an unauthorized caller never touches the
      * client's namespace. */
     uid_t owner;
     int ret = peer_fuse_mount_owner(pidfd, mnt_id, &owner);
     if (ret < 0) {
-        *status = DEFUSED_ERR_NOT_A_FUSE_MOUNT;
-        *sys_errno = 0;
+        defused_error_set(err, DEFUSED_VARLINK_ERROR_NOT_A_FUSE_MOUNT, 0);
         return ret;
     }
     if (owner != uid) {
-        *status = DEFUSED_ERR_NOT_ALLOWED;
-        *sys_errno = 0;
+        defused_error_set(err, DEFUSED_VARLINK_ERROR_NOT_ALLOWED, 0);
         return -EPERM;
     }
 
@@ -729,25 +714,26 @@ int defused_sandbox_unmount(int pidfd, int proc_fd, int parent_fd,
 
         int child_ret = install_seccomp(DEFUSED_OP_UNMOUNT);
         if (child_ret < 0)
-            sandbox_done(pipefd[1], DEFUSED_ERR_UNMOUNT_FAILED, -child_ret,
-                         child_ret);
+            sandbox_done(pipefd[1], DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED,
+                         -child_ret, child_ret);
 
         if (sandbox_setns(pidfd, CLONE_NEWNS) == -1) {
             child_ret = -errno;
-            sandbox_done(pipefd[1], DEFUSED_ERR_SETNS_FAILED, -child_ret,
-                         child_ret);
+            sandbox_done(pipefd[1], DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED,
+                         -child_ret, child_ret);
         }
 
         child_ret = sandbox_unmount_verified(proc_fd, parent_fd, name, mnt_id,
                                              lazy ? MNT_DETACH : 0);
         sandbox_done(pipefd[1],
-                     child_ret < 0 ? DEFUSED_ERR_UNMOUNT_FAILED : DEFUSED_OK,
+                     child_ret < 0 ? DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED
+                                   : NULL,
                      child_ret < 0 ? -child_ret : 0, child_ret);
     }
 
     pipefd[1] = safe_close(pipefd[1]);
-    return reap_sandbox(pipefd[0], pid, DEFUSED_ERR_UNMOUNT_FAILED, status,
-                        sys_errno);
+    return reap_sandbox(pipefd[0], pid, DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED,
+                        err);
 }
 
 #ifdef DEFUSED_TEST

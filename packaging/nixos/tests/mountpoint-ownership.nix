@@ -40,7 +40,7 @@ pkgs.testers.nixosTest {
 
     machine.succeed(
         "journalctl -u 'defused@*' --no-pager | "
-        "grep -F 'DEFUSED_ERR_NOT_ALLOWED'"
+        "grep -F 'website.soss.defused.NotAllowed'"
     )
   '';
 }

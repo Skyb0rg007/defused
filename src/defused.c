@@ -92,8 +92,6 @@ static int varlink_mount(sd_varlink *link, sd_json_variant *parameters,
 static int varlink_unmount(sd_varlink *link, sd_json_variant *parameters,
                            sd_varlink_method_flags_t flags, void *userdata)
     __attribute__((__nonnull__(1, 4), __warn_unused_result__));
-static const char *status_name(uint32_t status)
-    __attribute__((__const__, __warn_unused_result__));
 static int get_peer_cred(int sock, struct ucred *cred)
     __attribute__((__nonnull__(2), __warn_unused_result__));
 static int handle_mount(sd_varlink *link, int sock,
@@ -221,14 +219,15 @@ static int handle_connection(int sock_fd) {
     return EXIT_SUCCESS;
 }
 
-static int reply_response(sd_varlink *link, uint32_t status, int sys_errno) {
-    int ret =
-        sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_UNSIGNED("status", status),
-                           SD_JSON_BUILD_PAIR_INTEGER("sysErrno", sys_errno));
-    if (ret < 0)
-        fprintf(stderr, "defused: failed to send response %s: %s\n",
-                status_name(status), strerror(-ret));
-    return ret;
+/* errno goes on the wire only for the errors declared to carry it. Also,
+ * sd_varlink_error() hands the error it just sent back as a negative errno
+ * (-EBADR for an id it has no mapping for), so a negative return here is the
+ * normal case, not a failure to reply. */
+static int reply_error(sd_varlink *link, const struct defused_error *err) {
+    return sd_varlink_errorbo(
+        link, err->id,
+        SD_JSON_BUILD_PAIR_CONDITION(err->sys_errno != 0, "errno",
+                                     SD_JSON_BUILD_INTEGER(err->sys_errno)));
 }
 
 static int varlink_mount(sd_varlink *link, sd_json_variant *parameters,
@@ -346,29 +345,6 @@ static int varlink_unmount(sd_varlink *link, sd_json_variant *parameters,
     if (ret < 0)
         return ret;
     return handle_umount(link, ctx->sock, &req, parent_fd, &cred);
-}
-
-static const char *status_name(uint32_t status) {
-    switch (status) {
-    case DEFUSED_OK:
-        return "DEFUSED_OK";
-    case DEFUSED_ERR_MALFORMED:
-        return "DEFUSED_ERR_MALFORMED";
-    case DEFUSED_ERR_BAD_OPTION:
-        return "DEFUSED_ERR_BAD_OPTION";
-    case DEFUSED_ERR_NOT_ALLOWED:
-        return "DEFUSED_ERR_NOT_ALLOWED";
-    case DEFUSED_ERR_NOT_A_FUSE_MOUNT:
-        return "DEFUSED_ERR_NOT_A_FUSE_MOUNT";
-    case DEFUSED_ERR_MOUNT_FAILED:
-        return "DEFUSED_ERR_MOUNT_FAILED";
-    case DEFUSED_ERR_UNMOUNT_FAILED:
-        return "DEFUSED_ERR_UNMOUNT_FAILED";
-    case DEFUSED_ERR_SETNS_FAILED:
-        return "DEFUSED_ERR_SETNS_FAILED";
-    default:
-        return "unknown status";
-    }
 }
 
 static __attribute__((__warn_unused_result__)) int peer_pidfd(int sock) {
@@ -688,19 +664,17 @@ create_detached_mount(const struct prepared_mount *mnt) {
     return mountfd;
 }
 
-/* Validates and performs a mount request. On failure, *status and
- * *sys_errno describe what to report to the client; the caller logs and
- * replies. */
-static __attribute__((__nonnull__(2, 5, 6, 7), __warn_unused_result__)) int
+/* Validates and performs a mount request. On failure, *err describes what to
+ * report to the client; the caller logs and replies. */
+static __attribute__((__nonnull__(2, 5, 6), __warn_unused_result__)) int
 mount_request(int sock, const struct defused_mount_req *req, int mnt_fd,
-              int dev_fd, const struct ucred *cred, uint32_t *status,
-              int *sys_errno) {
+              int dev_fd, const struct ucred *cred, struct defused_error *err) {
     /* varlink_mount() already bounds-checked these before copying them out
      * of the JSON payload. */
     assert(strnlen(req->fsname, DEFUSED_MAX_NAME) < DEFUSED_MAX_NAME);
     assert(strnlen(req->subtype, DEFUSED_MAX_NAME) < DEFUSED_MAX_NAME);
     if (strchr(req->fsname, '/') || strchr(req->subtype, '/')) {
-        *status = DEFUSED_ERR_MALFORMED;
+        defused_error_set(err, DEFUSED_VARLINK_ERROR_MALFORMED, EINVAL);
         return -EINVAL;
     }
 
@@ -708,38 +682,36 @@ mount_request(int sock, const struct defused_mount_req *req, int mnt_fd,
      * answered entirely by polkit (see check_polkit_authorized()); this
      * only validates protocol shape. */
     if ((req->mount_flags & ~(uint32_t)DEFUSED_MOUNT_FLAGS_MASK) != 0) {
-        *status = DEFUSED_ERR_BAD_OPTION;
+        defused_error_set(err, DEFUSED_VARLINK_ERROR_BAD_OPTION, 0);
         return -EINVAL;
     }
 
     struct stat st;
     if (fstat(mnt_fd, &st) == -1) {
-        *status = DEFUSED_ERR_MALFORMED;
-        *sys_errno = errno;
+        defused_error_set(err, DEFUSED_VARLINK_ERROR_MALFORMED, errno);
         return -errno;
     }
     if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) {
-        *status = DEFUSED_ERR_MALFORMED;
-        *sys_errno = S_ISLNK(st.st_mode) ? ELOOP : ENOTDIR;
-        return -*sys_errno;
+        int sys_errno = S_ISLNK(st.st_mode) ? ELOOP : ENOTDIR;
+        defused_error_set(err, DEFUSED_VARLINK_ERROR_MALFORMED, sys_errno);
+        return -sys_errno;
     }
     /* Ownership policy diverges from libfuse's setuid fusermount3 here --
      * see doc/protocol.md. */
     if (st.st_uid != cred->uid || !(st.st_mode & S_IWUSR) ||
         (S_ISDIR(st.st_mode) && !(st.st_mode & S_IXUSR))) {
-        *status = DEFUSED_ERR_NOT_ALLOWED;
+        defused_error_set(err, DEFUSED_VARLINK_ERROR_NOT_ALLOWED, 0);
         return -EPERM;
     }
     int ret = check_mountpoint_fstype(mnt_fd);
     if (ret < 0) {
-        *status = DEFUSED_ERR_NOT_ALLOWED;
+        defused_error_set(err, DEFUSED_VARLINK_ERROR_NOT_ALLOWED, 0);
         return ret;
     }
 
     ret = check_fuse_device_fd(dev_fd);
     if (ret < 0) {
-        *status = DEFUSED_ERR_MALFORMED;
-        *sys_errno = -ret;
+        defused_error_set(err, DEFUSED_VARLINK_ERROR_MALFORMED, -ret);
         return ret;
     }
 
@@ -748,9 +720,9 @@ mount_request(int sock, const struct defused_mount_req *req, int mnt_fd,
     errno = 0;
     int current_mounts = count_fuse_fs("defused");
     if (current_mounts < 0) {
-        *status = DEFUSED_ERR_MOUNT_FAILED;
-        *sys_errno = errno ? errno : EIO;
-        return -*sys_errno;
+        defused_error_set(err, DEFUSED_VARLINK_ERROR_MOUNT_FAILED,
+                          errno ? errno : EIO);
+        return -err->sys_errno;
     }
 
     char privileged_flags[128];
@@ -760,16 +732,17 @@ mount_request(int sock, const struct defused_mount_req *req, int mnt_fd,
     ret = check_polkit_authorized(sock, cred, DEFUSED_POLKIT_ACTION_MOUNT,
                                   current_mounts, privileged_flags);
     if (ret < 0) {
-        *status =
-            ret == -EACCES ? DEFUSED_ERR_NOT_ALLOWED : DEFUSED_ERR_MOUNT_FAILED;
-        *sys_errno = -ret;
+        /* -EACCES is polkit's answer, not a failure to ask it. */
+        if (ret == -EACCES)
+            defused_error_set(err, DEFUSED_VARLINK_ERROR_NOT_ALLOWED, 0);
+        else
+            defused_error_set(err, DEFUSED_VARLINK_ERROR_MOUNT_FAILED, -ret);
         return ret;
     }
 
     _cleanup_close_ int pidfd = peer_pidfd(sock);
     if (pidfd < 0) {
-        *status = DEFUSED_ERR_MOUNT_FAILED;
-        *sys_errno = -pidfd;
+        defused_error_set(err, DEFUSED_VARLINK_ERROR_MOUNT_FAILED, -pidfd);
         return pidfd;
     }
 
@@ -778,46 +751,47 @@ mount_request(int sock, const struct defused_mount_req *req, int mnt_fd,
 
     _cleanup_close_ int mountfd = create_detached_mount(&prepared);
     if (mountfd < 0) {
-        *status = DEFUSED_ERR_MOUNT_FAILED;
-        *sys_errno = -mountfd;
+        defused_error_set(err, DEFUSED_VARLINK_ERROR_MOUNT_FAILED, -mountfd);
         return mountfd;
     }
 
-    return defused_sandbox_mount(pidfd, mountfd, mnt_fd, status, sys_errno);
+    return defused_sandbox_mount(pidfd, mountfd, mnt_fd, err);
+}
+
+static __attribute__((__nonnull__(1, 2))) void
+log_request_error(const char *what, const struct defused_error *err, int ret) {
+    fprintf(stderr,
+            "defused: %s request failed with %s (ret=%d, errno=%d: %s)\n", what,
+            err->id, ret, err->sys_errno,
+            err->sys_errno ? strerror(err->sys_errno) : "none");
 }
 
 static int handle_mount(sd_varlink *link, int sock,
                         const struct defused_mount_req *req, int mnt_fd,
                         int dev_fd, const struct ucred *cred) {
-    uint32_t status = DEFUSED_OK;
-    int sys_errno = 0;
-    int ret =
-        mount_request(sock, req, mnt_fd, dev_fd, cred, &status, &sys_errno);
+    struct defused_error err = {};
+
+    int ret = mount_request(sock, req, mnt_fd, dev_fd, cred, &err);
     if (ret < 0) {
-        fprintf(
-            stderr,
-            "defused: mount request failed with %s (ret=%d, errno=%d: %s)\n",
-            status_name(status), ret, sys_errno,
-            sys_errno ? strerror(sys_errno) : "none");
-        (void)reply_response(link, status, sys_errno);
+        log_request_error("mount", &err, ret);
+        (void)reply_error(link, &err);
         return ret;
     }
 
-    return reply_response(link, DEFUSED_OK, 0);
+    return sd_varlink_reply(link, NULL);
 }
 
-/* Validates and performs an unmount request. On failure, *status and
- * *sys_errno describe what to report to the client; the caller logs and
- * replies. */
-static __attribute__((__nonnull__(2, 4, 5, 6), __warn_unused_result__)) int
+/* Validates and performs an unmount request. On failure, *err describes what
+ * to report to the client; the caller logs and replies. */
+static __attribute__((__nonnull__(2, 4, 5), __warn_unused_result__)) int
 umount_request(int sock, const struct defused_umount_req *req, int parent_fd,
-               const struct ucred *cred, uint32_t *status, int *sys_errno) {
+               const struct ucred *cred, struct defused_error *err) {
     /* varlink_unmount() already bounds-checked this before copying it out
      * of the JSON payload. */
     assert(strnlen(req->name, DEFUSED_MAX_FILENAME) < DEFUSED_MAX_FILENAME);
     if (req->name[0] == '\0' || strchr(req->name, '/') ||
         !strcmp(req->name, ".") || !strcmp(req->name, "..")) {
-        *status = DEFUSED_ERR_MALFORMED;
+        defused_error_set(err, DEFUSED_VARLINK_ERROR_MALFORMED, EINVAL);
         return -EINVAL;
     }
 
@@ -826,24 +800,21 @@ umount_request(int sock, const struct defused_umount_req *req, int parent_fd,
     _cleanup_close_ int proc_fd =
         open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (proc_fd == -1) {
-        *status = DEFUSED_ERR_UNMOUNT_FAILED;
-        *sys_errno = errno;
+        defused_error_set(err, DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED, errno);
         return -errno;
     }
 
     _cleanup_close_ int mnt_fd =
         openat(parent_fd, req->name, O_PATH | O_NOFOLLOW | O_CLOEXEC);
     if (mnt_fd == -1) {
-        *status = DEFUSED_ERR_MALFORMED;
-        *sys_errno = errno;
+        defused_error_set(err, DEFUSED_VARLINK_ERROR_MALFORMED, errno);
         return -errno;
     }
 
     long parent_mnt_id = -1;
     int ret = fd_mnt_id(proc_fd, parent_fd, &parent_mnt_id);
     if (ret < 0) {
-        *status = DEFUSED_ERR_MALFORMED;
-        *sys_errno = -ret;
+        defused_error_set(err, DEFUSED_VARLINK_ERROR_MALFORMED, -ret);
         return ret;
     }
 
@@ -854,12 +825,11 @@ umount_request(int sock, const struct defused_umount_req *req, int parent_fd,
     long mnt_id = -1;
     ret = fd_mnt_id(proc_fd, mnt_fd, &mnt_id);
     if (ret < 0) {
-        *status = DEFUSED_ERR_MALFORMED;
-        *sys_errno = -ret;
+        defused_error_set(err, DEFUSED_VARLINK_ERROR_MALFORMED, -ret);
         return ret;
     }
     if (mnt_id == parent_mnt_id) {
-        *status = DEFUSED_ERR_NOT_A_FUSE_MOUNT;
+        defused_error_set(err, DEFUSED_VARLINK_ERROR_NOT_A_FUSE_MOUNT, 0);
         return -EINVAL;
     }
 
@@ -876,41 +846,38 @@ umount_request(int sock, const struct defused_umount_req *req, int parent_fd,
     ret = check_polkit_authorized(sock, cred, DEFUSED_POLKIT_ACTION_UNMOUNT, -1,
                                   NULL);
     if (ret < 0) {
-        *status = ret == -EACCES ? DEFUSED_ERR_NOT_ALLOWED
-                                 : DEFUSED_ERR_UNMOUNT_FAILED;
-        *sys_errno = -ret;
+        if (ret == -EACCES)
+            defused_error_set(err, DEFUSED_VARLINK_ERROR_NOT_ALLOWED, 0);
+        else
+            defused_error_set(err, DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED, -ret);
         return ret;
     }
 
     _cleanup_close_ int pidfd = peer_pidfd(sock);
     if (pidfd < 0) {
-        *status = DEFUSED_ERR_UNMOUNT_FAILED;
-        *sys_errno = -pidfd;
+        defused_error_set(err, DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED, -pidfd);
         return pidfd;
     }
 
     return defused_sandbox_unmount(pidfd, proc_fd, parent_fd, req->name,
-                                   req->lazy, mnt_id, cred->uid, status,
-                                   sys_errno);
+                                   req->lazy, mnt_id, cred->uid, err);
 }
 
 static int handle_umount(sd_varlink *link, int sock,
                          const struct defused_umount_req *req, int parent_fd,
                          const struct ucred *cred) {
-    uint32_t status = DEFUSED_OK;
-    int sys_errno = 0;
-    int ret = umount_request(sock, req, parent_fd, cred, &status, &sys_errno);
-    if (ret < 0)
-        fprintf(
-            stderr,
-            "defused: unmount request failed with %s (ret=%d, errno=%d: %s)\n",
-            status_name(status), ret, sys_errno,
-            sys_errno ? strerror(sys_errno) : "none");
-    int send_ret = reply_response(link, status, sys_errno);
-    if (ret == 0)
-        ret = send_ret;
-    return ret;
+    struct defused_error err = {};
+
+    int ret = umount_request(sock, req, parent_fd, cred, &err);
+    if (ret < 0) {
+        log_request_error("unmount", &err, ret);
+        (void)reply_error(link, &err);
+        return ret;
+    }
+
+    return sd_varlink_reply(link, NULL);
 }
+
 static __attribute__((__nonnull__(1))) void usage(const char *prog) {
     fprintf(
         stderr,
