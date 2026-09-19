@@ -40,6 +40,8 @@ sandbox_lib = static_library(
 defused_exe = executable(
   'defused',
   'src/defused.c',
+  'src/defused-daemon.c',
+  'src/defused-policy.c',
   'src/defused-varlink.c',
   'src/util.c',
   c_args : common_c_args,

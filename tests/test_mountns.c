@@ -32,7 +32,7 @@
  *
  * Both scenarios send DEFUSED_OP_UNMOUNT, which now asks polkit before
  * join_peer_mnt_ns() (the same ordering constraint as mount -- see
- * check_polkit_authorized()'s doc comment in defused.c). polkit only lets
+ * defused_polkit_check_authorized() in defused-policy.c). polkit only lets
  * a *trusted* caller (uid 0, or an action's declared owner) check another
  * identity's authorization at all, and neither defused nor its simulated
  * client is real uid 0 in this unprivileged harness, so both scenarios
