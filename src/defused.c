@@ -589,12 +589,14 @@ mount_request(const struct request_context *ctx,
     return defused_sandbox_mount(pidfd, mountfd, mnt_fd, err);
 }
 
-static __attribute__((__nonnull__(1, 2))) void
-log_request_error(const char *what, const struct defused_error *err, int ret) {
+static __attribute__((__nonnull__(1, 2, 4))) void
+log_request_error(const char *what, const struct defused_error *err, int ret,
+                  const struct ucred *cred) {
     fprintf(stderr,
-            "defused: %s request failed with %s (ret=%d, errno=%d: %s)\n", what,
-            err->id, ret, err->sys_errno,
-            err->sys_errno ? strerror(err->sys_errno) : "none");
+            "defused: %s request from pid %lld (uid %u) failed with %s "
+            "(ret=%d, errno=%d: %s)\n",
+            what, (long long)cred->pid, (unsigned)cred->uid, err->id, ret,
+            err->sys_errno, err->sys_errno ? strerror(err->sys_errno) : "none");
 }
 
 static int handle_mount(sd_varlink *link, const struct request_context *ctx,
@@ -604,11 +606,15 @@ static int handle_mount(sd_varlink *link, const struct request_context *ctx,
 
     int ret = mount_request(ctx, req, mnt_fd, dev_fd, cred, &err);
     if (ret < 0) {
-        log_request_error("mount", &err, ret);
+        log_request_error("mount", &err, ret, cred);
         (void)reply_error(link, &err);
         return ret;
     }
 
+    fprintf(stderr, "defused: mounted %s%s%s for uid %u (flags %#x)\n",
+            req->mount_flags & DEFUSED_MOUNT_BLKDEV ? "fuseblk" : "fuse",
+            req->subtype[0] ? "." : "", req->subtype, (unsigned)cred->uid,
+            req->mount_flags);
     return sd_varlink_reply(link, NULL);
 }
 
@@ -711,11 +717,13 @@ static int handle_umount(sd_varlink *link, const struct request_context *ctx,
 
     int ret = umount_request(ctx, req, parent_fd, cred, &err);
     if (ret < 0) {
-        log_request_error("unmount", &err, ret);
+        log_request_error("unmount", &err, ret, cred);
         (void)reply_error(link, &err);
         return ret;
     }
 
+    fprintf(stderr, "defused: unmounted %s for uid %u%s\n", req->name,
+            (unsigned)cred->uid, req->lazy ? " (lazy)" : "");
     return sd_varlink_reply(link, NULL);
 }
 

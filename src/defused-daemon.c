@@ -77,8 +77,13 @@ int defused_run_fork_daemon(int (*handle_connection)(int sock_fd)) {
             return ret;
         }
 
-        if (live_children >= DEFUSED_DAEMON_MAX_CONNECTIONS)
+        if (live_children >= DEFUSED_DAEMON_MAX_CONNECTIONS) {
+            fprintf(stderr,
+                    "defused: refusing connection: %d already being handled "
+                    "(max %d)\n",
+                    (int)live_children, DEFUSED_DAEMON_MAX_CONNECTIONS);
             continue;
+        }
 
         pid_t pid = fork();
         if (pid == -1) {
@@ -134,6 +139,7 @@ static int create_listening_socket(void) {
         goto fail_unlink;
     }
 
+    fprintf(stderr, "defused: listening on %s\n", path);
     return TAKE_FD(fd);
 
 fail_unlink:
