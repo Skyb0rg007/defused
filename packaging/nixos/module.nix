@@ -27,6 +27,16 @@ in
         description = "The defused package to use.";
       };
 
+      replaceFusermount3 = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Install defused's fusermount3 as {file}`/run/wrappers/bin/fusermount3`,
+          where libfuse looks for it, in place of the setuid helper from
+          {option}`programs.fuse`.
+        '';
+      };
+
       extraArgs = lib.mkOption {
         type = lib.types.listOf lib.types.str;
         default = [ ];
@@ -43,7 +53,45 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    environment.systemPackages = [ package ];
+    # hiPrio: programs.fuse also puts a fusermount3 into the system path.
+    environment.systemPackages = [ (if cfg.replaceFusermount3 then lib.hiPrio package else package) ];
+
+    warnings =
+      lib.optional (config.programs.fuse.enable && !cfg.replaceFusermount3) ''
+        services.defused.replaceFusermount3 is off while programs.fuse is on,
+        so /run/wrappers/bin/fusermount3 is libfuse's setuid helper and FUSE
+        programs use it instead of defused. Programs started with
+        no_new_privs still cannot mount.
+      ''
+      ++
+        lib.optional
+          (
+            config.programs.fuse.enable
+            && cfg.replaceFusermount3
+            && (config.programs.fuse.userAllowOther || config.programs.fuse.mountMax != 1000)
+          )
+          ''
+            programs.fuse.userAllowOther and programs.fuse.mountMax only
+            configure libfuse's fusermount, which services.defused has
+            replaced; polkit decides these for defused instead (see
+            security.polkit.extraConfig and doc/protocol.md).
+          '';
+
+    # mkForce: programs.fuse defines the same wrapper, as setuid libfuse.
+    # Every submodule option is set so none of its definition survives.
+    security.wrappers.fusermount3 = lib.mkIf cfg.replaceFusermount3 (
+      lib.mkForce {
+        enable = true;
+        program = "fusermount3";
+        source = "${package}/bin/fusermount3";
+        owner = "root";
+        group = "root";
+        permissions = "u+rx,g+x,o+x";
+        capabilities = "";
+        setuid = false;
+        setgid = false;
+      }
+    );
 
     # defused asks polkit whether a client may create a FUSE mount at all
     # (see doc/protocol.md); polkitd has to actually be running for that
