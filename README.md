@@ -103,7 +103,7 @@ works.
 ```
 
 This replaces `/run/wrappers/bin/fusermount3` with defused's, so every FUSE
-program uses it.
+program uses it, and installs the recommended polkit rule.
 See `services.defused.*` for the options.
 
 ## Nix binary cache

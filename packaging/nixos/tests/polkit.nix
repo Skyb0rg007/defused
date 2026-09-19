@@ -32,6 +32,7 @@ let
       boot.kernelModules = [ "fuse" ];
       services.defused.enable = true;
       services.defused.package = package;
+      services.defused.recommendedPolkitRule = pkgs.lib.mkDefault false;
       users.users.alice = {
         isNormalUser = true;
         createHome = true;
@@ -47,16 +48,15 @@ pkgs.testers.nixosTest {
     # that challenge, so every mount must be refused.
     denied = plainNode;
 
-    # Installs the actual shipped example rule (polkit/examples/
-    # 50-defused-mount-policy.rules) rather than an ad-hoc one, so this test
-    # also proves that specific file is correct, not just that *some* rule
-    # using current-mounts can grant the base mount action.
+    # The module option installs the actual shipped example rule
+    # (polkit/examples/50-defused-mount-policy.rules) rather than an ad-hoc
+    # one, so this test also proves that specific file is correct, not just
+    # that *some* rule using current-mounts can grant the base mount action.
     allowed =
       { ... }:
       {
         imports = [ plainNode ];
-        environment.etc."polkit-1/rules.d/50-defused-mount-policy.rules".source =
-          ../../polkit/examples/50-defused-mount-policy.rules;
+        services.defused.recommendedPolkitRule = true;
       };
 
     # A rule that explicitly adds "allow_other" to its allowlist, unlike
