@@ -9,8 +9,8 @@ SPDX-License-Identifier: GPL-2.0-or-later
 ## Build and test
 
 If possible, use a Nix dev shell to make the tools available.
-Otherwise, the project has runtime dependencies on libseccomp and libsystemd,
-build-time dependencies on meson and ninja.
+Otherwise, the project has runtime dependencies on libseccomp and libsystemd
+(258 or later), build-time dependencies on meson and ninja.
 You should also install treefmt, nixfmt, and clang-tools for development.
 
 ```sh

@@ -12,7 +12,9 @@ project(
 
 cc = meson.get_compiler('c')
 seccomp_dep = dependency('libseccomp')
-systemd_dep = dependency('libsystemd')
+# sd-varlink fd passing (SD_VARLINK_SERVER_FD_PASSING_INPUT_STRICT,
+# sd_varlink_get_n_fds) is new in systemd 258.
+systemd_dep = dependency('libsystemd', version : '>= 258')
 
 # Not $libdir: the systemd unit and AppArmor profile hard-code this path.
 defused_install_dir = get_option('prefix') / 'lib/defused'
