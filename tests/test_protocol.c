@@ -548,6 +548,19 @@ int main(int argc, char *argv[]) {
                              DEFUSED_VARLINK_ERROR_BAD_OPTION) != 0)
         return 1;
 
+    /* Only `defused --child` accepts these, never the service. */
+    struct defused_mount_req privileged_opt = {
+        .mount_flags = DEFUSED_MOUNT_ALLOW_SUID,
+    };
+    if (run_mount_req_expect(argv[1], &privileged_opt, ".",
+                             DEFUSED_VARLINK_ERROR_BAD_OPTION) != 0)
+        return 1;
+    privileged_opt.mount_flags = DEFUSED_MOUNT_BLKDEV;
+    strcpy(privileged_opt.fsname, "dev");
+    if (run_mount_req_expect(argv[1], &privileged_opt, ".",
+                             DEFUSED_VARLINK_ERROR_BAD_OPTION) != 0)
+        return 1;
+
     if (getuid() != 0) {
         const char *unowned = find_unowned_dir();
         if (unowned == NULL) {

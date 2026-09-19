@@ -132,9 +132,11 @@ static void check_forwarded_fd(int comm_fd) {
 
 /* The -o string test_mount() and test_privileged_mount() send, and what
  * method_mount() expects it to have been parsed into. */
-static const char mount_opts[] =
-    "ro,noexec,suid,dev,sync,dirsync,fsname=test\\,fs,subtype=mem\\,fs,"
-    "max_read=4096,default_permissions,nonempty,x-gvfs-hide";
+#define MOUNT_OPTS                                                             \
+    "ro,noexec,suid,dev,sync,dirsync,fsname=test\\,fs,subtype=mem\\,fs,"       \
+    "max_read=4096,default_permissions,nonempty,x-gvfs-hide"
+static const char mount_opts[] = MOUNT_OPTS;
+static const char privileged_mount_opts[] = MOUNT_OPTS ",blkdev";
 
 static int method_mount(sd_varlink *link, sd_json_variant *parameters,
                         sd_varlink_method_flags_t flags, void *userdata) {
@@ -176,6 +178,10 @@ static int method_mount(sd_varlink *link, sd_json_variant *parameters,
         DEFUSED_MOUNT_RDONLY | DEFUSED_MOUNT_NOEXEC | DEFUSED_MOUNT_ALLOW_DEV |
         DEFUSED_MOUNT_SYNCHRONOUS | DEFUSED_MOUNT_DIRSYNC |
         DEFUSED_FUSE_DEFAULT_PERMISSIONS;
+    /* suid is ignored for an unprivileged caller and honored for a
+     * privileged one, which also sends blkdev (see privileged_mount_opts). */
+    if (strcmp(getenv("DEFUSED_TEST_UID"), "0") == 0)
+        expected_flags |= DEFUSED_MOUNT_ALLOW_SUID | DEFUSED_MOUNT_BLKDEV;
     CHECK(p.mount_flags == expected_flags);
     CHECK(p.max_read == 4096);
     CHECK(p.blksize == 0);
@@ -320,7 +326,7 @@ static int test_privileged_mount(const char *client) {
     _cleanup_close_pair_ int comm[2] = EBADF_PAIR;
     CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, comm) == 0);
 
-    char *args[] = {(char *)"-o", (char *)mount_opts, (char *)"."};
+    char *args[] = {(char *)"-o", (char *)privileged_mount_opts, (char *)"."};
     pid_t pid;
     CHECK(spawn_client(client, comm[1], args, 3, &pid) == 0);
     comm[1] = safe_close(comm[1]);

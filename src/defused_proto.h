@@ -54,8 +54,11 @@ enum defused_op {
 /* Max length of an error id in struct defused_error */
 #define DEFUSED_MAX_ERROR_ID 64
 
-/* Max length of fsname and subtype */
+/* Max length of subtype */
 #define DEFUSED_MAX_NAME 32
+
+/* Max length of fsname (a device path for blkdev) */
+#define DEFUSED_MAX_FSNAME 4096
 
 /* Mountpoint basename */
 #define DEFUSED_MAX_FILENAME 255
@@ -82,13 +85,19 @@ enum defused_mount_flag {
     DEFUSED_FUSE_ALLOW_OTHER = 1u << 8,
     /* Have Linux VFS perform Unix permission checks */
     DEFUSED_FUSE_DEFAULT_PERMISSIONS = 1u << 9,
+    /* Honor set-user-ID bits (privileged) */
+    DEFUSED_MOUNT_ALLOW_SUID = 1u << 10,
+    /* Mount fuseblk on the block device named by fsname (privileged) */
+    DEFUSED_MOUNT_BLKDEV = 1u << 11,
 };
+#define DEFUSED_MOUNT_PRIVILEGED_FLAGS                                         \
+    (DEFUSED_MOUNT_ALLOW_SUID | DEFUSED_MOUNT_BLKDEV)
 #define DEFUSED_MOUNT_FLAGS_MASK                                               \
     (DEFUSED_MOUNT_RDONLY | DEFUSED_MOUNT_ALLOW_DEV | DEFUSED_MOUNT_NOEXEC |   \
      DEFUSED_MOUNT_NOATIME | DEFUSED_MOUNT_NODIRATIME |                        \
      DEFUSED_MOUNT_NOSYMFOLLOW | DEFUSED_MOUNT_SYNCHRONOUS |                   \
      DEFUSED_MOUNT_DIRSYNC | DEFUSED_FUSE_ALLOW_OTHER |                        \
-     DEFUSED_FUSE_DEFAULT_PERMISSIONS)
+     DEFUSED_FUSE_DEFAULT_PERMISSIONS | DEFUSED_MOUNT_PRIVILEGED_FLAGS)
 
 /*
  * Request a FUSE mount. The Varlink call carries two file descriptors,
@@ -108,7 +117,7 @@ struct defused_mount_req {
     uint32_t max_read;
     /* maximum block size, 0 for unset */
     uint32_t blksize;
-    char fsname[DEFUSED_MAX_NAME];
+    char fsname[DEFUSED_MAX_FSNAME];
     char subtype[DEFUSED_MAX_NAME];
 };
 

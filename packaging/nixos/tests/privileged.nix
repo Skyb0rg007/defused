@@ -66,6 +66,18 @@ pkgs.testers.nixosTest {
             "' - fuse fuse ' allow_other"
         )
 
+    with subtest("suid and blkdev work like libfuse's root path"):
+        machine.succeed(
+            helper + "assert-mount /root/mnt suid ' - fuse fuse ' rw '!nosuid'"
+        )
+        machine.succeed("truncate -s 1M /root/blk.img")
+        dev = machine.succeed("losetup -f --show /root/blk.img").strip()
+        machine.succeed(
+            helper + f"assert-mount /root/mnt blkdev,fsname={dev} "
+            f"' - fuseblk {dev} ' rw"
+        )
+        machine.succeed(f"losetup -d {dev}")
+
     with subtest("the mountpoint need not be owned by the caller"):
         machine.succeed("install -d -o alice -g users /home/alice/mnt")
         machine.succeed(

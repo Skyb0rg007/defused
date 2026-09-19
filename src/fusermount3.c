@@ -66,8 +66,8 @@ struct flag_opt {
 static const struct flag_opt flag_opts[] = {
     {"rw", DEFUSED_MOUNT_RDONLY, false, true},
     {"ro", DEFUSED_MOUNT_RDONLY, true, true},
-    {"suid", 0, true, false},
-    {"nosuid", 0, false, true},
+    {"suid", DEFUSED_MOUNT_ALLOW_SUID, true, false},
+    {"nosuid", DEFUSED_MOUNT_ALLOW_SUID, false, true},
     {"dev", DEFUSED_MOUNT_ALLOW_DEV, true, true},
     {"nodev", DEFUSED_MOUNT_ALLOW_DEV, false, true},
     {"exec", DEFUSED_MOUNT_NOEXEC, false, true},
@@ -116,7 +116,7 @@ static void print_service_error(uint32_t op, const char *mnt,
 static int parse_mount_opts(const char *opts, struct defused_mount_req *req)
     __attribute__((__nonnull__(1, 2), __warn_unused_result__));
 static int copy_name(char *dst, size_t dstsz, const char *what, const char *s,
-                     unsigned len)
+                     unsigned len, bool allow_slash)
     __attribute__((__nonnull__(1, 3, 4), __warn_unused_result__));
 static int parse_u32(const char *s, unsigned len, const char *pfx,
                      uint32_t *out)
@@ -516,7 +516,8 @@ static void usage(void) {
  * - fsname=/subtype= honor backslash escapes
  * - auto_unmount sets the global configuration variable
  * - the legacy/internal options are dropped silently
- * - unsafe flag options (just suid) are warned about and ignored
+ * - unsafe flag options (just suid) and blkdev are privileged: otherwise
+ *   suid is warned about and ignored, blkdev is an error
  * - anything unrecognized is a hard error.
  */
 static int parse_mount_opts(const char *opts, struct defused_mount_req *req) {
@@ -534,17 +535,20 @@ static int parse_mount_opts(const char *opts, struct defused_mount_req *req) {
 
         if (begins_with(s, "fsname=")) {
             int ret = copy_name(req->fsname, sizeof(req->fsname), "fsname",
-                                s + 7, len - 7);
+                                s + 7, len - 7, privileged);
             if (ret < 0)
                 return ret;
         } else if (begins_with(s, "subtype=")) {
             int ret = copy_name(req->subtype, sizeof(req->subtype), "subtype",
-                                s + 8, len - 8);
+                                s + 8, len - 8, false);
             if (ret < 0)
                 return ret;
         } else if (opt_eq(s, len, "blkdev")) {
-            fprintf(stderr, "%s: option blkdev is not supported\n", progname);
-            return -EPERM;
+            if (!privileged) {
+                fprintf(stderr, "%s: option blkdev is privileged\n", progname);
+                return -EPERM;
+            }
+            mount_flags |= DEFUSED_MOUNT_BLKDEV;
         } else if (opt_eq(s, len, "auto_unmount")) {
             auto_unmount = true;
         } else if (opt_eq(s, len, "default_permissions")) {
@@ -573,7 +577,7 @@ static int parse_mount_opts(const char *opts, struct defused_mount_req *req) {
                         (int)len, s);
                 return -EINVAL;
             }
-            if (!fo->safe)
+            if (!fo->safe && !privileged)
                 fprintf(stderr, "%s: unsafe option %s ignored\n", progname,
                         fo->opt);
             else if (fo->on)
@@ -595,13 +599,13 @@ static int parse_mount_opts(const char *opts, struct defused_mount_req *req) {
  * checking character/length rules.
  * Escaped commas are valid here, matching libfuse's fuse_opt parser. */
 static int copy_name(char *dst, size_t dstsz, const char *what, const char *s,
-                     unsigned len) {
+                     unsigned len, bool allow_slash) {
     size_t d = 0;
     for (unsigned i = 0; i < len; i++) {
         char ch = s[i];
         if (ch == '\\' && i + 1 < len)
             ch = s[++i];
-        if (ch == '/') {
+        if (ch == '/' && !allow_slash) {
             fprintf(stderr, "%s: invalid character '%c' in %s\n", progname, ch,
                     what);
             return -EINVAL;
