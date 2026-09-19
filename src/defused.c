@@ -58,8 +58,8 @@
  * packaging/polkit/examples/50-defused-mount-policy.rules does this by checking
  * requested names against its own allowlist and falling back otherwise, so a
  * rule written before a new privileged option existed denies it by default
- * instead of silently granting it. Add future privileged options (suid, cuse,
- * blkdev, ...) here as they're implemented. */
+ * instead of silently granting it. Add future privileged options here as
+ * they're implemented. */
 static const struct {
     uint32_t flag;
     const char *name;
@@ -73,8 +73,8 @@ struct request_context {
 };
 
 struct prepared_mount {
-    char type[2 * DEFUSED_MAX_NAME + 16];
-    char source[DEFUSED_MAX_NAME];
+    char type[DEFUSED_MAX_NAME + 16];
+    char source[DEFUSED_MAX_FSNAME];
     char fd[32];
     char rootmode[32];
     char user_id[32];
@@ -579,7 +579,9 @@ prepare_mount(const struct defused_mount_req *req, int dev_fd,
               const struct stat *st, const struct ucred *cred,
               struct prepared_mount *out) {
     memset(out, 0, sizeof(*out));
-    snprintf(out->type, sizeof(out->type), "fuse%s%s",
+    uint32_t flags = req->mount_flags & DEFUSED_MOUNT_FLAGS_MASK;
+    snprintf(out->type, sizeof(out->type), "%s%s%s",
+             flags & DEFUSED_MOUNT_BLKDEV ? "fuseblk" : "fuse",
              req->subtype[0] ? "." : "", req->subtype);
     snprintf(out->source, sizeof(out->source), "%s",
              req->fsname[0] ? req->fsname : "fuse");
@@ -597,9 +599,10 @@ prepare_mount(const struct defused_mount_req *req, int dev_fd,
     }
     out->have_subtype = req->subtype[0] != '\0';
 
-    uint32_t flags = req->mount_flags & DEFUSED_MOUNT_FLAGS_MASK;
     out->flags = flags;
-    out->mount_attrs = MOUNT_ATTR_NOSUID;
+    out->mount_attrs = 0;
+    if (!(flags & DEFUSED_MOUNT_ALLOW_SUID))
+        out->mount_attrs |= MOUNT_ATTR_NOSUID;
     if (flags & DEFUSED_MOUNT_RDONLY)
         out->mount_attrs |= MOUNT_ATTR_RDONLY;
     if (!(flags & DEFUSED_MOUNT_ALLOW_DEV))
@@ -625,7 +628,7 @@ create_detached_mount(const struct prepared_mount *mnt) {
         const char *value;
         bool present;
     } strings[] = {
-        {"subtype", mnt->type + 5, mnt->have_subtype},
+        {"subtype", strchr(mnt->type, '.') + 1, mnt->have_subtype},
         {"source", mnt->source, true},
         {"fd", mnt->fd, true},
         {"rootmode", mnt->rootmode, true},
@@ -705,9 +708,11 @@ mount_request(const struct request_context *ctx,
               const struct ucred *cred, struct defused_error *err) {
     /* varlink_mount() already bounds-checked these before copying them out
      * of the JSON payload. */
-    assert(strnlen(req->fsname, DEFUSED_MAX_NAME) < DEFUSED_MAX_NAME);
+    assert(strnlen(req->fsname, DEFUSED_MAX_FSNAME) < DEFUSED_MAX_FSNAME);
     assert(strnlen(req->subtype, DEFUSED_MAX_NAME) < DEFUSED_MAX_NAME);
-    if (strchr(req->fsname, '/') || strchr(req->subtype, '/')) {
+    if ((!ctx->privileged && strchr(req->fsname, '/')) ||
+        strchr(req->subtype, '/') ||
+        ((req->mount_flags & DEFUSED_MOUNT_BLKDEV) && !req->fsname[0])) {
         defused_error_set(err, DEFUSED_VARLINK_ERROR_MALFORMED, EINVAL);
         return -EINVAL;
     }
@@ -715,7 +720,10 @@ mount_request(const struct request_context *ctx,
     /* Policy questions like whether this caller may use allow_other are
      * answered entirely by polkit (see check_polkit_authorized()); this
      * only validates protocol shape. */
-    if ((req->mount_flags & ~(uint32_t)DEFUSED_MOUNT_FLAGS_MASK) != 0) {
+    uint32_t allowed = DEFUSED_MOUNT_FLAGS_MASK;
+    if (!ctx->privileged)
+        allowed &= ~(uint32_t)DEFUSED_MOUNT_PRIVILEGED_FLAGS;
+    if ((req->mount_flags & ~allowed) != 0) {
         defused_error_set(err, DEFUSED_VARLINK_ERROR_BAD_OPTION, 0);
         return -EINVAL;
     }

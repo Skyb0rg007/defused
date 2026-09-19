@@ -33,9 +33,8 @@ It must be started as root.
 - **Discovery**: the socket inode is tagged with the extended attribute
   `user.varlink=entrypoint` as recommended by the [Varlink UAPI Spec][].
   This only works on Linux 7.0 and above.
-- **`--child`**: the connected socket arrives the same way, but from
-  `sd_varlink_connect_exec(3)` in `fusermount3` rather than from systemd;
-  see [Privileged callers](#privileged-callers).
+- **`--child`**: the same, but spawned by `fusermount3` via
+  `sd_varlink_connect_exec(3)`; see [Privileged callers](#privileged-callers).
 
 The service handles one Varlink method call and exits when the connection goes
 idle.
@@ -73,10 +72,10 @@ array associated with the call. `fusermount3` sends `0` and `1`, respectively.
 `mountFlags` is the final option bitmask requested by the client. The empty
 bitmask is the fusermount3-compatible unprivileged default: `nosuid` and
 `nodev` are enforced unless the client explicitly sets
-`DEFUSED_MOUNT_ALLOW_DEV`.
+`DEFUSED_MOUNT_ALLOW_DEV` (or, from a privileged caller,
+`DEFUSED_MOUNT_ALLOW_SUID`).
 
-Policy applied before the mount is attempted (only the first two for a
-[privileged caller](#privileged-callers)):
+Policy applied before the mount is attempted:
 
 - The mountpoint must be a directory or regular file
   (`MalformedRequest` otherwise).
@@ -136,22 +135,21 @@ reference would make a non-lazy unmount fail with `EBUSY`.
 
 ## Privileged callers
 
-A `fusermount3` caller that is root or holds `CAP_SYS_ADMIN` can mount by
-itself, and the service's policy would only get in its way: root could not
-mount on a directory it does not own, or on a filesystem type outside
-libfuse's allowlist, or without a polkit rule.
+A `fusermount3` caller that is root or holds `CAP_SYS_ADMIN` does not use the
+service: it spawns `defused --child` with `sd_varlink_connect_exec(3)` and
+speaks the same protocol to it.
+The child validates the request for shape, skips the ownership rule, the
+filesystem-type allowlist, polkit, and the unmount `user_id=` check, and calls
+`move_mount()` or `umount2()` directly in the caller's mount namespace.
+Like root's `umount`, it unmounts any mount below the parent directory.
 
-Such a caller never connects to the socket.
-`fusermount3` instead spawns `defused --child` with
-`sd_varlink_connect_exec(3)` and speaks the same protocol to it over a
-socketpair.
-The child validates the request for shape as the service does, then skips the
-ownership rule, the filesystem-type allowlist, polkit, and the unmount
-`user_id=` check, and calls `move_mount()` or `umount2()` directly: it
-already runs in the caller's mount namespace with the caller's privileges, so
-there is no namespace to join and nothing to sandbox against.
-Like root's `umount`, it will unmount any mount below the parent directory,
-not only FUSE ones.
+It is also the only path that accepts `DEFUSED_MOUNT_ALLOW_SUID` (`suid`) and
+`DEFUSED_MOUNT_BLKDEV` (`blkdev`: a `fuseblk` mount whose `fsName` is the
+block device path, so it may contain slashes here), as libfuse's `fusermount3`
+does for root.
+The service answers `BadMountOption` to both rather than asking polkit, since
+a rule granting `suid` would let a user's FUSE server hand out setuid-root
+binaries.
 
 ## Errors
 
@@ -169,7 +167,7 @@ error UnmountFailed(errno: int)
 | Error | Meaning |
 | --- | --- |
 | `MalformedRequest` | Request-level validation failure after Varlink parsing and fd binding; `errno` says what was wrong with it |
-| `BadMountOption` | `mountFlags` outside its allowed mask |
+| `BadMountOption` | `mountFlags` outside its allowed mask, or a privileged-only flag sent to the service |
 | `NotAllowed` | The mountpoint/mount is not the caller's to use, or polkit denied the operation |
 | `NotAFuseMount` | Unmount target is not a FUSE mount |
 | `MountFailed` | Mount setup, joining the caller's mount namespace, or attachment failed, or polkit could not be reached |

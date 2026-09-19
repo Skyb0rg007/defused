@@ -149,9 +149,13 @@ let
         raise RuntimeError(f"no mountinfo entry for {mountpoint}")
 
     def assert_tokens(line, tokens):
-        missing = [token for token in tokens if token not in line]
-        if missing:
-            raise AssertionError(f"missing {missing!r} from mountinfo line: {line}")
+        """A token starting with '!' must be absent from the line."""
+        missing = [t for t in tokens if not t.startswith("!") and t not in line]
+        present = [t for t in tokens if t.startswith("!") and t[1:] in line]
+        if missing or present:
+            raise AssertionError(
+                f"missing {missing!r}, unexpected {present!r} in mountinfo line: {line}"
+            )
 
     def assert_mount(mountpoint, opts, tokens):
         fuse_fd = mount_fuse(mountpoint, opts)

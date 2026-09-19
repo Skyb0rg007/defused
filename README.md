@@ -59,7 +59,8 @@ accepted connections.
 A caller that is root or holds `CAP_SYS_ADMIN` does not need the service:
 `fusermount3` instead spawns `defused --child`, which performs the request
 with the caller's own privileges and none of the service's policy (no polkit,
-no mountpoint ownership rule, no filesystem-type allowlist).
+no mountpoint ownership rule, no filesystem-type allowlist), and honors the
+`suid` and `blkdev` options like libfuse's `fusermount3` does for root.
 libfuse's own `fusermount3` is therefore not needed at all.
 
 ## Mountpoint ownership model
