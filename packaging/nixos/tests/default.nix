@@ -29,6 +29,7 @@ let
     polkit = ./polkit.nix;
     apparmor = ./apparmor.nix;
     privileged = ./privileged.nix;
+    desktop = ./desktop.nix;
   };
 
   # "linux-6_12": stable across point releases.

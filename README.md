@@ -93,6 +93,19 @@ deny access to `/dev/fuse` or `/run/defused/defused.sock`.
 See [protocol.md](./doc/protocol.md) for more information on how defused
 works.
 
+## NixOS
+
+```nix
+{
+  imports = [ inputs.defused.nixosModules.defused ];
+  services.defused.enable = true;
+}
+```
+
+This replaces `/run/wrappers/bin/fusermount3` with defused's, so every FUSE
+program uses it.
+See `services.defused.*` for the options.
+
 ## Nix binary cache
 
 I am using cachix as a binary cache:
