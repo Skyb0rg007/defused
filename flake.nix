@@ -100,6 +100,7 @@
               pkgs.clang-tools
               pkgs.reuse
               pkgs.fuse3
+              pkgs.act
             ];
             shellHook = ''
               export NIX_CFLAGS_COMPILE="-U_FORTIFY_SOURCE $NIX_CFLAGS_COMPILE"

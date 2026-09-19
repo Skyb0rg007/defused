@@ -1,0 +1,82 @@
+# SPDX-FileCopyrightText: 2026 Skye Soss <skye@soss.website>
+#
+# SPDX-License-Identifier: MIT-0
+
+# Build, test and install defused on an FHS distro with its own toolchain
+# and packages, then drive the installed binaries end to end
+# (tests/fhs/e2e.sh). Everything else runs under Nix, which is how the
+# systemd unit mismatch in #47 went unnoticed. Manually triggered; runs
+# locally with `act -W .github/workflows/test-fhs.yml` from the dev shell.
+#
+# Inside a container there is no systemd as PID 1, so the service runs as
+# `defused --daemon` and the units are only checked with systemd-analyze
+# verify.
+
+name: test-fhs
+
+on:
+  workflow_dispatch: ~
+
+permissions:
+  contents: read
+
+jobs:
+  ubuntu:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:26.04
+      # For /dev/fuse and the mount(2) calls defused makes.
+      options: --privileged
+    steps:
+      # Before checkout: the stock image has no git.
+      - name: Install packages
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            apparmor \
+            dbus \
+            fuse-overlayfs \
+            gcc \
+            git \
+            libc6-dev \
+            libseccomp-dev \
+            libsystemd-dev \
+            meson \
+            ninja-build \
+            pkgconf \
+            polkitd \
+            python3 \
+            systemd \
+            util-linux
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Build and run the Meson tests
+        run: |
+          meson setup build --prefix=/usr
+          meson compile -C build
+          meson test -C build --print-errorlogs
+      - name: Install
+        run: |
+          meson install -C build
+          install -D -m 0644 -t /usr/lib/systemd/system \
+            packaging/systemd/defused.socket packaging/systemd/defused@.service
+      - name: Check the systemd units and the AppArmor profile
+        run: |
+          systemd-analyze verify /usr/lib/systemd/system/defused.socket
+          apparmor_parser --skip-kernel-load --skip-cache /etc/apparmor.d/defused
+      - name: Start polkit and defused --daemon
+        run: |
+          install -D -m 0644 tests/fhs/50-defused-test.rules \
+            /etc/polkit-1/rules.d/50-defused-test.rules
+          mkdir -p /run/dbus /run/defused
+          dbus-daemon --system --fork
+          setsid /usr/lib/defused/defused --daemon >/run/defused/daemon.log 2>&1 &
+          for _ in $(seq 50); do
+            test -S /run/defused/defused.sock && break
+            sleep 0.1
+          done
+          test -S /run/defused/defused.sock
+      - name: End-to-end test
+        run: tests/fhs/e2e.sh
+      - name: Show the daemon log
+        if: always()
+        run: cat /run/defused/daemon.log || true

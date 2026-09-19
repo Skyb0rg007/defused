@@ -43,6 +43,9 @@ unmounts, the service resolves a client's pidfd to its pid with the
 line of `/proc/self/fdinfo/<pidfd>` on older kernels.
 Privileged callers (see below) have neither requirement.
 
+Building needs libsystemd 258 or later, for the sd-varlink file descriptor
+passing API. Debian 13 (systemd 257) and Ubuntu 24.04 (255) are too old.
+
 ## Project structure
 
 This project provides the following:
