@@ -41,6 +41,11 @@
         // {
           # doCheck = true, so building the package runs `meson test`.
           meson-tests = self.packages.${system}.defused;
+          # The same, for a build with no polkit (and so no D-Bus) code.
+          meson-tests-no-polkit = self.packages.${system}.defused.overrideAttrs (old: {
+            pname = "defused-no-polkit";
+            mesonFlags = (old.mesonFlags or [ ]) ++ [ "-Dpolkit=false" ];
+          });
 
           reuse-lint = pkgs.runCommand "defused-reuse-lint" { nativeBuildInputs = [ pkgs.reuse ]; } ''
             cd ${src}

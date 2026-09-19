@@ -30,24 +30,7 @@
  * Neither test reaches a real FUSE mount/unmount. The client creates only a
  * private bind mount inside its own mount namespace.
  *
- * Both scenarios send DEFUSED_OP_UNMOUNT, which now asks polkit before
- * join_peer_mnt_ns() (the same ordering constraint as mount -- see
- * defused_polkit_check_authorized() in defused-policy.c). polkit only lets
- * a *trusted* caller (uid 0, or an action's declared owner) check another
- * identity's authorization at all, and neither defused nor its simulated
- * client is real uid 0 in this unprivileged harness, so both scenarios
- * are expected to be turned away there with UnmountFailed, before ever
- * reaching the setns() logic these tests were written to distinguish -- so,
- * unprivileged, the two scenarios are no longer distinguishable from each
- * other via this harness, and neither actually exercises setns() at all.
- * Both CHECKs below accept UnmountFailed alongside each test's originally
- * expected error so they still pass unprivileged (and still verify the
- * polkit gate really runs before anything namespace-sensitive).
- * test_cannot_join still catches the bug it cares most about either way:
- * silently falling back to defused's own namespace instead of failing would
- * show up as neither of its two accepted errors. Real, trusted-caller (root)
- * coverage of both mount and unmount across mount namespaces lives in
- * packaging/nixos/tests/mount-namespace.nix instead.
+ * Unprivileged, policy or the mountinfo check refuses both before setns().
  */
 #define _GNU_SOURCE
 #include "common.h"
@@ -151,11 +134,7 @@ static int scratch_mount_create(struct scratch_mount *m) {
     return 0;
 }
 
-/* Sends an unmount request for a bind mount that is intentionally not FUSE.
- * A service that can enter the client's namespace should therefore return
- * NotAFuseMount; one that cannot should fail earlier with UnmountFailed. In
- * this unprivileged harness both are instead turned away even earlier, by
- * polkit -- see the file-level comment above. Takes ownership of sock_fd. */
+/* Unmount of a non-FUSE bind mount. Takes ownership of sock_fd. */
 static int send_non_fuse_umount_request(int sock_fd,
                                         struct defused_error *err) {
     _cleanup_close_ int sock = sock_fd;
@@ -410,11 +389,14 @@ static int test_cannot_join(const char *defused_path) {
         struct defused_error err;
         int ret = send_non_fuse_umount_request(client_sock, &err);
         bool accepted =
-            ret == 0 && !strcmp(err.id, DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED);
+            ret == 0 &&
+            (!strcmp(err.id, DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED) ||
+             !strcmp(err.id, DEFUSED_VARLINK_ERROR_NOT_A_FUSE_MOUNT));
         if (!accepted)
-            fprintf(stderr, "test_cannot_join: got %s, expected %s\n",
+            fprintf(stderr, "test_cannot_join: got %s, expected %s or %s\n",
                     err.id[0] ? err.id : "a successful reply",
-                    DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED);
+                    DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED,
+                    DEFUSED_VARLINK_ERROR_NOT_A_FUSE_MOUNT);
         _exit(accepted ? 0 : 1);
     }
 

@@ -15,6 +15,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -51,7 +52,9 @@ static void sigterm_waitp(pid_t *pid) {
     }
 }
 
-static int spawn_defused(const char *defused_path, int *client_sock,
+/* extra_args: NULL-terminated service arguments, or NULL. */
+static int spawn_defused(const char *defused_path,
+                         const char *const *extra_args, int *client_sock,
                          pid_t *out_pid) {
     _cleanup_close_pair_ int sv[2] = EBADF_PAIR;
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == -1) {
@@ -74,7 +77,15 @@ static int spawn_defused(const char *defused_path, int *client_sock,
         snprintf(pidbuf, sizeof(pidbuf), "%d", (int)getpid());
         setenv("LISTEN_PID", pidbuf, 1);
         setenv("LISTEN_FDS", "1", 1);
-        execl(defused_path, "defused", NULL);
+        const char *argv[8] = {"defused"};
+        size_t argc = 1;
+        while (extra_args != NULL && extra_args[argc - 1] != NULL &&
+               argc < sizeof(argv) / sizeof(argv[0]) - 1) {
+            argv[argc] = extra_args[argc - 1];
+            argc++;
+        }
+        argv[argc] = NULL;
+        execv(defused_path, (char *const *)argv);
         perror("exec");
         _exit(127);
     }
@@ -128,11 +139,12 @@ static int send_mount_req(int sock_fd, const struct defused_mount_req *req,
 /* Runs one mount request against a fresh defused instance and reports the
  * error it came back with via *err; callers decide what counts as a pass. */
 static int run_mount_req(const char *defused_path,
+                         const char *const *extra_args,
                          const struct defused_mount_req *req, const char *path,
                          const char *dev_path, struct defused_error *err) {
     _cleanup_close_ int sock = -EBADF;
     pid_t pid;
-    int ret = spawn_defused(defused_path, &sock, &pid);
+    int ret = spawn_defused(defused_path, extra_args, &sock, &pid);
     if (ret < 0)
         return ret;
 
@@ -171,10 +183,12 @@ static int run_mount_req(const char *defused_path,
 }
 
 static int run_mount_req_expect(const char *defused_path,
+                                const char *const *extra_args,
                                 const struct defused_mount_req *req,
                                 const char *path, const char *expect_id) {
     struct defused_error err;
-    int ret = run_mount_req(defused_path, req, path, "/dev/null", &err);
+    int ret =
+        run_mount_req(defused_path, extra_args, req, path, "/dev/null", &err);
     if (ret < 0)
         return ret;
     if (strcmp(err.id, expect_id) != 0) {
@@ -200,19 +214,14 @@ static const char *find_unowned_dir(void) {
     return NULL;
 }
 
-/* The mountpoint ownership check happens before the polkit check, so it
- * takes a real self-owned mountpoint (and a real /dev/fuse fd, since
- * check_fuse_device_fd() validates the device major/minor) to reach
- * defused_polkit_check_authorized() at all. Skips gracefully if this sandbox has
- * no /dev/fuse, rather than asserting anything about polkit's specific
- * answer -- what matters here is that an unauthorized request never gets
- * past this gate to the privileged mount syscalls, not what a particular
- * polkit configuration decides. */
+/* The policy tests need a real /dev/fuse fd and skip without one. */
 static bool fuse_device_usable(void) {
     _cleanup_close_ int probe = open("/dev/fuse", O_RDWR | O_CLOEXEC);
     return probe >= 0;
 }
 
+#ifdef HAVE_POLKIT
+/* Only that an unauthorized request never reaches the mount syscalls. */
 static int test_polkit_gate(const char *defused_path) {
     if (!fuse_device_usable()) {
         fprintf(stderr,
@@ -231,7 +240,7 @@ static int test_polkit_gate(const char *defused_path) {
 
     struct defused_mount_req req = {};
     struct defused_error err;
-    int ret = run_mount_req(defused_path, &req, dir, "/dev/fuse", &err);
+    int ret = run_mount_req(defused_path, NULL, &req, dir, "/dev/fuse", &err);
     if (ret < 0)
         return ret;
 
@@ -247,6 +256,137 @@ static int test_polkit_gate(const char *defused_path) {
                 "FAIL: expected the polkit gate to block the mount (got %s)\n",
                 err.id[0] ? err.id : "a successful reply");
         return -EINVAL;
+    }
+    return 0;
+}
+#endif /* HAVE_POLKIT */
+
+static gid_t foreign_gid(void) {
+    gid_t groups[NGROUPS_MAX];
+    int n = getgroups(NGROUPS_MAX, groups);
+    if (n < 0)
+        n = 0;
+    for (gid_t gid = 60000;; gid++) {
+        bool held = gid == getgid() || gid == getegid();
+        for (int i = 0; i < n && !held; i++)
+            held = groups[i] == gid;
+        if (!held)
+            return gid;
+    }
+}
+
+static int expect_builtin_reply(const char *defused_path,
+                                const char *const *extra_args,
+                                const struct defused_mount_req *req,
+                                const char *dir, const char *expect_id,
+                                const char *why) {
+    struct defused_error err;
+    int ret =
+        run_mount_req(defused_path, extra_args, req, dir, "/dev/fuse", &err);
+    if (ret < 0)
+        return ret;
+    if (strcmp(err.id, expect_id) != 0) {
+        fprintf(stderr, "FAIL: %s: expected %s, got %s\n", why, expect_id,
+                err.id[0] ? err.id : "a successful reply");
+        return -EINVAL;
+    }
+    return 0;
+}
+
+/* MountFailed: past the gate, the unprivileged mount syscall failed. */
+static int test_builtin_policy(const char *defused_path) {
+    if (!fuse_device_usable()) {
+        fprintf(stderr,
+                "SKIP: /dev/fuse not usable here (%s), skipping built-in "
+                "policy test\n",
+                strerror(errno));
+        return 0;
+    }
+
+    char dir_template[] = "/tmp/defused-builtin-test-XXXXXX";
+    _cleanup_(rmdirp) const char *dir = mkdtemp(dir_template);
+    if (dir == NULL) {
+        perror("mkdtemp");
+        return -errno;
+    }
+
+    char groups_arg[64];
+    snprintf(groups_arg, sizeof(groups_arg), "--allow-groups=%u",
+             (unsigned)foreign_gid());
+    const char *const wrong_group[] = {"--policy=builtin", groups_arg, NULL};
+    struct defused_mount_req plain = {};
+    int ret = expect_builtin_reply(defused_path, wrong_group, &plain, dir,
+                                   DEFUSED_VARLINK_ERROR_NOT_ALLOWED,
+                                   "caller outside --allow-groups");
+    if (ret < 0)
+        return ret;
+
+    const char *const no_privileged[] = {"--policy=builtin", NULL};
+    struct defused_mount_req allow_other = {
+        .mount_flags = DEFUSED_FUSE_ALLOW_OTHER,
+    };
+    ret = expect_builtin_reply(defused_path, no_privileged, &allow_other, dir,
+                               DEFUSED_VARLINK_ERROR_NOT_ALLOWED,
+                               "allow_other without --allow-privileged-flags");
+    if (ret < 0)
+        return ret;
+
+    const char *const with_privileged[] = {
+        "--policy=builtin", "--allow-privileged-flags=allow_other", NULL};
+    return expect_builtin_reply(defused_path, with_privileged, &allow_other,
+                                dir, DEFUSED_VARLINK_ERROR_MOUNT_FAILED,
+                                "allow_other with --allow-privileged-flags");
+}
+
+/* Rejected args: EXIT_FAILURE before touching the connection, so EOF. */
+static int expect_rejected_args(const char *defused_path,
+                                const char *const *args) {
+    _cleanup_close_ int sock = -EBADF;
+    pid_t pid;
+    int ret = spawn_defused(defused_path, args, &sock, &pid);
+    if (ret < 0)
+        return ret;
+
+    struct pollfd pfd = {.fd = sock, .events = POLLIN};
+    char byte;
+    ssize_t n = -1;
+    if (poll(&pfd, 1, 10000) > 0)
+        n = read(sock, &byte, 1);
+    if (n != 0) {
+        fprintf(stderr, "FAIL: defused accepted \"%s\" (%s)\n", args[0],
+                n < 0 ? "no EOF within 10s" : "it replied");
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+        return -EINVAL;
+    }
+
+    int wstatus;
+    waitpid(pid, &wstatus, 0);
+    if (!WIFEXITED(wstatus) || WEXITSTATUS(wstatus) != EXIT_FAILURE) {
+        fprintf(stderr, "FAIL: defused with \"%s\" did not exit with %d\n",
+                args[0], EXIT_FAILURE);
+        return -EINVAL;
+    }
+    return 0;
+}
+
+static int test_bad_args(const char *defused_path) {
+    static const char *const cases[][3] = {
+        {"--policy=bogus", NULL},
+#ifndef HAVE_POLKIT
+        {"--policy=polkit", NULL},
+#endif
+        {"--max-mounts=0", NULL},
+        {"--max-mounts=ten", NULL},
+        {"--allow-groups=defused-no-such-group", NULL},
+        {"--allow-privileged-flags=suid", NULL},
+        {"--daemon", "--child", NULL},
+        {"stray-argument", NULL},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        int ret = expect_rejected_args(defused_path, cases[i]);
+        if (ret < 0)
+            return ret;
     }
     return 0;
 }
@@ -459,14 +599,14 @@ static int open_daemon_connections(const char *sock_path,
     return 0;
 }
 
-/* Exercises the DEFUSED_DAEMON_MAX_CONNECTIONS cap in defused_run_fork_daemon():
- * opens exactly the cap's worth of connections and leaves them open without
- * sending a request, so live_children sits at the cap. A further connection
- * is then accepted by the kernel (connect() succeeds immediately, since
- * that only requires room in the listen backlog) but should be closed by
- * the daemon rather than handed to a forked child, so the client sees EOF
- * without ever getting a response. Also checks the connections under the
- * cap are untouched by the overflow. */
+/* Exercises the DEFUSED_DAEMON_MAX_CONNECTIONS cap in
+ * defused_run_fork_daemon(): opens exactly the cap's worth of connections and
+ * leaves them open without sending a request, so live_children sits at the cap.
+ * A further connection is then accepted by the kernel (connect() succeeds
+ * immediately, since that only requires room in the listen backlog) but should
+ * be closed by the daemon rather than handed to a forked child, so the client
+ * sees EOF without ever getting a response. Also checks the connections under
+ * the cap are untouched by the overflow. */
 static int test_daemon_connection_cap(const char *defused_path) {
     char dir_template[] = "/tmp/defused-daemon-cap-test-XXXXXX";
     _cleanup_(rmdirp) const char *dir = mkdtemp(dir_template);
@@ -542,10 +682,13 @@ int main(int argc, char *argv[]) {
     }
     test_set_timeout();
 
+    /* Refused for its shape; this only checks the options parse. */
+    static const char *const all_policy_args[] = {
+        "--max-mounts=5", "--allow-groups=", "--allow-privileged-flags=", NULL};
     struct defused_mount_req bad_opt = {
         .mount_flags = 1u << 31, /* never in DEFUSED_MOUNT_FLAGS_MASK */
     };
-    if (run_mount_req_expect(argv[1], &bad_opt, ".",
+    if (run_mount_req_expect(argv[1], all_policy_args, &bad_opt, ".",
                              DEFUSED_VARLINK_ERROR_BAD_OPTION) != 0)
         return 1;
 
@@ -553,13 +696,16 @@ int main(int argc, char *argv[]) {
     struct defused_mount_req privileged_opt = {
         .mount_flags = DEFUSED_MOUNT_ALLOW_SUID,
     };
-    if (run_mount_req_expect(argv[1], &privileged_opt, ".",
+    if (run_mount_req_expect(argv[1], NULL, &privileged_opt, ".",
                              DEFUSED_VARLINK_ERROR_BAD_OPTION) != 0)
         return 1;
     privileged_opt.mount_flags = DEFUSED_MOUNT_BLKDEV;
     strcpy(privileged_opt.fsname, "dev");
-    if (run_mount_req_expect(argv[1], &privileged_opt, ".",
+    if (run_mount_req_expect(argv[1], NULL, &privileged_opt, ".",
                              DEFUSED_VARLINK_ERROR_BAD_OPTION) != 0)
+        return 1;
+
+    if (test_bad_args(argv[1]) != 0)
         return 1;
 
     if (getuid() != 0) {
@@ -570,12 +716,16 @@ int main(int argc, char *argv[]) {
                     "here, skipping the mountpoint ownership test\n");
         } else {
             struct defused_mount_req not_owned = {};
-            if (run_mount_req_expect(argv[1], &not_owned, unowned,
+            if (run_mount_req_expect(argv[1], NULL, &not_owned, unowned,
                                      DEFUSED_VARLINK_ERROR_NOT_ALLOWED) != 0)
                 return 1;
         }
 
+#ifdef HAVE_POLKIT
         if (test_polkit_gate(argv[1]) != 0)
+            return 1;
+#endif
+        if (test_builtin_policy(argv[1]) != 0)
             return 1;
     }
 

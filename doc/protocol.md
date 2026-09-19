@@ -85,11 +85,13 @@ Policy applied before the mount is attempted:
   filesystem type that libfuse permits for unprivileged mounts
   (`NotAllowed` otherwise). Directories must also be searchable by
   the caller.
-- The service asks polkit (`org.freedesktop.PolicyKit1.Authority
-  .CheckAuthorization`) whether the caller may create this mount
-  (`website.soss.defused.mount`), providing the privileged options that the
-  request asks for via the `privileged-flags` detail, and the total number
-  of FUSE mounts via `current-mounts`.
+- The service asks its policy whether the caller may create this mount at
+  all. With `--policy=polkit` that is
+  `org.freedesktop.PolicyKit1.Authority.CheckAuthorization` for
+  `website.soss.defused.mount`, with the requested privileged options in the
+  `privileged-flags` detail and the total number of FUSE mounts in
+  `current-mounts`; with `--policy=builtin`, see
+  [Running without polkit](#running-without-polkit).
 
 On success, the service creates the mount with Linux's file-descriptor-based
 mount API (`fsopen()`/`fsconfig()`/`fsmount()`), attaches it to the received
@@ -116,10 +118,11 @@ The target must be a mountpoint under the parent, not just a regular directory
 inside the same mount, so the target and parent mount IDs must differ.
 From here on the `mnt_id` is what identifies the target.
 
-The service then ensures via polkit that the caller is permitted to call
-`website.soss.defused.unmount`, failing otherwise.
-The polkit check only answers whether the caller may use unmount at all,
-and thus the default policy is to always allow.
+The service then asks its policy whether the caller may unmount at all
+(`website.soss.defused.unmount` under polkit, the `--allow-groups` check
+under the built-in policy), failing otherwise.
+The check only answers whether the caller may use unmount at all, and thus
+the default policy is to always allow.
 The service then reads the caller's `/proc/<pid>/mountinfo` (the pid comes
 from the socket peer's pidfd) and checks that the target's `mnt_id` identifies
 a FUSE mount whose `user_id=` superblock option matches the caller's uid.
@@ -168,7 +171,7 @@ error UnmountFailed(errno: int)
 | --- | --- |
 | `MalformedRequest` | Request-level validation failure after Varlink parsing and fd binding; `errno` says what was wrong with it |
 | `BadMountOption` | `mountFlags` outside its allowed mask, or a privileged-only flag sent to the service |
-| `NotAllowed` | The mountpoint/mount is not the caller's to use, or polkit denied the operation |
+| `NotAllowed` | The mountpoint/mount is not the caller's to use, or policy denied the operation |
 | `NotAFuseMount` | Unmount target is not a FUSE mount |
 | `MountFailed` | Mount setup, joining the caller's mount namespace, or attachment failed, or polkit could not be reached |
 | `UnmountFailed` | Joining the caller's mount namespace or `umount2(2)` failed, or polkit could not be reached |
@@ -273,6 +276,29 @@ policy becoming insecure.
 By using a comma-separated list the polkit rule can simply require auth for
 every option it doesn't recognize: see
 `packaging/polkit/examples/50-defused-mount-policy.rules` for an example.
+
+### Running without polkit
+
+Servers often have no polkit, and a policy like "one group may create up to
+100 mounts, with no privileged options" is enough for them.
+`defused --policy=builtin` applies such a policy from the command line
+without touching D-Bus:
+
+| Option | Polkit equivalent |
+| --- | --- |
+| `--max-mounts=N` | The recommended rule's `current-mounts < 100` |
+| `--allow-groups=GROUP[,GROUP...]` | `subject.isInGroup()`; empty means any user |
+| `--allow-privileged-flags=NAME[,NAME...]` | The recommended rule's `allowedPrivilegedFlags`; empty means none |
+
+Denials are `NotAllowed`, with the reason in the service log.
+There is no `AUTH_ADMIN_KEEP` equivalent: nothing can be asked interactively.
+For unmount only the group check applies, for the reason given in the next
+section.
+
+`meson setup -Dpolkit=false` builds only the built-in policy: no sd-bus code
+is compiled (`HAVE_POLKIT` is undefined), the `.policy` file is not
+installed, and the generated `defused@.service` defaults to
+`DEFUSED_POLICY=builtin`.
 
 ### Why unmount's default policy differs from mount's
 

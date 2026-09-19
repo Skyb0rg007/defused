@@ -187,7 +187,6 @@ static int handle_connection(int sock_fd, bool privileged) {
     return EXIT_SUCCESS;
 }
 
-/* For defused_run_fork_daemon(). */
 static int handle_unprivileged_connection(int sock_fd) {
     return handle_connection(sock_fd, false);
 }
@@ -477,10 +476,9 @@ create_detached_mount(const struct prepared_mount *mnt) {
     return mountfd;
 }
 
-static __attribute__((__nonnull__(3, 4), __warn_unused_result__)) int
-authorize_mount(int pidfd, uint32_t mount_flags, const struct ucred *cred,
-                struct defused_error *err) {
-    /* Handed to polkit so a rule can implement its own mount-count policy. */
+static __attribute__((__nonnull__(4, 5), __warn_unused_result__)) int
+authorize_mount(int sock, int pidfd, uint32_t mount_flags,
+                const struct ucred *cred, struct defused_error *err) {
     errno = 0;
     int current_mounts = count_fuse_fs("defused");
     if (current_mounts < 0) {
@@ -489,15 +487,10 @@ authorize_mount(int pidfd, uint32_t mount_flags, const struct ucred *cred,
         return -err->sys_errno;
     }
 
-    char privileged_flags[128];
-    defused_format_privileged_flags(mount_flags, privileged_flags,
-                                    sizeof(privileged_flags));
-
-    int ret = defused_polkit_check_authorized(pidfd, cred,
-                                              DEFUSED_POLKIT_ACTION_MOUNT,
-                                              current_mounts, privileged_flags);
+    int ret = defused_policy_check(sock, pidfd, cred, DEFUSED_OP_MOUNT,
+                                   mount_flags, current_mounts);
     if (ret < 0) {
-        /* -EACCES is polkit's answer, not a failure to ask it. */
+        /* -EACCES is the policy's answer, not a failure to apply it. */
         if (ret == -EACCES)
             defused_error_set(err, DEFUSED_VARLINK_ERROR_NOT_ALLOWED, 0);
         else
@@ -523,10 +516,7 @@ mount_request(const struct request_context *ctx,
         return -EINVAL;
     }
 
-    /* Policy questions like whether this caller may use allow_other are
-     * answered entirely by polkit (see defused_polkit_check_authorized());
-     * this
-     * only validates protocol shape. */
+    /* Only protocol shape; policy is defused_policy_check()'s. */
     uint32_t allowed = DEFUSED_MOUNT_FLAGS_MASK;
     if (!ctx->privileged)
         allowed &= ~(uint32_t)DEFUSED_MOUNT_PRIVILEGED_FLAGS;
@@ -574,7 +564,7 @@ mount_request(const struct request_context *ctx,
             defused_error_set(err, DEFUSED_VARLINK_ERROR_MOUNT_FAILED, -pidfd);
             return pidfd;
         }
-        ret = authorize_mount(pidfd, req->mount_flags, cred, err);
+        ret = authorize_mount(ctx->sock, pidfd, req->mount_flags, cred, err);
         if (ret < 0)
             return ret;
     }
@@ -700,8 +690,8 @@ umount_request(const struct request_context *ctx,
      * the caller may use unmount at all -- whether this specific mount is
      * theirs to tear down is checked separately, inside
      * defused_sandbox_unmount(). */
-    ret = defused_polkit_check_authorized(
-        pidfd, cred, DEFUSED_POLKIT_ACTION_UNMOUNT, -1, NULL);
+    ret =
+        defused_policy_check(ctx->sock, pidfd, cred, DEFUSED_OP_UNMOUNT, 0, -1);
     if (ret < 0) {
         if (ret == -EACCES)
             defused_error_set(err, DEFUSED_VARLINK_ERROR_NOT_ALLOWED, 0);
@@ -732,35 +722,69 @@ static int handle_umount(sd_varlink *link, const struct request_context *ctx,
 static __attribute__((__nonnull__(1))) void usage(const char *prog) {
     fprintf(
         stderr,
-        "usage: %s [--daemon | --child]\n"
+        "usage: %s [--daemon | --child] [POLICY OPTION...]\n"
         "\n"
         "By default, handles one mount/unmount request on the\n"
         "socket-activation fd (see defused_proto.h); meant to be spawned by\n"
         "systemd socket activation, one process per connection. With\n"
         "--daemon, creates the defused Varlink socket itself and forks a\n"
         "child to handle each accepted connection, for non-systemd\n"
-        "setups. There are no policy options -- policy decisions are\n"
-        "made per request by polkit; see doc/protocol.md.\n"
+        "setups.\n"
         "\n"
         "  --daemon  listen on $DEFUSED_SOCKET (or the default socket\n"
         "            path) and fork a child for each connection\n"
         "  --child   same, but with this process's own privileges and no\n"
         "            policy at all; spawned by fusermount3 for root and\n"
-        "            CAP_SYS_ADMIN callers, never for a service unit\n",
-        prog);
+        "            CAP_SYS_ADMIN callers, never for a service unit\n"
+        "\n"
+        "Policy options decide whether an unprivileged caller may mount or\n"
+        "unmount at all (see doc/protocol.md); --child ignores them.\n"
+        "\n"
+        "  --policy=polkit|builtin\n"
+        "            ask polkit per request, or apply the built-in policy\n"
+        "            below, which needs no polkit (default: %s%s)\n"
+        "  --max-mounts=N\n"
+        "            built-in policy: refuse a mount once N FUSE filesystems\n"
+        "            are mounted, like libfuse's mount_max (default %d)\n"
+        "  --allow-groups=GROUP[,GROUP...]\n"
+        "            built-in policy: only members of these groups (names\n"
+        "            or gids) may mount and unmount (default: any user)\n"
+        "  --allow-privileged-flags=NAME[,NAME...]\n"
+        "            built-in policy: privileged mount options a caller may\n"
+        "            use; the only one so far is allow_other (default: none)\n",
+        prog, DEFUSED_DEFAULT_POLICY_NAME,
+#ifdef HAVE_POLKIT
+        "",
+#else
+        "; this build has no polkit support",
+#endif
+        DEFUSED_DEFAULT_MAX_MOUNTS);
 }
 
 static int parse_args(int argc, char *argv[]) {
-    enum { OPT_DAEMON = 256, OPT_CHILD };
+    enum {
+        OPT_DAEMON = 256,
+        OPT_CHILD,
+        OPT_POLICY,
+        OPT_MAX_MOUNTS,
+        OPT_ALLOW_GROUPS,
+        OPT_ALLOW_PRIVILEGED_FLAGS,
+    };
 
     static const struct option opts[] = {
         {"daemon", no_argument, NULL, OPT_DAEMON},
         {"child", no_argument, NULL, OPT_CHILD},
+        {"policy", required_argument, NULL, OPT_POLICY},
+        {"max-mounts", required_argument, NULL, OPT_MAX_MOUNTS},
+        {"allow-groups", required_argument, NULL, OPT_ALLOW_GROUPS},
+        {"allow-privileged-flags", required_argument, NULL,
+         OPT_ALLOW_PRIVILEGED_FLAGS},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
     for (;;) {
         int c = getopt_long(argc, argv, "h", opts, NULL);
+        int ret = 0;
 
         if (c == -1)
             break;
@@ -771,6 +795,18 @@ static int parse_args(int argc, char *argv[]) {
         case OPT_CHILD:
             cfg_child = true;
             break;
+        case OPT_POLICY:
+            ret = defused_policy_parse_policy(optarg);
+            break;
+        case OPT_MAX_MOUNTS:
+            ret = defused_policy_parse_max_mounts(optarg);
+            break;
+        case OPT_ALLOW_GROUPS:
+            ret = defused_policy_parse_allow_groups(optarg);
+            break;
+        case OPT_ALLOW_PRIVILEGED_FLAGS:
+            ret = defused_policy_parse_allow_privileged_flags(optarg);
+            break;
         case 'h':
             usage(argv[0]);
             exit(0);
@@ -778,6 +814,13 @@ static int parse_args(int argc, char *argv[]) {
             usage(argv[0]);
             return -EINVAL;
         }
+        if (ret < 0)
+            return ret;
+    }
+    if (optind < argc) {
+        fprintf(stderr, "defused: unexpected argument: %s\n", argv[optind]);
+        usage(argv[0]);
+        return -EINVAL;
     }
     if (cfg_daemon && cfg_child) {
         fprintf(stderr, "defused: --daemon and --child are exclusive\n");
