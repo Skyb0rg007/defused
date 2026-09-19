@@ -18,7 +18,7 @@ let
       kernelPackages
       ;
   };
-  inherit (common) package;
+  inherit (common) package mountHelper;
   inherit (pkgs) lib;
 in
 pkgs.testers.nixosTest {
@@ -33,6 +33,10 @@ pkgs.testers.nixosTest {
       # module all turn on: a setuid libfuse fusermount3 in /run/wrappers/bin,
       # which is where nixpkgs' libfuse looks for its helper.
       programs.fuse.enable = true;
+
+      # Not the blanket grant from baseNode: a desktop runs on the module's
+      # own default, the recommended rule.
+      security.polkit.extraConfig = lib.mkForce "";
 
       # A stock libfuse filesystem, to mount through that helper.
       environment.systemPackages = [ pkgs.fuse-overlayfs ];
@@ -59,6 +63,13 @@ pkgs.testers.nixosTest {
           machine.succeed("test -u /run/wrappers/bin/fusermount")
           machine.succeed("test -e /etc/fuse.conf")
 
+      with subtest("the recommended polkit rule is installed"):
+          machine.succeed(
+              "cmp /etc/polkit-1/rules.d/50-defused-mount-policy.rules "
+              "${../../polkit/examples/50-defused-mount-policy.rules}"
+          )
+          machine.fail("grep -F defused /etc/polkit-1/rules.d/10-nixos.rules")
+
       with subtest("the system path prefers defused's fusermount3 too"):
           machine.succeed(
               "test \"$(readlink -f /run/current-system/sw/bin/fusermount3)\" = "
@@ -80,6 +91,15 @@ pkgs.testers.nixosTest {
           assert "nosuid" in line and "nodev" in line, line
           machine.succeed("test \"$(runuser -u alice -- cat /home/alice/mnt/file)\" = hello")
           machine.succeed("journalctl -u 'defused@*' --no-pager | grep -F defused")
+
+      with subtest("but allow_other still needs an administrator"):
+          machine.succeed("install -d -o alice -g users /home/alice/mnt-other")
+          machine.succeed(
+              "timeout 45s runuser -u alice -- "
+              "${pkgs.python3}/bin/python3 ${mountHelper} "
+              "expect-failure /home/alice/mnt-other allow_other "
+              "'not allowed by the defused service'"
+          )
 
       with subtest("and unmounts through it"):
           machine.succeed(

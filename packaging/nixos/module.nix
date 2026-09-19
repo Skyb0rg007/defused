@@ -37,6 +37,15 @@ in
         '';
       };
 
+      recommendedPolkitRule = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Install {file}`packaging/polkit/examples/50-defused-mount-policy.rules`,
+          which grants ordinary mounts without authentication.
+        '';
+      };
+
       extraArgs = lib.mkOption {
         type = lib.types.listOf lib.types.str;
         default = [ ];
@@ -97,6 +106,12 @@ in
     # (see doc/protocol.md); polkitd has to actually be running for that
     # check to ever succeed, rather than fail closed.
     security.polkit.enable = lib.mkDefault true;
+
+    environment.etc."polkit-1/rules.d/50-defused-mount-policy.rules" =
+      lib.mkIf cfg.recommendedPolkitRule
+        {
+          source = ../polkit/examples/50-defused-mount-policy.rules;
+        };
 
     security.apparmor = {
       policies.defused.path = "${package}/etc/apparmor.d/defused";
