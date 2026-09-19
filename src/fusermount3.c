@@ -86,6 +86,8 @@ static const struct flag_opt flag_opts[] = {
 
 static const char *const short_opts = "hVo:uzq";
 
+enum { OPT_WORKS_WITHOUT_SETUID = 256 };
+
 static const struct option long_opts[] = {
     {"unmount", no_argument, NULL, 'u'},
     {"lazy", no_argument, NULL, 'z'},
@@ -96,6 +98,7 @@ static const struct option long_opts[] = {
     {"auto-unmount", no_argument, NULL, 'U'},
     {"comm-fd", required_argument, NULL, 'c'},
     {"sync-init", no_argument, NULL, 'S'},
+    {"works-without-setuid", no_argument, NULL, OPT_WORKS_WITHOUT_SETUID},
     {NULL, 0, NULL, 0},
 };
 
@@ -173,6 +176,8 @@ int main(int argc, char *argv[]) {
             break;
         case 'S':
             die("--sync-init is not supported");
+        case OPT_WORKS_WITHOUT_SETUID:
+            return 0;
         default:
             return EXIT_FAILURE;
         }
