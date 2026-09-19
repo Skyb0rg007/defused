@@ -90,7 +90,8 @@ static int send_mount_req(int sock_fd, const struct defused_mount_req *req,
                           int dev_fd, int mnt_fd, struct defused_error *err) {
     _cleanup_close_ int sock = sock_fd;
     _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *link = NULL;
-    _cleanup_(sd_json_variant_unrefp) sd_json_variant *reply = NULL;
+    /* Borrowed from the link, valid until its next call; not ours to unref. */
+    sd_json_variant *reply = NULL;
     const char *error_id = NULL;
     int ret = sd_varlink_connect_fd(&link, sock);
     if (ret < 0)

@@ -173,7 +173,8 @@ static int send_non_fuse_umount_request(int sock_fd,
     }
 
     _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *link = NULL;
-    _cleanup_(sd_json_variant_unrefp) sd_json_variant *reply = NULL;
+    /* Borrowed from the link, valid until its next call; not ours to unref. */
+    sd_json_variant *reply = NULL;
     const char *error_id = NULL;
     ret = sd_varlink_connect_fd(&link, sock);
     if (ret < 0)

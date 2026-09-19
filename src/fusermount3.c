@@ -414,7 +414,8 @@ static int transact(uint32_t op, const union defused_req *req, const int *fds,
             return ret;
     }
 
-    _cleanup_(sd_json_variant_unrefp) sd_json_variant *reply = NULL;
+    /* Borrowed from the link, valid until its next call; not ours to unref. */
+    sd_json_variant *reply = NULL;
     const char *error_id = NULL;
     if (op == DEFUSED_OP_MOUNT)
         ret = sd_varlink_callbo(
