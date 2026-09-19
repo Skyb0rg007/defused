@@ -15,6 +15,8 @@
  */
 #define _GNU_SOURCE
 #include "common.h"
+#include "defused-daemon.h"
+#include "defused-policy.h"
 #include "defused-sandbox.h"
 #include "defused_proto.h"
 #include "util.h"
@@ -23,7 +25,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
-#include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -34,38 +35,12 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
-#include <sys/un.h>
 #include <sys/vfs.h>
-#include <sys/wait.h>
-#include <sys/xattr.h>
-#include <systemd/sd-bus.h>
 #include <systemd/sd-daemon.h>
 #include <systemd/sd-event.h>
 #include <systemd/sd-json.h>
 #include <systemd/sd-varlink.h>
 #include <unistd.h>
-
-/* polkit action ids checked before creating/tearing down a FUSE mount; see
- * packaging/polkit/website.soss.defused.policy for their declared defaults. */
-#define DEFUSED_POLKIT_ACTION_MOUNT "website.soss.defused.mount"
-#define DEFUSED_POLKIT_ACTION_UNMOUNT "website.soss.defused.unmount"
-
-/* Mount flags reported to polkit by name in the "privileged-flags" detail
- * (see check_polkit_authorized()), so a rule can tell which capabilities a
- * mount request actually needs instead of only "is any capability used at
- * all". A rule should treat any name it doesn't specifically recognize as
- * requiring AUTH_ADMIN_KEEP --
- * packaging/polkit/examples/50-defused-mount-policy.rules does this by checking
- * requested names against its own allowlist and falling back otherwise, so a
- * rule written before a new privileged option existed denies it by default
- * instead of silently granting it. Add future privileged options here as
- * they're implemented. */
-static const struct {
-    uint32_t flag;
-    const char *name;
-} privileged_mount_flags[] = {
-    {DEFUSED_FUSE_ALLOW_OTHER, "allow_other"},
-};
 
 struct request_context {
     int sock;
@@ -112,28 +87,13 @@ static int socket_activation_fd(int *out_fd)
     __attribute__((__nonnull__(1), __warn_unused_result__));
 static int handle_connection(int sock_fd, bool privileged)
     __attribute__((__warn_unused_result__));
-static int run_fork_daemon(void) __attribute__((__warn_unused_result__));
-static int create_listening_socket(void)
+static int handle_unprivileged_connection(int sock_fd)
     __attribute__((__warn_unused_result__));
-static void tag_varlink_entrypoint(const char *path)
-    __attribute__((__nonnull__(1)));
-static int bind_unix_socket(int fd, const struct sockaddr_un *sa,
-                            socklen_t sa_len, const char *path)
-    __attribute__((__nonnull__(2, 4), __warn_unused_result__));
 static int fd_mnt_id(int proc_fd, int fd, long *out_id)
     __attribute__((__nonnull__(3), __warn_unused_result__));
 
 static bool cfg_daemon = false;
 static bool cfg_child = false;
-
-/* Cap on concurrent --daemon children, so that a mode-0666 socket doesn't
- * let an unprivileged local user exhaust the process table/memory by
- * hammering accept() -- systemd's own Accept=yes has MaxConnections= for
- * the same reason. Not configurable: this is a fixed backstop, not a
- * policy knob. */
-#define DEFUSED_DAEMON_MAX_CONNECTIONS 64
-
-static volatile sig_atomic_t live_children = 0;
 
 int main(int argc, char *argv[]) {
     int ret = parse_args(argc, argv);
@@ -141,7 +101,9 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
 
     if (cfg_daemon)
-        return run_fork_daemon() == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+        return defused_run_fork_daemon(handle_unprivileged_connection) == 0
+                   ? EXIT_SUCCESS
+                   : EXIT_FAILURE;
 
     int sock = -EBADF;
     ret = socket_activation_fd(&sock);
@@ -154,7 +116,8 @@ int main(int argc, char *argv[]) {
 /* Handles a single already-connected Varlink socket to completion (one
  * mount/unmount request), then closes it. Takes ownership of sock_fd. Used
  * both for the systemd-Accept=yes case in main() (the handed-off connection)
- * and for each forked child in run_fork_daemon() (the accepted connection).
+ * and for each forked child in defused_run_fork_daemon() (the accepted
+ * connection).
  */
 static int handle_connection(int sock_fd, bool privileged) {
     _cleanup_close_ int sock = sock_fd;
@@ -222,6 +185,11 @@ static int handle_connection(int sock_fd, bool privileged) {
     }
 
     return EXIT_SUCCESS;
+}
+
+/* For defused_run_fork_daemon(). */
+static int handle_unprivileged_connection(int sock_fd) {
+    return handle_connection(sock_fd, false);
 }
 
 /* errno goes on the wire only for the errors declared to carry it. Also,
@@ -385,169 +353,6 @@ static int mount_fsconfig_flag(int fsfd, const char *key) {
     return 0;
 }
 
-/* Writes a comma-separated list of privileged_mount_flags[] names for the
- * bits set in mount_flags into buf (empty string if none are set), for the
- * "privileged-flags" polkit detail -- see privileged_mount_flags[]'s doc
- * comment. buf is always NUL-terminated; names that wouldn't fit are
- * silently dropped, which only matters if this table grows to carry far
- * more (and far longer) names than it does today. */
-static __attribute__((__nonnull__(2))) void
-format_privileged_flags(uint32_t mount_flags, char *buf, size_t bufsz) {
-    size_t len = 0;
-    buf[0] = '\0';
-
-    for (size_t i = 0;
-         i < sizeof(privileged_mount_flags) / sizeof(privileged_mount_flags[0]);
-         i++) {
-        if (!(mount_flags & privileged_mount_flags[i].flag))
-            continue;
-
-        const char *name = privileged_mount_flags[i].name;
-        size_t name_len = strlen(name);
-        size_t sep_len = len > 0 ? 1 : 0;
-        if (len + sep_len + name_len >= bufsz)
-            break;
-
-        if (sep_len)
-            buf[len++] = ',';
-        memcpy(buf + len, name, name_len);
-        len += name_len;
-        buf[len] = '\0';
-    }
-}
-
-/* Asks polkit whether the connecting process is allowed to perform
- * action_id (one of the DEFUSED_POLKIT_ACTION_* ids). This is independent
- * of (and in addition to) the ownership checks in handle_mount()/
- * handle_umount(): ownership says the caller has the right to act on
- * *this particular file or mount*, polkit says the caller is allowed to
- * use defused for this operation, with these specific options, at all --
- * and lets an administrator's policy (or a custom polkit rules.d script)
- * decide that per uid/gid, interactively, or based on the details passed
- * below.
- *
- * current_mounts and privileged_flags are mount-specific details (see
- * below); pass current_mounts < 0 and/or privileged_flags NULL or "" to
- * omit either, for actions/requests that have no use for them (unmount
- * has no use for either; an ordinary mount request with no privileged
- * options set has no use for privileged_flags).
- *
- * The subject's pid is conveyed to polkit as a pidfd obtained from this
- * connection's SO_PEERPIDFD, not a bare pid, for the same TOCTOU reason the
- * sandboxed mount/unmount child joins the peer namespace through a pidfd: a
- * pid alone can be recycled between the credential check and whenever polkit
- * gets around to looking at it, and a pidfd names one specific process no
- * matter what.
- *
- * Fails closed: if polkit cannot be reached at all (e.g. not installed or
- * not running), the operation is refused rather than silently falling back
- * to the ownership check alone. */
-static __attribute__((__nonnull__(2, 3), __warn_unused_result__)) int
-check_polkit_authorized(int sock, const struct ucred *cred,
-                        const char *action_id, long current_mounts,
-                        const char *privileged_flags) {
-    bool have_privileged_flags = privileged_flags && privileged_flags[0];
-    _cleanup_close_ int pidfd = peer_pidfd(sock);
-    if (pidfd < 0)
-        return pidfd;
-
-    _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-    _cleanup_(sd_bus_message_unrefp) sd_bus_message *call = NULL;
-    _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
-    _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-    int ret;
-
-    ret = sd_bus_open_system(&bus);
-    if (ret < 0) {
-        fprintf(stderr, "defused: failed to connect to the system bus: %s\n",
-                strerror(-ret));
-        return ret;
-    }
-
-    ret = sd_bus_message_new_method_call(
-        bus, &call, "org.freedesktop.PolicyKit1",
-        "/org/freedesktop/PolicyKit1/Authority",
-        "org.freedesktop.PolicyKit1.Authority", "CheckAuthorization");
-    if (ret < 0)
-        return ret;
-
-    /* subject: (sa{sv}) = ("unix-process", {"uid": <i>, "pidfd": <h>}).
-     * Passing both "uid" and "pidfd" (rather than "pid"/"start-time") makes
-     * polkit resolve the subject from the pidfd directly -- see
-     * polkit_subject_new_for_gvariant_invocation() in polkit's
-     * src/polkit/polkitsubject.c. */
-    ret = sd_bus_message_append(call, "(sa{sv})s", "unix-process", 2u, "uid",
-                                "i", (int32_t)cred->uid, "pidfd", "h", pidfd,
-                                action_id);
-    if (ret < 0)
-        return ret;
-
-    /* details: a{ss}. uid, gid, and pid are deliberately not included: a
-     * rule already gets those from the subject polkit itself constructs
-     * (subject.uid, subject.groups, subject.pid), no need to duplicate them
-     * here. current-mounts and privileged-flags (mount only, see above) are
-     * the only things a rule can't get any other way, and are each omitted
-     * entirely when the caller has nothing to say -- see
-     * packaging/polkit/examples/50-defused-mount-policy.rules for a rule that
-     * uses both. */
-    ret = sd_bus_message_open_container(call, 'a', "{ss}");
-    if (ret < 0)
-        return ret;
-    char mounts_buf[32];
-    if (current_mounts >= 0) {
-        snprintf(mounts_buf, sizeof(mounts_buf), "%ld", current_mounts);
-        ret = sd_bus_message_append(call, "{ss}", "current-mounts", mounts_buf);
-        if (ret < 0)
-            return ret;
-    }
-    if (have_privileged_flags) {
-        ret = sd_bus_message_append(call, "{ss}", "privileged-flags",
-                                    privileged_flags);
-        if (ret < 0)
-            return ret;
-    }
-    ret = sd_bus_message_close_container(call);
-    if (ret < 0)
-        return ret;
-
-    /* flags: CHECK_AUTHORIZATION_FLAGS_ALLOW_USER_INTERACTION (1), so that
-     * an agent in the caller's session can answer an AUTH_ADMIN_KEEP-style
-     * challenge instead of it failing outright. cancellation_id: unused, we
-     * never call CancelCheckAuthorization. */
-    ret = sd_bus_message_append(call, "us", (uint32_t)1, "");
-    if (ret < 0)
-        return ret;
-
-    ret = sd_bus_call(bus, call, 0, &error, &reply);
-    if (ret < 0) {
-        fprintf(stderr, "defused: polkit CheckAuthorization failed: %s\n",
-                error.message ? error.message : strerror(-ret));
-        return ret;
-    }
-
-    int is_authorized = 0;
-    int is_challenge = 0;
-    ret = sd_bus_message_enter_container(reply, 'r', "bba{ss}");
-    if (ret < 0)
-        return ret;
-    ret = sd_bus_message_read(reply, "bb", &is_authorized, &is_challenge);
-    if (ret < 0)
-        return ret;
-    ret = sd_bus_message_skip(reply, "a{ss}");
-    if (ret < 0)
-        return ret;
-    ret = sd_bus_message_exit_container(reply);
-    if (ret < 0)
-        return ret;
-
-    if (!is_authorized) {
-        fprintf(stderr, "defused: polkit denied %s to uid %u (challenge=%d)\n",
-                action_id, (unsigned)cred->uid, is_challenge);
-        return -EACCES;
-    }
-    return 0;
-}
-
 static __attribute__((__warn_unused_result__)) int
 check_mountpoint_fstype(int mnt_fd) {
     struct statfs fs;
@@ -673,7 +478,7 @@ create_detached_mount(const struct prepared_mount *mnt) {
 }
 
 static __attribute__((__nonnull__(3, 4), __warn_unused_result__)) int
-authorize_mount(int sock, uint32_t mount_flags, const struct ucred *cred,
+authorize_mount(int pidfd, uint32_t mount_flags, const struct ucred *cred,
                 struct defused_error *err) {
     /* Handed to polkit so a rule can implement its own mount-count policy. */
     errno = 0;
@@ -685,11 +490,12 @@ authorize_mount(int sock, uint32_t mount_flags, const struct ucred *cred,
     }
 
     char privileged_flags[128];
-    format_privileged_flags(mount_flags, privileged_flags,
-                            sizeof(privileged_flags));
+    defused_format_privileged_flags(mount_flags, privileged_flags,
+                                    sizeof(privileged_flags));
 
-    int ret = check_polkit_authorized(sock, cred, DEFUSED_POLKIT_ACTION_MOUNT,
-                                      current_mounts, privileged_flags);
+    int ret = defused_polkit_check_authorized(pidfd, cred,
+                                              DEFUSED_POLKIT_ACTION_MOUNT,
+                                              current_mounts, privileged_flags);
     if (ret < 0) {
         /* -EACCES is polkit's answer, not a failure to ask it. */
         if (ret == -EACCES)
@@ -718,7 +524,8 @@ mount_request(const struct request_context *ctx,
     }
 
     /* Policy questions like whether this caller may use allow_other are
-     * answered entirely by polkit (see check_polkit_authorized()); this
+     * answered entirely by polkit (see defused_polkit_check_authorized());
+     * this
      * only validates protocol shape. */
     uint32_t allowed = DEFUSED_MOUNT_FLAGS_MASK;
     if (!ctx->privileged)
@@ -760,8 +567,14 @@ mount_request(const struct request_context *ctx,
         return ret;
     }
 
+    _cleanup_close_ int pidfd = -EBADF;
     if (!ctx->privileged) {
-        ret = authorize_mount(ctx->sock, req->mount_flags, cred, err);
+        pidfd = peer_pidfd(ctx->sock);
+        if (pidfd < 0) {
+            defused_error_set(err, DEFUSED_VARLINK_ERROR_MOUNT_FAILED, -pidfd);
+            return pidfd;
+        }
+        ret = authorize_mount(pidfd, req->mount_flags, cred, err);
         if (ret < 0)
             return ret;
     }
@@ -783,11 +596,6 @@ mount_request(const struct request_context *ctx,
         return -errno;
     }
 
-    _cleanup_close_ int pidfd = peer_pidfd(ctx->sock);
-    if (pidfd < 0) {
-        defused_error_set(err, DEFUSED_VARLINK_ERROR_MOUNT_FAILED, -pidfd);
-        return pidfd;
-    }
     return defused_sandbox_mount(pidfd, mountfd, mnt_fd, err);
 }
 
@@ -881,25 +689,25 @@ umount_request(const struct request_context *ctx,
         return -errno;
     }
 
+    _cleanup_close_ int pidfd = peer_pidfd(ctx->sock);
+    if (pidfd < 0) {
+        defused_error_set(err, DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED, -pidfd);
+        return pidfd;
+    }
+
     /* Before the sandboxed child installs seccomp: the filter has no room for
      * the syscalls talking to polkit over D-Bus needs. This asks only whether
      * the caller may use unmount at all -- whether this specific mount is
      * theirs to tear down is checked separately, inside
      * defused_sandbox_unmount(). */
-    ret = check_polkit_authorized(ctx->sock, cred,
-                                  DEFUSED_POLKIT_ACTION_UNMOUNT, -1, NULL);
+    ret = defused_polkit_check_authorized(
+        pidfd, cred, DEFUSED_POLKIT_ACTION_UNMOUNT, -1, NULL);
     if (ret < 0) {
         if (ret == -EACCES)
             defused_error_set(err, DEFUSED_VARLINK_ERROR_NOT_ALLOWED, 0);
         else
             defused_error_set(err, DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED, -ret);
         return ret;
-    }
-
-    _cleanup_close_ int pidfd = peer_pidfd(ctx->sock);
-    if (pidfd < 0) {
-        defused_error_set(err, DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED, -pidfd);
-        return pidfd;
     }
 
     return defused_sandbox_unmount(pidfd, proc_fd, parent_fd, req->name,
@@ -975,189 +783,6 @@ static int parse_args(int argc, char *argv[]) {
         fprintf(stderr, "defused: --daemon and --child are exclusive\n");
         return -EINVAL;
     }
-    return 0;
-}
-
-/* Reaps every exited child on each SIGCHLD delivery, decrementing
- * live_children so the accept loop below knows how many are still
- * outstanding. Async-signal-safe: only waitpid() and arithmetic on a
- * volatile sig_atomic_t. */
-static void sigchld_handler(int sig) {
-    (void)sig;
-    int saved_errno = errno;
-    while (waitpid(-1, NULL, WNOHANG) > 0)
-        live_children--;
-    errno = saved_errno;
-}
-
-/* Accepts connections on a self-created listening socket and forks a child
- * to run handle_connection() on each one, for setups without systemd
- * Accept=yes socket activation (see --daemon in usage()). Caps concurrent
- * children at DEFUSED_DAEMON_MAX_CONNECTIONS; connections past the cap are
- * accepted and immediately closed rather than left queued in the backlog,
- * so a client sees a dropped connection (a retryable failure) instead of
- * hanging. */
-static int run_fork_daemon(void) {
-    _cleanup_close_ int listen_fd = create_listening_socket();
-    if (listen_fd < 0)
-        return listen_fd;
-
-    /* SA_RESTART so accept4() below doesn't need special-casing beyond the
-     * EINTR from other signals. */
-    struct sigaction sa = {
-        .sa_handler = sigchld_handler,
-        .sa_flags = SA_RESTART,
-    };
-    sigemptyset(&sa.sa_mask);
-    if (sigaction(SIGCHLD, &sa, NULL) == -1) {
-        int ret = -errno;
-        fprintf(stderr, "defused: sigaction(SIGCHLD): %s\n", strerror(errno));
-        return ret;
-    }
-
-    for (;;) {
-        _cleanup_close_ int conn = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
-        if (conn == -1) {
-            /* EINTR is routine (SA_RESTART still lets other signals
-             * interrupt); EMFILE/ENFILE/ECONNABORTED are transient resource
-             * or peer-abort conditions that can recur near the connection
-             * cap, so log and keep listening rather than tearing down the
-             * whole daemon over them. Anything else is unexpected. */
-            if (errno == EINTR)
-                continue;
-            if (errno == EMFILE || errno == ENFILE || errno == ECONNABORTED) {
-                fprintf(stderr, "defused: accept4: %s\n", strerror(errno));
-                continue;
-            }
-            int ret = -errno;
-            fprintf(stderr, "defused: accept4: %s\n", strerror(errno));
-            return ret;
-        }
-
-        if (live_children >= DEFUSED_DAEMON_MAX_CONNECTIONS)
-            continue;
-
-        pid_t pid = fork();
-        if (pid == -1) {
-            fprintf(stderr, "defused: fork: %s\n", strerror(errno));
-            continue;
-        }
-        if (pid == 0) {
-            listen_fd = safe_close(listen_fd);
-            /* Back to the default disposition: this child forks a sandbox
-             * child of its own and waits for it, so it must not inherit a
-             * handler that reaps every child out from under that wait(). */
-            struct sigaction dfl = {.sa_handler = SIG_DFL};
-            sigemptyset(&dfl.sa_mask);
-            (void)sigaction(SIGCHLD, &dfl, NULL);
-            _exit(handle_connection(TAKE_FD(conn), false));
-        }
-        live_children++;
-    }
-}
-
-/* Creates, binds, and listens on the AF_UNIX SOCK_STREAM Varlink socket at
- * $DEFUSED_SOCKET (or DEFUSED_SOCKET_PATH), mode 0666 so non-root, non-
- * systemd callers can reach it -- see the --daemon usage() text. */
-static int create_listening_socket(void) {
-    const char *path = getenv("DEFUSED_SOCKET");
-    if (path == NULL || *path == '\0')
-        path = DEFUSED_SOCKET_PATH;
-
-    struct sockaddr_un sa = {.sun_family = AF_UNIX};
-    if (strlen(path) >= sizeof(sa.sun_path)) {
-        fprintf(stderr, "defused: socket path too long: %s\n", path);
-        return -ENAMETOOLONG;
-    }
-    (void)strlcpy(sa.sun_path, path, sizeof(sa.sun_path));
-
-    _cleanup_close_ int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (fd == -1) {
-        fprintf(stderr, "defused: socket: %s\n", strerror(errno));
-        return -errno;
-    }
-
-    int ret = bind_unix_socket(fd, &sa, sizeof(sa), path);
-    if (ret < 0)
-        return ret;
-
-    tag_varlink_entrypoint(path);
-
-    if (chmod(path, 0666) == -1) {
-        ret = -errno;
-        fprintf(stderr, "defused: chmod(%s): %s\n", path, strerror(errno));
-        goto fail_unlink;
-    }
-
-    if (listen(fd, SOMAXCONN) == -1) {
-        ret = -errno;
-        fprintf(stderr, "defused: listen(%s): %s\n", path, strerror(errno));
-        goto fail_unlink;
-    }
-
-    return TAKE_FD(fd);
-
-fail_unlink:
-    unlink(path);
-    return ret;
-}
-
-/* Advisory Varlink entrypoint tag, as systemd's XAttrEntryPoint= sets it.
- * Kernels before 7.0 reject xattrs on socket inodes with EPERM. */
-static void tag_varlink_entrypoint(const char *path) {
-    static const char value[] = "entrypoint";
-    if (setxattr(path, "user.varlink", value, sizeof(value) - 1, 0) == 0)
-        return;
-    if (errno == EPERM || errno == ENOTSUP || errno == EOPNOTSUPP)
-        return;
-    fprintf(stderr, "defused: setxattr(%s, user.varlink): %s\n", path,
-            strerror(errno));
-}
-
-/* bind(2), handling the case where path already exists: if it's a live
- * socket someone is listening on, that's a genuine conflict; if connecting
- * to it fails with ECONNREFUSED, it's a stale socket left behind by a
- * previous run and can be unlinked and rebound. */
-static int bind_unix_socket(int fd, const struct sockaddr_un *sa,
-                            socklen_t sa_len, const char *path) {
-    if (bind(fd, (const struct sockaddr *)sa, sa_len) == 0)
-        return 0;
-    if (errno != EADDRINUSE) {
-        int ret = -errno;
-        fprintf(stderr, "defused: bind(%s): %s\n", path, strerror(errno));
-        return ret;
-    }
-
-    _cleanup_close_ int probe = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (probe == -1) {
-        int ret = -errno;
-        fprintf(stderr, "defused: socket probe: %s\n", strerror(errno));
-        return ret;
-    }
-
-    if (connect(probe, (const struct sockaddr *)sa, sa_len) == 0) {
-        fprintf(stderr, "defused: socket already in use: %s\n", path);
-        return -EADDRINUSE;
-    }
-    if (errno != ECONNREFUSED) {
-        int ret = -errno;
-        fprintf(stderr, "defused: cannot connect to existing socket %s: %s\n",
-                path, strerror(errno));
-        return ret;
-    }
-
-    if (unlink(path) == -1) {
-        int ret = -errno;
-        fprintf(stderr, "defused: unlink stale socket %s: %s\n", path,
-                strerror(errno));
-        return ret;
-    }
-    if (bind(fd, (const struct sockaddr *)sa, sa_len) == -1) {
-        int ret = -errno;
-        fprintf(stderr, "defused: bind(%s): %s\n", path, strerror(errno));
-        return ret;
-    }
-
     return 0;
 }
 

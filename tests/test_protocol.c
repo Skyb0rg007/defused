@@ -203,7 +203,7 @@ static const char *find_unowned_dir(void) {
 /* The mountpoint ownership check happens before the polkit check, so it
  * takes a real self-owned mountpoint (and a real /dev/fuse fd, since
  * check_fuse_device_fd() validates the device major/minor) to reach
- * check_polkit_authorized() at all. Skips gracefully if this sandbox has
+ * defused_polkit_check_authorized() at all. Skips gracefully if this sandbox has
  * no /dev/fuse, rather than asserting anything about polkit's specific
  * answer -- what matters here is that an unauthorized request never gets
  * past this gate to the privileged mount syscalls, not what a particular
@@ -338,7 +338,7 @@ static int run_daemon_mount_req(const char *sock_path,
  * be reaped before starting the second: a single request wouldn't tell us
  * the daemon keeps accepting new connections after handling one (i.e. that
  * it's really forking per connection, not a one-shot handler), and issuing
- * them without a pause also exercises run_fork_daemon()'s live_children
+ * them without a pause also exercises defused_run_fork_daemon()'s live_children
  * cap under light concurrency without tripping it. */
 static int test_daemon_mode(const char *defused_path) {
     char dir_template[] = "/tmp/defused-daemon-test-XXXXXX";
@@ -412,7 +412,7 @@ static int test_daemon_missing_socket_dir(const char *defused_path) {
 
 /* Must match DEFUSED_DAEMON_MAX_CONNECTIONS in src/defused.c: the number of
  * concurrent connections test_daemon_connection_cap() needs to open to pin
- * run_fork_daemon()'s live_children count at the cap. */
+ * defused_run_fork_daemon()'s live_children count at the cap. */
 #define TEST_DAEMON_MAX_CONNECTIONS 64
 
 /* The connections test_daemon_connection_cap() holds open, closed together
@@ -459,7 +459,7 @@ static int open_daemon_connections(const char *sock_path,
     return 0;
 }
 
-/* Exercises the DEFUSED_DAEMON_MAX_CONNECTIONS cap in run_fork_daemon():
+/* Exercises the DEFUSED_DAEMON_MAX_CONNECTIONS cap in defused_run_fork_daemon():
  * opens exactly the cap's worth of connections and leaves them open without
  * sending a request, so live_children sits at the cap. A further connection
  * is then accepted by the kernel (connect() succeeds immediately, since
