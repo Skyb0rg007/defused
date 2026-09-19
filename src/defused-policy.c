@@ -3,32 +3,34 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * The mount/unmount policy check: asks polkit whether the connecting
- * process may use defused for an operation at all.
+ * Policy: whether the connecting process may use defused at all.
  */
 #define _GNU_SOURCE
 #include "defused-policy.h"
 #include "common.h"
 #include "defused_proto.h"
+#include "util.h"
 
+#include <assert.h>
 #include <errno.h>
+#include <grp.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#ifdef HAVE_POLKIT
 #include <systemd/sd-bus.h>
+#endif
 
-/* Mount flags reported to polkit by name in the "privileged-flags" detail
- * (see defused_polkit_check_authorized()), so a rule can tell which capabilities a
- * mount request actually needs instead of only "is any capability used at
- * all". A rule should treat any name it doesn't specifically recognize as
- * requiring AUTH_ADMIN_KEEP --
- * packaging/polkit/examples/50-defused-mount-policy.rules does this by checking
- * requested names against its own allowlist and falling back otherwise, so a
- * rule written before a new privileged option existed denies it by default
- * instead of silently granting it. Add future privileged options here as
- * they're implemented. */
+#ifdef HAVE_POLKIT
+/* See packaging/polkit/website.soss.defused.policy. */
+#define DEFUSED_POLKIT_ACTION_MOUNT "website.soss.defused.mount"
+#define DEFUSED_POLKIT_ACTION_UNMOUNT "website.soss.defused.unmount"
+#endif
+
+/* Granted by name, so an old policy denies new options by default. */
 static const struct {
     uint32_t flag;
     const char *name;
@@ -36,14 +38,26 @@ static const struct {
     {DEFUSED_FUSE_ALLOW_OTHER, "allow_other"},
 };
 
-/* Writes a comma-separated list of privileged_mount_flags[] names for the
- * bits set in mount_flags into buf (empty string if none are set), for the
- * "privileged-flags" polkit detail -- see privileged_mount_flags[]'s doc
- * comment. buf is always NUL-terminated; names that wouldn't fit are
- * silently dropped, which only matters if this table grows to carry far
- * more (and far longer) names than it does today. */
-void defused_format_privileged_flags(uint32_t mount_flags, char *buf,
-                                     size_t bufsz) {
+enum policy {
+    POLICY_BUILTIN,
+    POLICY_POLKIT,
+};
+#ifdef HAVE_POLKIT
+#define DEFUSED_DEFAULT_POLICY POLICY_POLKIT
+#else
+#define DEFUSED_DEFAULT_POLICY POLICY_BUILTIN
+#endif
+static enum policy cfg_policy = DEFUSED_DEFAULT_POLICY;
+
+static long cfg_max_mounts = DEFUSED_DEFAULT_MAX_MOUNTS;
+#define DEFUSED_MAX_ALLOW_GROUPS 32
+static gid_t cfg_allow_groups[DEFUSED_MAX_ALLOW_GROUPS];
+static size_t cfg_n_allow_groups = 0;
+static uint32_t cfg_allow_privileged_flags = 0;
+
+/* Names that don't fit are dropped. */
+static __attribute__((__nonnull__(2))) void
+format_privileged_flags(uint32_t mount_flags, char *buf, size_t bufsz) {
     size_t len = 0;
     buf[0] = '\0';
 
@@ -67,35 +81,12 @@ void defused_format_privileged_flags(uint32_t mount_flags, char *buf,
     }
 }
 
-/* Asks polkit whether the connecting process is allowed to perform
- * action_id (one of the DEFUSED_POLKIT_ACTION_* ids). This is independent
- * of (and in addition to) the ownership checks in handle_mount()/
- * handle_umount(): ownership says the caller has the right to act on
- * *this particular file or mount*, polkit says the caller is allowed to
- * use defused for this operation, with these specific options, at all --
- * and lets an administrator's policy (or a custom polkit rules.d script)
- * decide that per uid/gid, interactively, or based on the details passed
- * below.
- *
- * current_mounts and privileged_flags are mount-specific details (see
- * below); pass current_mounts < 0 and/or privileged_flags NULL or "" to
- * omit either, for actions/requests that have no use for them (unmount
- * has no use for either; an ordinary mount request with no privileged
- * options set has no use for privileged_flags).
- *
- * The subject's pid is conveyed to polkit as pidfd, obtained by the caller
- * from this connection's SO_PEERPIDFD, not a bare pid, for the same TOCTOU
- * reason the sandboxed mount/unmount child joins the peer namespace through a
- * pidfd: a pid alone can be recycled between the credential check and whenever
- * polkit gets around to looking at it, and a pidfd names one specific process
- * no matter what.
- *
- * Fails closed: if polkit cannot be reached at all (e.g. not installed or
- * not running), the operation is refused rather than silently falling back
- * to the ownership check alone. */
-int defused_polkit_check_authorized(int pidfd, const struct ucred *cred,
-                                    const char *action_id, long current_mounts,
-                                    const char *privileged_flags) {
+#ifdef HAVE_POLKIT
+/* Fails closed if polkit is unreachable. */
+static __attribute__((__nonnull__(2, 3), __warn_unused_result__)) int
+check_polkit_authorized(int pidfd, const struct ucred *cred,
+                        const char *action_id, long current_mounts,
+                        const char *privileged_flags) {
     bool have_privileged_flags = privileged_flags && privileged_flags[0];
 
     _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
@@ -118,25 +109,14 @@ int defused_polkit_check_authorized(int pidfd, const struct ucred *cred,
     if (ret < 0)
         return ret;
 
-    /* subject: (sa{sv}) = ("unix-process", {"uid": <i>, "pidfd": <h>}).
-     * Passing both "uid" and "pidfd" (rather than "pid"/"start-time") makes
-     * polkit resolve the subject from the pidfd directly -- see
-     * polkit_subject_new_for_gvariant_invocation() in polkit's
-     * src/polkit/polkitsubject.c. */
+    /* "uid" + "pidfd": polkit resolves the subject from the pidfd. */
     ret = sd_bus_message_append(call, "(sa{sv})s", "unix-process", 2u, "uid",
                                 "i", (int32_t)cred->uid, "pidfd", "h", pidfd,
                                 action_id);
     if (ret < 0)
         return ret;
 
-    /* details: a{ss}. uid, gid, and pid are deliberately not included: a
-     * rule already gets those from the subject polkit itself constructs
-     * (subject.uid, subject.groups, subject.pid), no need to duplicate them
-     * here. current-mounts and privileged-flags (mount only, see above) are
-     * the only things a rule can't get any other way, and are each omitted
-     * entirely when the caller has nothing to say -- see
-     * packaging/polkit/examples/50-defused-mount-policy.rules for a rule that
-     * uses both. */
+    /* No uid/gid/pid details: a rule gets those from the subject. */
     ret = sd_bus_message_open_container(call, 'a', "{ss}");
     if (ret < 0)
         return ret;
@@ -157,10 +137,7 @@ int defused_polkit_check_authorized(int pidfd, const struct ucred *cred,
     if (ret < 0)
         return ret;
 
-    /* flags: CHECK_AUTHORIZATION_FLAGS_ALLOW_USER_INTERACTION (1), so that
-     * an agent in the caller's session can answer an AUTH_ADMIN_KEEP-style
-     * challenge instead of it failing outright. cancellation_id: unused, we
-     * never call CancelCheckAuthorization. */
+    /* ALLOW_USER_INTERACTION; no cancellation_id. */
     ret = sd_bus_message_append(call, "us", (uint32_t)1, "");
     if (ret < 0)
         return ret;
@@ -191,6 +168,209 @@ int defused_polkit_check_authorized(int pidfd, const struct ucred *cred,
         fprintf(stderr, "defused: polkit denied %s to uid %u (challenge=%d)\n",
                 action_id, (unsigned)cred->uid, is_challenge);
         return -EACCES;
+    }
+    return 0;
+}
+#endif /* HAVE_POLKIT */
+
+/* Returns 1, 0, or a negative errno. SO_PEERGROUPS needs Linux 4.13. */
+static __attribute__((__nonnull__(2), __warn_unused_result__)) int
+peer_in_allowed_groups(int sock, const struct ucred *cred) {
+    for (size_t i = 0; i < cfg_n_allow_groups; i++)
+        if (cred->gid == cfg_allow_groups[i])
+            return 1;
+
+    gid_t stack_groups[32];
+    _cleanup_free_ gid_t *heap_groups = NULL;
+    gid_t *groups = stack_groups;
+    socklen_t len = sizeof(stack_groups);
+    int ret = getsockopt(sock, SOL_SOCKET, SO_PEERGROUPS, groups, &len);
+    if (ret == -1 && errno == ERANGE) {
+        heap_groups = malloc(len);
+        if (heap_groups == NULL)
+            return -ENOMEM;
+        groups = heap_groups;
+        ret = getsockopt(sock, SOL_SOCKET, SO_PEERGROUPS, groups, &len);
+    }
+    if (ret == -1) {
+        fprintf(stderr, "defused: SO_PEERGROUPS failed: %s\n", strerror(errno));
+        return -errno;
+    }
+
+    for (size_t i = 0; i < len / sizeof(gid_t); i++)
+        for (size_t j = 0; j < cfg_n_allow_groups; j++)
+            if (groups[i] == cfg_allow_groups[j])
+                return 1;
+    return 0;
+}
+
+/* Returns -EACCES on a denial. */
+static __attribute__((__nonnull__(2), __warn_unused_result__)) int
+builtin_check_authorized(int sock, const struct ucred *cred, enum defused_op op,
+                         uint32_t mount_flags, long current_mounts) {
+    const char *what = op == DEFUSED_OP_MOUNT ? "mount" : "unmount";
+
+    if (cfg_n_allow_groups > 0) {
+        int ret = peer_in_allowed_groups(sock, cred);
+        if (ret < 0)
+            return ret;
+        if (ret == 0) {
+            fprintf(stderr,
+                    "defused: %s refused: uid %u (gid %u) is in none of the "
+                    "--allow-groups groups\n",
+                    what, (unsigned)cred->uid, (unsigned)cred->gid);
+            return -EACCES;
+        }
+    }
+
+    uint32_t denied_flags = mount_flags & ~cfg_allow_privileged_flags;
+    char denied_names[128];
+    format_privileged_flags(denied_flags, denied_names, sizeof(denied_names));
+    if (denied_names[0]) {
+        fprintf(stderr,
+                "defused: %s refused: uid %u asked for %s, not granted by "
+                "--allow-privileged-flags\n",
+                what, (unsigned)cred->uid, denied_names);
+        return -EACCES;
+    }
+
+    if (current_mounts >= 0 && current_mounts >= cfg_max_mounts) {
+        fprintf(stderr,
+                "defused: %s refused: %ld FUSE filesystems already mounted "
+                "(--max-mounts=%ld)\n",
+                what, current_mounts, cfg_max_mounts);
+        return -EACCES;
+    }
+    return 0;
+}
+
+int defused_policy_check(int sock, int pidfd, const struct ucred *cred,
+                         enum defused_op op, uint32_t mount_flags,
+                         long current_mounts) {
+#ifdef HAVE_POLKIT
+    if (cfg_policy == POLICY_POLKIT) {
+        if (op == DEFUSED_OP_UNMOUNT)
+            return check_polkit_authorized(
+                pidfd, cred, DEFUSED_POLKIT_ACTION_UNMOUNT, -1, NULL);
+
+        char privileged_flags[128];
+        format_privileged_flags(mount_flags, privileged_flags,
+                                sizeof(privileged_flags));
+        return check_polkit_authorized(pidfd, cred, DEFUSED_POLKIT_ACTION_MOUNT,
+                                       current_mounts, privileged_flags);
+    }
+#else
+    (void)pidfd;
+#endif
+    assert(cfg_policy == POLICY_BUILTIN);
+    return builtin_check_authorized(sock, cred, op, mount_flags,
+                                    current_mounts);
+}
+
+int defused_policy_parse_policy(const char *arg) {
+    if (strcmp(arg, "builtin") == 0) {
+        cfg_policy = POLICY_BUILTIN;
+        return 0;
+    }
+    if (strcmp(arg, "polkit") == 0) {
+#ifdef HAVE_POLKIT
+        cfg_policy = POLICY_POLKIT;
+        return 0;
+#else
+        fprintf(stderr,
+                "defused: --policy=polkit: this build has no polkit support\n");
+        return -EINVAL;
+#endif
+    }
+    fprintf(stderr,
+            "defused: unknown policy '%s' (expected polkit or builtin)\n", arg);
+    return -EINVAL;
+}
+
+int defused_policy_parse_max_mounts(const char *arg) {
+    long n;
+    if (libfuse_strtol(arg, &n) < 0 || n <= 0) {
+        fprintf(stderr,
+                "defused: --max-mounts: expected a positive number, got '%s'\n",
+                arg);
+        return -EINVAL;
+    }
+    cfg_max_mounts = n;
+    return 0;
+}
+
+static __attribute__((__nonnull__(1, 2), __warn_unused_result__)) int
+parse_group(const char *name, gid_t *out_gid) {
+    long n;
+    if (libfuse_strtol(name, &n) == 0) {
+        if (n < 0 || n > (long)(gid_t)-1) {
+            fprintf(stderr, "defused: --allow-groups: gid out of range: %s\n",
+                    name);
+            return -EINVAL;
+        }
+        *out_gid = (gid_t)n;
+        return 0;
+    }
+
+    errno = 0;
+    struct group *gr = getgrnam(name);
+    if (gr == NULL) {
+        fprintf(stderr, "defused: --allow-groups: no such group: %s%s%s\n",
+                name, errno ? ": " : "", errno ? strerror(errno) : "");
+        return -EINVAL;
+    }
+    *out_gid = gr->gr_gid;
+    return 0;
+}
+
+/* Empty is allowed, so a unit file can pass an unset variable. */
+int defused_policy_parse_allow_groups(const char *arg) {
+    _cleanup_free_ char *list = strdup(arg);
+    if (list == NULL)
+        return -ENOMEM;
+
+    cfg_n_allow_groups = 0;
+    char *saveptr = NULL;
+    for (char *name = strtok_r(list, ",", &saveptr); name != NULL;
+         name = strtok_r(NULL, ",", &saveptr)) {
+        if (cfg_n_allow_groups == DEFUSED_MAX_ALLOW_GROUPS) {
+            fprintf(stderr, "defused: --allow-groups: more than %d groups\n",
+                    DEFUSED_MAX_ALLOW_GROUPS);
+            return -EINVAL;
+        }
+        int ret = parse_group(name, &cfg_allow_groups[cfg_n_allow_groups]);
+        if (ret < 0)
+            return ret;
+        cfg_n_allow_groups++;
+    }
+    return 0;
+}
+
+int defused_policy_parse_allow_privileged_flags(const char *arg) {
+    _cleanup_free_ char *list = strdup(arg);
+    if (list == NULL)
+        return -ENOMEM;
+
+    cfg_allow_privileged_flags = 0;
+    char *saveptr = NULL;
+    for (char *name = strtok_r(list, ",", &saveptr); name != NULL;
+         name = strtok_r(NULL, ",", &saveptr)) {
+        bool found = false;
+        for (size_t i = 0; i < sizeof(privileged_mount_flags) /
+                                   sizeof(privileged_mount_flags[0]);
+             i++) {
+            if (strcmp(name, privileged_mount_flags[i].name) == 0) {
+                cfg_allow_privileged_flags |= privileged_mount_flags[i].flag;
+                found = true;
+            }
+        }
+        if (!found) {
+            fprintf(stderr,
+                    "defused: --allow-privileged-flags: unknown privileged "
+                    "mount option: %s\n",
+                    name);
+            return -EINVAL;
+        }
     }
     return 0;
 }

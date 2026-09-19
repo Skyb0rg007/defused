@@ -109,6 +109,10 @@ pkgs.testers.nixosTest {
     allowedOther.wait_for_unit("multi-user.target")
     allowedOther.wait_for_unit("defused.socket")
 
+    with subtest("the polkit policy passes no built-in policy options"):
+        denied.succeed("systemctl cat defused@.service | grep -F -- '--policy=polkit'")
+        denied.fail("systemctl cat defused@.service | grep -F -- '--max-mounts'")
+
     with subtest("default AUTH_ADMIN_KEEP denies without an interactive agent"):
         denied.succeed("install -d -o alice -g users /home/alice/mnt")
         denied.succeed(

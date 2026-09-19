@@ -4,7 +4,7 @@
 
 // Sample polkit rule for website.soss.defused.mount (see doc/protocol.md).
 //
-// The shipped default (data/website.soss.defused.policy) is
+// The shipped default (packaging/polkit/website.soss.defused.policy) is
 // AUTH_ADMIN_KEEP for every request, which is safe but requires an
 // administrator to authenticate interactively for every single FUSE
 // mount. Install this file as e.g.
@@ -13,7 +13,8 @@
 // for this caller, and using no privileged option this rule doesn't
 // explicitly recognize -- while still falling back to the interactive
 // AUTH_ADMIN_KEEP default for anything past that limit or that isn't
-// on the allowlist below.
+// on the allowlist below. Without polkit, `defused --policy=builtin`
+// applies the non-interactive part of this policy.
 //
 // current-mounts and privileged-flags are details defused passes to
 // every CheckAuthorization call for the mount action; see

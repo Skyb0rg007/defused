@@ -37,6 +37,21 @@ in
         '';
       };
 
+      policy = lib.mkOption {
+        type = lib.types.enum [
+          "polkit"
+          "builtin"
+        ];
+        default = "polkit";
+        description = ''
+          Who may mount and unmount (see doc/protocol.md): `polkit` asks
+          polkit per request; `builtin` applies
+          {option}`services.defused.maxMounts`,
+          {option}`services.defused.allowGroups` and
+          {option}`services.defused.allowPrivilegedFlags` without polkit.
+        '';
+      };
+
       recommendedPolkitRule = lib.mkOption {
         type = lib.types.bool;
         default = true;
@@ -46,15 +61,41 @@ in
         '';
       };
 
+      maxMounts = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 100;
+        description = ''
+          Built-in policy only: refuse a mount once this many FUSE
+          filesystems are mounted, like {option}`programs.fuse.mountMax`.
+        '';
+      };
+
+      allowGroups = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        example = [ "fuse" ];
+        description = ''
+          Built-in policy only: groups whose members may mount and unmount.
+          Empty allows every user.
+        '';
+      };
+
+      allowPrivilegedFlags = lib.mkOption {
+        type = lib.types.listOf (lib.types.enum [ "allow_other" ]);
+        default = [ ];
+        description = ''
+          Built-in policy only: privileged mount options callers may use.
+          `allow_other` is the equivalent of
+          {option}`programs.fuse.userAllowOther`.
+        '';
+      };
+
       extraArgs = lib.mkOption {
         type = lib.types.listOf lib.types.str;
         default = [ ];
         description = ''
-          Additional command-line arguments passed to defused. defused
-          currently takes no flags beyond --help -- mount policy is decided
-          per request by polkit, see security.polkit.extraConfig and
-          packaging/polkit/examples/50-defused-mount-policy.rules. Kept for
-          forward compatibility.
+          Additional command-line arguments passed to defused, after the
+          policy options the settings above generate.
         '';
       };
     };
@@ -82,8 +123,8 @@ in
           ''
             programs.fuse.userAllowOther and programs.fuse.mountMax only
             configure libfuse's fusermount, which services.defused has
-            replaced; polkit decides these for defused instead (see
-            security.polkit.extraConfig and doc/protocol.md).
+            replaced; for defused, use polkit (see doc/protocol.md) or
+            services.defused.maxMounts and allowPrivilegedFlags.
           '';
 
     # mkForce: programs.fuse defines the same wrapper, as setuid libfuse.
@@ -102,13 +143,12 @@ in
       }
     );
 
-    # defused asks polkit whether a client may create a FUSE mount at all
-    # (see doc/protocol.md); polkitd has to actually be running for that
-    # check to ever succeed, rather than fail closed.
-    security.polkit.enable = lib.mkDefault true;
+    # Under the polkit policy, polkitd has to be running for a mount to
+    # ever be granted rather than fail closed.
+    security.polkit.enable = lib.mkIf (cfg.policy == "polkit") (lib.mkDefault true);
 
     environment.etc."polkit-1/rules.d/50-defused-mount-policy.rules" =
-      lib.mkIf cfg.recommendedPolkitRule
+      lib.mkIf (cfg.policy == "polkit" && cfg.recommendedPolkitRule)
         {
           source = ../polkit/examples/50-defused-mount-policy.rules;
         };
@@ -140,11 +180,22 @@ in
     systemd.services."defused@" = {
       description = "defused FUSE mount service";
       documentation = [ "https://github.com/Skyb0rg007/defused" ];
-      wants = [ "polkit.service" ];
-      after = [ "polkit.service" ];
+      wants = lib.optional (cfg.policy == "polkit") "polkit.service";
+      after = lib.optional (cfg.policy == "polkit") "polkit.service";
 
       serviceConfig = {
-        ExecStart = lib.escapeShellArgs ([ "${package}/lib/defused/defused" ] ++ cfg.extraArgs);
+        ExecStart = lib.escapeShellArgs (
+          [
+            "${package}/lib/defused/defused"
+            "--policy=${cfg.policy}"
+          ]
+          ++ lib.optionals (cfg.policy == "builtin") [
+            "--max-mounts=${toString cfg.maxMounts}"
+            "--allow-groups=${lib.concatStringsSep "," cfg.allowGroups}"
+            "--allow-privileged-flags=${lib.concatStringsSep "," cfg.allowPrivilegedFlags}"
+          ]
+          ++ cfg.extraArgs
+        );
         AmbientCapabilities = [
           "CAP_DAC_READ_SEARCH"
           "CAP_SYS_ADMIN"

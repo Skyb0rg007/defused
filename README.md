@@ -46,6 +46,9 @@ Privileged callers (see below) have neither requirement.
 Building needs libsystemd 258 or later, for the sd-varlink file descriptor
 passing API. Debian 13 (systemd 257) and Ubuntu 24.04 (255) are too old.
 
+polkit is optional (see [Mount policy](#mount-policy)); `meson setup
+-Dpolkit=false` builds without it.
+
 ## Project structure
 
 This project provides the following:
@@ -58,6 +61,34 @@ The system service is written to use systemd socket activation with
 For testing or on systems without systemd, `defused --daemon` can be used
 to create the Varlink socket and fork off child processes to handle
 accepted connections.
+
+## Mount policy
+
+`defused --policy` chooses who may mount and unmount at all:
+
+- `polkit` (the default) asks polkit per request; see
+  [protocol.md](./doc/protocol.md) and the recommended rule in
+  `packaging/polkit/examples/50-defused-mount-policy.rules`.
+- `builtin` needs no polkit:
+
+  | Option | Meaning | Default |
+  | --- | --- | --- |
+  | `--max-mounts=N` | Refuse a mount once N FUSE filesystems are mounted (libfuse's `mount_max`) | 100 |
+  | `--allow-groups=GROUP[,GROUP...]` | Only members of these groups (names or gids, supplementary included) may mount and unmount | any user |
+  | `--allow-privileged-flags=NAME[,NAME...]` | Privileged mount options callers may use; only `allow_other` exists (libfuse's `user_allow_other`) | none |
+
+The ownership checks below always apply as well.
+The installed `defused@.service` takes these from environment variables, so
+switching is a drop-in:
+
+```
+# systemctl edit defused@.service
+[Service]
+Environment=DEFUSED_POLICY=builtin
+Environment=DEFUSED_ALLOW_GROUPS=fuse
+```
+
+`DEFUSED_MAX_MOUNTS` and `DEFUSED_ALLOW_PRIVILEGED_FLAGS` work the same way.
 
 A caller that is root or holds `CAP_SYS_ADMIN` does not need the service:
 `fusermount3` instead spawns `defused --child`, which performs the request
@@ -104,6 +135,9 @@ works.
 
 This replaces `/run/wrappers/bin/fusermount3` with defused's, so every FUSE
 program uses it, and installs the recommended polkit rule.
+`services.defused.policy = "builtin"` uses the built-in policy instead
+(`maxMounts`, `allowGroups`, `allowPrivilegedFlags`) and leaves polkit
+alone.
 See `services.defused.*` for the options.
 
 ## Nix binary cache

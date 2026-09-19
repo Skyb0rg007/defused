@@ -55,13 +55,12 @@ jobs:
           meson compile -C build
           meson test -C build --print-errorlogs
       - name: Install
-        run: |
-          meson install -C build
-          install -D -m 0644 -t /usr/lib/systemd/system \
-            packaging/systemd/defused.socket packaging/systemd/defused@.service
+        run: meson install -C build
       - name: Check the systemd units and the AppArmor profile
         run: |
           systemd-analyze verify /usr/lib/systemd/system/defused.socket
+          systemd-analyze verify /usr/lib/systemd/system/defused@.service
+          grep -F 'Environment=DEFUSED_POLICY=polkit' /usr/lib/systemd/system/defused@.service
           apparmor_parser --skip-kernel-load --skip-cache /etc/apparmor.d/defused
       - name: Start polkit and defused --daemon
         run: |
@@ -76,6 +75,21 @@ jobs:
           done
           test -S /run/defused/defused.sock
       - name: End-to-end test
+        run: tests/fhs/e2e.sh
+      # Once more without polkit: the built-in policy, restricted to the
+      # test user's group, decides instead. e2e.sh created that user above.
+      - name: Restart defused --daemon with the built-in policy
+        run: |
+          pkill -f '^/usr/lib/defused/defused --daemon' || true
+          setsid /usr/lib/defused/defused --daemon --policy=builtin \
+            --allow-groups=defused-test --max-mounts=10 \
+            >>/run/defused/daemon.log 2>&1 &
+          for _ in $(seq 50); do
+            test -S /run/defused/defused.sock && break
+            sleep 0.1
+          done
+          test -S /run/defused/defused.sock
+      - name: End-to-end test with the built-in policy
         run: tests/fhs/e2e.sh
       - name: Show the daemon log
         if: always()
