@@ -19,7 +19,9 @@
 #ifndef DEFUSED_PROTO_H
 #define DEFUSED_PROTO_H
 
+#include <stdarg.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <systemd/sd-json.h>
 #include <systemd/sd-varlink-idl.h>
@@ -53,6 +55,9 @@ enum defused_op {
 
 /* Max length of an error id in struct defused_error */
 #define DEFUSED_MAX_ERROR_ID 64
+
+/* Max length of the log-only diagnostic in struct defused_error */
+#define DEFUSED_MAX_ERROR_DETAIL 160
 
 /* Max length of subtype */
 #define DEFUSED_MAX_NAME 32
@@ -142,17 +147,48 @@ union defused_req {
 };
 
 /* Why an operation failed; an empty id means it did not. sys_errno is the
- * error's "errno" field, 0 for the errors that don't carry one. */
+ * error's "errno" field, 0 for the errors that don't carry one.
+ *
+ * detail names the exact check or syscall that failed. It only ever reaches
+ * the service's log, never the wire, so it may say things the client is
+ * deliberately not told: several causes share one error id, and some errors
+ * carry no errno. */
 struct defused_error {
     char id[DEFUSED_MAX_ERROR_ID];
+    char detail[DEFUSED_MAX_ERROR_DETAIL];
     int32_t sys_errno;
 };
 
-static inline void defused_error_set(struct defused_error *err, const char *id,
-                                     int sys_errno) {
+/* The setters return -sys_errno so a caller can `return
+ * defused_error_setf(...)`. */
+static inline int defused_error_set_detail(struct defused_error *err,
+                                           const char *id, int sys_errno,
+                                           const char *detail) {
     strncpy(err->id, id ? id : "", sizeof(err->id) - 1);
     err->id[sizeof(err->id) - 1] = '\0';
+    strncpy(err->detail, detail ? detail : "", sizeof(err->detail) - 1);
+    err->detail[sizeof(err->detail) - 1] = '\0';
     err->sys_errno = sys_errno;
+    return -sys_errno;
+}
+
+static inline int defused_error_set(struct defused_error *err, const char *id,
+                                    int sys_errno) {
+    return defused_error_set_detail(err, id, sys_errno, NULL);
+}
+
+/* vsnprintf() is more than the sandboxed child's seccomp filter allows, and
+ * it may clobber errno: capture errno before calling. */
+__attribute__((__format__(__printf__, 4, 5))) static inline int
+defused_error_setf(struct defused_error *err, const char *id, int sys_errno,
+                   const char *fmt, ...) {
+    defused_error_set(err, id, sys_errno);
+
+    va_list ap;
+    va_start(ap, fmt);
+    (void)vsnprintf(err->detail, sizeof(err->detail), fmt, ap);
+    va_end(ap);
+    return -sys_errno;
 }
 
 /* Fills in *err from an sd_varlink_call() result; a NULL error_id is

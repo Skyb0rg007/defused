@@ -14,6 +14,7 @@
 #include <poll.h>
 #include <sched.h>
 #include <seccomp.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -143,11 +144,14 @@ static __attribute__((__noreturn__)) void sandbox_exit(int status) {
 
 /* Sends the sandboxed child's result back to the parent over out_fd and
  * exits; sys_errno is taken as given rather than derived from
- * ret, since a refusal deliberately surfaces no syscall errno. */
-static __attribute__((__noreturn__)) void
-sandbox_done(int out_fd, const char *error_id, int sys_errno, int ret) {
+ * ret, since a refusal deliberately surfaces no syscall errno. detail must be
+ * a fixed string: the child cannot format one. */
+static __attribute__((__noreturn__)) void sandbox_done(int out_fd,
+                                                       const char *error_id,
+                                                       int sys_errno, int ret,
+                                                       const char *detail) {
     struct sandbox_result result = {.ret = ret};
-    defused_error_set(&result.err, error_id, sys_errno);
+    defused_error_set_detail(&result.err, error_id, sys_errno, detail);
     const char *p = (const char *)&result;
     size_t left = sizeof(result);
 
@@ -562,32 +566,50 @@ static int sandbox_fd_mnt_id(int proc_fd, int fd, long *out_id) {
  * closed on return, before the caller's umount2(): an open reference to the
  * mount makes a non-lazy unmount fail with EBUSY. */
 static int sandbox_check_mnt_id(int proc_fd, int parent_fd, const char *name,
-                                long mnt_id) {
+                                long mnt_id, const char **detail) {
     _cleanup_(sandbox_closep) int fd =
         sandbox_openat(parent_fd, name, O_PATH | O_NOFOLLOW | O_CLOEXEC);
-    if (fd == -1)
+    if (fd == -1) {
+        *detail = "reopening the mountpoint in the client's mount namespace "
+                  "failed";
         return -errno;
+    }
     long id = -1;
     int ret = sandbox_fd_mnt_id(proc_fd, fd, &id);
-    if (ret < 0)
+    if (ret < 0) {
+        *detail = "reading the mountpoint's mnt_id in the client's mount "
+                  "namespace failed";
         return ret;
-    return id == mnt_id ? 0 : -ESTALE;
+    }
+    if (id != mnt_id) {
+        *detail = "the mountpoint changed between the authorization check and "
+                  "the unmount";
+        return -ESTALE;
+    }
+    return 0;
 }
 
 /* Runs after setns(). Unmounts name, relative to parent_fd, once
  * sandbox_check_mnt_id() confirms it is still the mount the parent
  * authorized. */
 static int sandbox_unmount_verified(int proc_fd, int parent_fd,
-                                    const char *name, long mnt_id, int flags) {
-    if (sandbox_fchdir(parent_fd) == -1)
+                                    const char *name, long mnt_id, int flags,
+                                    const char **detail) {
+    if (sandbox_fchdir(parent_fd) == -1) {
+        *detail = "fchdir() to the parent directory in the client's mount "
+                  "namespace failed";
         return -errno;
+    }
 
-    int ret = sandbox_check_mnt_id(proc_fd, parent_fd, name, mnt_id);
+    int ret = sandbox_check_mnt_id(proc_fd, parent_fd, name, mnt_id, detail);
     if (ret < 0)
         return ret;
 
-    if (sandbox_umount2(name, UMOUNT_NOFOLLOW | flags) == -1)
+    if (sandbox_umount2(name, UMOUNT_NOFOLLOW | flags) == -1) {
+        *detail = flags & MNT_DETACH ? "umount2(MNT_DETACH) failed"
+                                     : "umount2() failed -- still busy?";
         return -errno;
+    }
     return 0;
 }
 
@@ -609,6 +631,29 @@ static int read_sandbox_result(int fd, struct sandbox_result *result) {
     }
 
     return 0;
+}
+
+/* A child that died without writing a result leaves only the wait status;
+ * SIGSYS there means the seccomp filter refused a syscall. */
+static __attribute__((__nonnull__(3))) void
+describe_sandbox_death(int status, int read_ret, struct defused_error *err,
+                       const char *fail_id) {
+    if (status >= 0 && WIFSIGNALED(status))
+        defused_error_setf(err, fail_id, -read_ret,
+                           "the sandboxed helper was killed by signal %d%s "
+                           "before reporting a result",
+                           WTERMSIG(status),
+                           WTERMSIG(status) == SIGSYS ? " (seccomp filter)"
+                                                      : "");
+    else if (status >= 0 && WIFEXITED(status))
+        defused_error_setf(err, fail_id, -read_ret,
+                           "the sandboxed helper exited with status %d without "
+                           "reporting a result",
+                           WEXITSTATUS(status));
+    else
+        defused_error_setf(err, fail_id, -read_ret,
+                           "could not read the sandboxed helper's result: %s",
+                           strerror(-read_ret));
 }
 
 static int wait_sandbox(pid_t pid) {
@@ -642,9 +687,9 @@ static int reap_sandbox(int pipefd_read, pid_t pid, const char *fail_id,
                         struct defused_error *err) {
     struct sandbox_result result;
     int ret = read_sandbox_result(pipefd_read, &result);
-    (void)wait_sandbox(pid);
+    int status = wait_sandbox(pid);
     if (ret < 0) {
-        defused_error_set(err, fail_id, -ret);
+        describe_sandbox_death(status, ret, err, fail_id);
         return ret;
     }
 
@@ -657,7 +702,10 @@ int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd,
     _cleanup_close_pair_ int pipefd[2] = EBADF_PAIR;
     pid_t pid = fork_with_pipe(pipefd);
     if (pid < 0)
-        return (int)pid;
+        return defused_error_setf(err, DEFUSED_VARLINK_ERROR_MOUNT_FAILED,
+                                  (int)-pid,
+                                  "fork() of the sandboxed helper "
+                                  "failed");
 
     if (pid == 0) {
         pipefd[0] = safe_close(pipefd[0]);
@@ -665,12 +713,13 @@ int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd,
         int ret = install_seccomp(DEFUSED_OP_MOUNT);
         if (ret < 0)
             sandbox_done(pipefd[1], DEFUSED_VARLINK_ERROR_MOUNT_FAILED, -ret,
-                         ret);
+                         ret, "installing the sandbox seccomp filter failed");
 
         if (sandbox_setns(pidfd, CLONE_NEWNS) == -1) {
             ret = -errno;
             sandbox_done(pipefd[1], DEFUSED_VARLINK_ERROR_MOUNT_FAILED, -ret,
-                         ret);
+                         ret,
+                         "setns() into the client's mount namespace failed");
         }
 
         ret = sandbox_move_mount(mountfd, "", mnt_fd, "",
@@ -680,7 +729,10 @@ int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd,
                   : 0;
         sandbox_done(pipefd[1],
                      ret < 0 ? DEFUSED_VARLINK_ERROR_MOUNT_FAILED : NULL,
-                     ret < 0 ? -ret : 0, ret);
+                     ret < 0 ? -ret : 0, ret,
+                     ret < 0 ? "move_mount() onto the mountpoint in the "
+                               "client's mount namespace failed"
+                             : NULL);
     }
 
     pipefd[1] = safe_close(pipefd[1]);
@@ -696,18 +748,30 @@ int defused_sandbox_unmount(int pidfd, int proc_fd, int parent_fd,
     uid_t owner;
     int ret = peer_fuse_mount_owner(pidfd, mnt_id, &owner);
     if (ret < 0) {
-        defused_error_set(err, DEFUSED_VARLINK_ERROR_NOT_A_FUSE_MOUNT, 0);
+        defused_error_setf(
+            err, DEFUSED_VARLINK_ERROR_NOT_A_FUSE_MOUNT, 0,
+            "mnt_id %ld %s (%s)", mnt_id,
+            ret == -ENOENT   ? "is not in the caller's mountinfo"
+            : ret == -EINVAL ? "is not a FUSE mount with a user_id= option"
+                             : "could not be read from the caller's mountinfo",
+            strerror(-ret));
         return ret;
     }
     if (owner != uid) {
-        defused_error_set(err, DEFUSED_VARLINK_ERROR_NOT_ALLOWED, 0);
+        defused_error_setf(err, DEFUSED_VARLINK_ERROR_NOT_ALLOWED, 0,
+                           "the FUSE mount with mnt_id %ld belongs to uid %u, "
+                           "not the caller's uid %u",
+                           mnt_id, (unsigned)owner, (unsigned)uid);
         return -EPERM;
     }
 
     _cleanup_close_pair_ int pipefd[2] = EBADF_PAIR;
     pid_t pid = fork_with_pipe(pipefd);
     if (pid < 0)
-        return (int)pid;
+        return defused_error_setf(err, DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED,
+                                  (int)-pid,
+                                  "fork() of the sandboxed helper "
+                                  "failed");
 
     if (pid == 0) {
         pipefd[0] = safe_close(pipefd[0]);
@@ -715,20 +779,24 @@ int defused_sandbox_unmount(int pidfd, int proc_fd, int parent_fd,
         int child_ret = install_seccomp(DEFUSED_OP_UNMOUNT);
         if (child_ret < 0)
             sandbox_done(pipefd[1], DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED,
-                         -child_ret, child_ret);
+                         -child_ret, child_ret,
+                         "installing the sandbox seccomp filter failed");
 
         if (sandbox_setns(pidfd, CLONE_NEWNS) == -1) {
             child_ret = -errno;
             sandbox_done(pipefd[1], DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED,
-                         -child_ret, child_ret);
+                         -child_ret, child_ret,
+                         "setns() into the client's mount namespace failed");
         }
 
+        const char *detail = NULL;
         child_ret = sandbox_unmount_verified(proc_fd, parent_fd, name, mnt_id,
-                                             lazy ? MNT_DETACH : 0);
+                                             lazy ? MNT_DETACH : 0, &detail);
         sandbox_done(pipefd[1],
                      child_ret < 0 ? DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED
                                    : NULL,
-                     child_ret < 0 ? -child_ret : 0, child_ret);
+                     child_ret < 0 ? -child_ret : 0, child_ret,
+                     child_ret < 0 ? detail : NULL);
     }
 
     pipefd[1] = safe_close(pipefd[1]);
