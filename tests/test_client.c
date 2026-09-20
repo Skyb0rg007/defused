@@ -345,6 +345,14 @@ static int test_privileged_unmount(const char *client) {
     return failures ? -EINVAL : 0;
 }
 
+static int test_works_without_setuid(const char *client) {
+    char *args[] = {(char *)"--works-without-setuid"};
+    pid_t pid;
+    CHECK(spawn_client(client, -1, args, 1, &pid) == 0);
+    CHECK(wait_exit_code(pid) == 0);
+    return failures ? -EINVAL : 0;
+}
+
 /* Runs as the `defused --child` the client spawned. The socket arrives as
  * fd 3 via $LISTEN_FDS, as the real defused expects. A failed CHECK here is
  * only visible in stderr, since the client's exit code reflects the reply. */
@@ -383,6 +391,7 @@ int main(int argc, char *argv[]) {
     setenv("DEFUSED_SOCKET", "/nonexistent/defused.sock", 1);
     (void)test_privileged_mount(argv[1]);
     (void)test_privileged_unmount(argv[1]);
+    (void)test_works_without_setuid(argv[1]);
 
     setenv("DEFUSED_TEST_UID", "1", 1);
 
