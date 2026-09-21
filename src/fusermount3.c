@@ -12,6 +12,7 @@
  */
 #define _GNU_SOURCE
 #include "common.h"
+#include "defused-syscall.h"
 #include "defused_proto.h"
 
 #include <errno.h>
@@ -382,8 +383,9 @@ static int close_inherited_fds(int cfd) {
     if (cfd <= STDERR_FILENO)
         return -EINVAL; /* We can't even report an error */
     if ((cfd > STDERR_FILENO + 1 &&
-         syscall(SYS_close_range, STDERR_FILENO + 1, cfd - 1, 0) < 0) ||
-        syscall(SYS_close_range, cfd + 1, ~0U, 0) < 0)
+         sys_close_range((unsigned)STDERR_FILENO + 1, (unsigned)cfd - 1, 0) <
+             0) ||
+        sys_close_range((unsigned)cfd + 1, ~0U, 0) < 0)
         for (int fd = STDERR_FILENO + 1, max = (int)sysconf(_SC_OPEN_MAX);
              fd < max; fd++)
             if (fd != cfd)
