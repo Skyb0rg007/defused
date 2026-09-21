@@ -15,6 +15,7 @@
 #define _GNU_SOURCE
 #include "common.h"
 #include "defused-sandbox.h"
+#include "defused-syscall.h"
 #include "defused_proto.h"
 
 #include <errno.h>
@@ -94,8 +95,7 @@ static int count_fuse_mounts(void) {
     uint64_t ids[256];
     int count = 0;
     for (;;) {
-        ssize_t n = (ssize_t)syscall(SYS_listmount, &req, ids,
-                                     (long)ARRAY_SIZE(ids), 0L);
+        ssize_t n = sys_listmount(&req, ids, ARRAY_SIZE(ids), 0);
         if (n < 0)
             return -errno;
         for (ssize_t i = 0; i < n; i++) {
@@ -344,9 +344,8 @@ static const char *fs_context_message(int fsfd, char *buf, size_t size) {
 /* fsconfig(FSCONFIG_SET_STRING), or FSCONFIG_SET_FLAG for a NULL value. */
 static int fsconfig_set(int fsfd, const char *key, const char *value,
                         struct defused_error *err) {
-    if (syscall(SYS_fsconfig, fsfd,
-                value ? FSCONFIG_SET_STRING : FSCONFIG_SET_FLAG, key, value,
-                0) == 0)
+    if (sys_fsconfig(fsfd, value ? FSCONFIG_SET_STRING : FSCONFIG_SET_FLAG, key,
+                     value, 0) == 0)
         return 0;
     char msg[128];
     return defused_error_setf(err, DEFUSED_ERROR_MOUNT_FAILED, errno,
@@ -366,7 +365,7 @@ static int create_detached_mount(const struct defused_mount_req *req,
     snprintf(type, sizeof(type), "%s%s%s",
              flags & DEFUSED_MOUNT_BLKDEV ? "fuseblk" : "fuse",
              req->subtype[0] ? "." : "", req->subtype);
-    _cleanup_close_ int fsfd = (int)syscall(SYS_fsopen, type, FSOPEN_CLOEXEC);
+    _cleanup_close_ int fsfd = sys_fsopen(type, FSOPEN_CLOEXEC);
     if (fsfd == -1)
         return defused_error_setf(
             err, DEFUSED_ERROR_MOUNT_FAILED, errno, "fsopen(\"%s\") failed%s",
@@ -404,7 +403,7 @@ static int create_detached_mount(const struct defused_mount_req *req,
         if (ret < 0)
             return ret;
     }
-    if (syscall(SYS_fsconfig, fsfd, FSCONFIG_CMD_CREATE, NULL, NULL, 0) == -1)
+    if (sys_fsconfig(fsfd, FSCONFIG_CMD_CREATE, NULL, NULL, 0) == -1)
         return defused_error_setf(err, DEFUSED_ERROR_MOUNT_FAILED, errno,
                                   "fsconfig(CMD_CREATE) for %s failed%s", type,
                                   fs_context_message(fsfd, msg, sizeof(msg)));
@@ -418,7 +417,7 @@ static int create_detached_mount(const struct defused_mount_req *req,
         (flags & DEFUSED_MOUNT_NOATIME ? MOUNT_ATTR_NOATIME : 0) |
         (flags & DEFUSED_MOUNT_NODIRATIME ? MOUNT_ATTR_NODIRATIME : 0) |
         (flags & DEFUSED_MOUNT_NOSYMFOLLOW ? MOUNT_ATTR_NOSYMFOLLOW : 0);
-    int mountfd = (int)syscall(SYS_fsmount, fsfd, FSMOUNT_CLOEXEC, attrs);
+    int mountfd = sys_fsmount(fsfd, FSMOUNT_CLOEXEC, attrs);
     if (mountfd == -1)
         return defused_error_setf(err, DEFUSED_ERROR_MOUNT_FAILED, errno,
                                   "fsmount(attrs %#x) failed%s", attrs,
@@ -519,8 +518,8 @@ static int mount_request(sd_varlink *link, const struct defused_mount_req *req,
         return mountfd;
     if (!cfg_child)
         return defused_sandbox_mount(pidfd, mountfd, mnt_fd, err);
-    if (syscall(SYS_move_mount, mountfd, "", mnt_fd, "",
-                MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH) == -1)
+    if (sys_move_mount(mountfd, "", mnt_fd, "",
+                       MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH) == -1)
         return defused_error_setf(err, DEFUSED_ERROR_MOUNT_FAILED, errno,
                                   "move_mount() onto the mountpoint failed");
     return 0;

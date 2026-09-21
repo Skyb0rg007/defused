@@ -9,6 +9,7 @@
 #define _GNU_SOURCE
 #include "defused-sandbox.h"
 #include "common.h"
+#include "defused-syscall.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -76,38 +77,18 @@ static int install_seccomp(enum defused_op op) {
     return seccomp_load(ctx);
 }
 
-/*
- * Everything that can run after setns() uses these: syscall() has exactly
- * the kernel entry named here, unlike a libc function whose implementation
- * may change underneath the allowlist.
- */
-static int sandbox_setns(int fd, int nstype) {
-    return (int)syscall(SYS_setns, fd, nstype);
-}
-
-static ssize_t sandbox_write(int fd, const void *buf, size_t count) {
-    return (ssize_t)syscall(SYS_write, fd, buf, count);
-}
-
-static int sandbox_fchdir(int fd) { return (int)syscall(SYS_fchdir, fd); }
-
-/* musl prototypes ioctl()'s request as int, which the _IO* constants do
- * not fit. The kernel takes an unsigned int, so pass the number itself. */
-static int raw_ioctl(int fd, unsigned long request, void *arg) {
-    return (int)syscall(SYS_ioctl, (long)fd, (long)request, arg);
-}
-
+/* exit_group() ends the process; the loop only keeps this noreturn. */
 static __attribute__((__noreturn__)) void sandbox_exit(int status) {
-    (void)syscall(SYS_exit_group, status);
+    sys_exit_group(status);
     for (;;)
-        (void)syscall(SYS_exit, status);
+        sys_exit(status);
 }
 
 /* Linux 6.13+. ENODATA, not EINVAL, for a useless reply: EINVAL means the
  * kernel lacks the ioctl. */
 static pid_t pidfd_to_pid_ioctl(int pidfd) {
     struct pidfd_info info = {0};
-    if (raw_ioctl(pidfd, PIDFD_GET_INFO, &info) == -1)
+    if (sys_ioctl(pidfd, PIDFD_GET_INFO, &info) == -1)
         return -errno;
     if (!(info.mask & PIDFD_INFO_PID) || info.pid == 0 ||
         info.pid > (unsigned int)INT_MAX)
@@ -194,7 +175,7 @@ int defused_is_fuse_mount(uint64_t mnt_ns_id, uint64_t mnt_id, bool *out_blkdev,
         .mnt_ns_id = mnt_ns_id,
     };
     union sandbox_statmount buf;
-    if (syscall(SYS_statmount, &req, &buf.sm, (long)sizeof(buf), 0L) == -1)
+    if (sys_statmount(&req, &buf.sm, sizeof(buf), 0) == -1)
         return -errno;
     if (!(buf.sm.mask & STATMOUNT_FS_TYPE))
         return -EINVAL;
@@ -228,7 +209,7 @@ static int peer_mnt_ns_id(int pidfd, uint64_t *out_id) {
     int ret = pidfd_alive(pidfd);
     if (ret < 0)
         return ret;
-    return raw_ioctl(ns_fd, NS_GET_MNTNS_ID, out_id) == -1 ? -errno : 0;
+    return sys_ioctl(ns_fd, NS_GET_MNTNS_ID, out_id) == -1 ? -errno : 0;
 }
 
 /* statmount() is told which namespace to look in, so this needs neither
@@ -260,8 +241,8 @@ _Static_assert(offsetof(struct sandbox_handle, f_handle) ==
 int defused_mnt_id(int dir_fd, const char *name, uint64_t *out_id) {
     struct sandbox_handle h = {.handle_bytes = MAX_HANDLE_SZ};
     uint64_t id = 0;
-    if (syscall(SYS_name_to_handle_at, (long)dir_fd, name, &h, &id,
-                (long)SANDBOX_HANDLE_FLAGS) == -1)
+    if (sys_name_to_handle_at(dir_fd, name, &h, &id, SANDBOX_HANDLE_FLAGS) ==
+        -1)
         return -errno;
     *out_id = id;
     return 0;
@@ -279,8 +260,8 @@ struct sandbox_job {
  * cannot format one. */
 static int sandbox_do_mount(const struct sandbox_job *job,
                             const char **detail) {
-    if (syscall(SYS_move_mount, job->mountfd, "", job->mnt_fd, "",
-                MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH) == 0)
+    if (sys_move_mount(job->mountfd, "", job->mnt_fd, "",
+                       MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH) == 0)
         return 0;
     *detail = "move_mount() onto the mountpoint in the client's mount "
               "namespace failed";
@@ -289,7 +270,7 @@ static int sandbox_do_mount(const struct sandbox_job *job,
 
 static int sandbox_do_unmount(const struct sandbox_job *job,
                               const char **detail) {
-    if (sandbox_fchdir(job->parent_fd) == -1) {
+    if (sys_fchdir(job->parent_fd) == -1) {
         *detail = "fchdir() to the parent directory in the client's mount "
                   "namespace failed";
         return -errno;
@@ -309,8 +290,7 @@ static int sandbox_do_unmount(const struct sandbox_job *job,
                   "and the unmount";
         return -ESTALE;
     }
-    if (syscall(SYS_umount2, job->name, UMOUNT_NOFOLLOW | job->umount_flags) ==
-        -1) {
+    if (sys_umount2(job->name, UMOUNT_NOFOLLOW | job->umount_flags) == -1) {
         *detail = job->umount_flags & MNT_DETACH
                       ? "umount2(MNT_DETACH) failed"
                       : "umount2() failed -- still busy?";
@@ -343,7 +323,7 @@ static int run_sandboxed(const struct sandbox_job *job, int pidfd,
         int ret = install_seccomp(job->op);
         if (ret == 0) {
             detail = "setns() into the client's mount namespace failed";
-            ret = sandbox_setns(pidfd, CLONE_NEWNS) == -1 ? -errno : 0;
+            ret = sys_setns(pidfd, CLONE_NEWNS) == -1 ? -errno : 0;
         }
         if (ret == 0)
             ret = job->op == DEFUSED_OP_MOUNT
@@ -353,7 +333,7 @@ static int run_sandboxed(const struct sandbox_job *job, int pidfd,
         if (ret < 0)
             defused_error_set(&result.err, fail_id, -ret, detail);
         /* Under PIPE_BUF, so it arrives whole or not at all. */
-        (void)sandbox_write(pipefd[1], &result, sizeof(result));
+        (void)sys_write(pipefd[1], &result, sizeof(result));
         sandbox_exit(ret == 0 ? 0 : 1);
     }
     pipefd[1] = safe_close(pipefd[1]);
