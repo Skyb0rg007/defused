@@ -105,60 +105,36 @@ static void test_filter_syscall(enum defused_op op, long syscall_number,
     CHECK(result.sys_errno == expected_errno);
 }
 
-static void test_mountinfo_parser(void) {
+/* statmount() strips the leading comma; FUSE always emits user_id= and
+ * group_id=. */
+static void test_mount_opts_parser(void) {
     uid_t uid = 0;
-    const char *line = "42 35 0:50 / /mnt rw,nosuid - fuse.sshfs user_id=123 "
-                       "rw,nosuid,user_id=1000,group_id=1000";
-    CHECK(defused_test_mountinfo_owner(line, 42, &uid) == 0);
+    CHECK(defused_test_mount_opts_owner("user_id=1000,group_id=1000", &uid) ==
+          0);
     CHECK(uid == 1000);
 
     uid = 0;
-    line = "43 35 0:51 / /mnt rw - fuse source "
-           "rw,xuser_id=123,user_id=1001,group_id=1001";
-    CHECK(defused_test_mountinfo_owner(line, 43, &uid) == 0);
+    CHECK(defused_test_mount_opts_owner("rw,nosuid,user_id=1001,group_id=2",
+                                        &uid) == 0);
     CHECK(uid == 1001);
 
+    /* Only the start of an option counts, so this is not a user_id=. */
     uid = 0;
-    line = "44 35 0:52 / /mnt rw - fuseblk source "
-           "rw,user_id=1002,group_id=1002";
-    CHECK(defused_test_mountinfo_owner(line, 44, &uid) == 0);
+    CHECK(defused_test_mount_opts_owner("xuser_id=1,user_id=1002", &uid) == 0);
     CHECK(uid == 1002);
 
-    line = "45 35 0:53 / /mnt rw - ext4 source rw,user_id=1003";
-    CHECK(defused_test_mountinfo_owner(line, 45, &uid) == -EINVAL);
+    uid = 0;
+    CHECK(defused_test_mount_opts_owner("allow_other,user_id=0", &uid) == 0);
+    CHECK(uid == 0);
 
-    line = "46 35 0:54 / /mnt rw - fuse source rw,group_id=1004";
-    CHECK(defused_test_mountinfo_owner(line, 99, &uid) == -ENOENT);
-    CHECK(defused_test_mountinfo_owner(line, 46, &uid) == -EINVAL);
-
-    line = "47 35 0:55 / /mnt rw - fuse user_id=1005 rw,group_id=1005";
-    CHECK(defused_test_mountinfo_owner(line, 47, &uid) == -EINVAL);
-
-    line = "48 35 0:56 / /mnt rw - fuseevil source rw,user_id=1006";
-    CHECK(defused_test_mountinfo_owner(line, 48, &uid) == -EINVAL);
-}
-
-static void test_long_mountinfo_line(void) {
-    char line[8192];
-    int n = snprintf(line, sizeof(line), "49 35 0:57 / /mnt rw ");
-    CHECK(n > 0);
-    if (n <= 0)
-        return;
-
-    size_t len = (size_t)n;
-    while (len < 6000)
-        line[len++] = 'x';
-
-    const char *suffix = " - fuse source rw,user_id=4242,group_id=4242";
-    size_t suffix_len = strlen(suffix);
-    CHECK(len + suffix_len + 1 < sizeof(line));
-    if (len + suffix_len + 1 >= sizeof(line))
-        return;
-    memcpy(line + len, suffix, suffix_len + 1);
-
-    uid_t uid = 0;
-    CHECK(defused_test_mountinfo_owner(line, 49, &uid) == 0);
-    CHECK(uid == 4242);
+    CHECK(defused_test_mount_opts_owner("rw,group_id=5", &uid) == -EINVAL);
+    CHECK(defused_test_mount_opts_owner("", &uid) == -EINVAL);
+    CHECK(defused_test_mount_opts_owner("user_id=", &uid) == -EINVAL);
+    CHECK(defused_test_mount_opts_owner("user_id=-1", &uid) == -EINVAL);
+    CHECK(defused_test_mount_opts_owner("user_id=1x,group_id=1", &uid) ==
+          -EINVAL);
+    CHECK(defused_test_mount_opts_owner("user_id=99999999999999999999", &uid) ==
+          -EINVAL);
 }
 
 static void test_fdinfo_pid(void) {
@@ -173,33 +149,6 @@ static void test_fdinfo_pid(void) {
     CHECK(defused_test_fdinfo_pid("Pid:\t\n") == -EINVAL);
     CHECK(defused_test_fdinfo_pid("Pid:\t2147483648\n") == -EINVAL);
     CHECK(defused_test_fdinfo_pid("Pid:\t4242 junk\n") == -EINVAL);
-}
-
-static void test_fdinfo_parser(void) {
-    long id = -1;
-    const char *info = "pos:\t0\nflags:\t012100000\nmnt_id:\t31\nino:\t4242\n";
-    CHECK(defused_test_fdinfo_mnt_id(info, &id) == 0);
-    CHECK(id == 31);
-
-    id = -1;
-    info = "pos:\t0\nflags:\t0\nmnt_id:\t7";
-    CHECK(defused_test_fdinfo_mnt_id(info, &id) == 0);
-    CHECK(id == 7);
-
-    info = "pos:\t0\nflags:\t0\nino:\t31\n";
-    CHECK(defused_test_fdinfo_mnt_id(info, &id) == -ENODATA);
-
-    info = "pos:\t0\nxmnt_id:\t31\n";
-    CHECK(defused_test_fdinfo_mnt_id(info, &id) == -ENODATA);
-
-    info = "mnt_id:\t\n";
-    CHECK(defused_test_fdinfo_mnt_id(info, &id) == -EINVAL);
-
-    info = "mnt_id:\t3x\n";
-    CHECK(defused_test_fdinfo_mnt_id(info, &id) == -EINVAL);
-
-    info = "mnt_id:\t99999999999999999999999\n";
-    CHECK(defused_test_fdinfo_mnt_id(info, &id) == -EOVERFLOW);
 }
 
 int main(void) {
@@ -221,15 +170,15 @@ int main(void) {
     test_filter_syscall(DEFUSED_OP_MOUNT, SYS_openat, EPERM);
     test_filter_syscall(DEFUSED_OP_MOUNT, SYS_fchdir, EPERM);
     test_filter_syscall(DEFUSED_OP_MOUNT, SYS_umount2, EPERM);
+    test_filter_syscall(DEFUSED_OP_MOUNT, SYS_name_to_handle_at, EPERM);
     test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_move_mount, EPERM);
-    test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_read, EBADF);
-    test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_close, EBADF);
-    test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_openat, EFAULT);
+    test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_read, EPERM);
+    test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_close, EPERM);
+    test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_openat, EPERM);
     test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_fchdir, EBADF);
     test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_umount2, EFAULT);
-    test_mountinfo_parser();
-    test_long_mountinfo_line();
+    test_filter_syscall(DEFUSED_OP_UNMOUNT, SYS_name_to_handle_at, EFAULT);
+    test_mount_opts_parser();
     test_fdinfo_pid();
-    test_fdinfo_parser();
     return failures ? 1 : 0;
 }

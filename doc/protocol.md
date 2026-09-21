@@ -110,9 +110,8 @@ The client attaches a file descriptor for the mountpoint's parent directory.
 `parentFileDescriptor` is the index of that fd, normally `0`.
 `name` is the mountpoint's basename within that directory.
 
-The service opens `name` under the parent fd with `O_PATH | O_NOFOLLOW`,
-reads the target's `mnt_id` from its `fdinfo`, compares that with the parent
-fd's `mnt_id`, and closes the target fd again.
+The service reads the `mnt_id` of `name` under the parent fd with
+`name_to_handle_at()` and compares it with the parent fd's own.
 The target must be a mountpoint under the parent, not just a regular directory
 inside the same mount, so the target and parent mount IDs must differ.
 From here on the `mnt_id` is what identifies the target.
@@ -121,16 +120,16 @@ The service then asks its policy whether the caller may unmount at all (the
 `--allow-groups` check), failing otherwise.
 The check only answers whether the caller may use unmount at all, and thus
 the default policy is to always allow.
-The service then reads the caller's `/proc/<pid>/mountinfo` (the pid comes
-from the socket peer's pidfd) and checks that the target's `mnt_id` identifies
-a FUSE mount whose `user_id=` superblock option matches the caller's uid.
+The service then asks `statmount()` about the target, naming the caller's
+mount namespace (found from the socket peer's pidfd) so that nothing has to
+be entered, and checks that the mount is a `fuse` or `fuseblk` one whose
+`user_id=` superblock option matches the caller's uid.
 
 Finally, a sandboxed child joins the caller's mount namespace, changes
-directory to the parent fd, re-opens `name` with `O_PATH | O_NOFOLLOW`, and
-checks through the service's trusted procfs that its `mnt_id` is still the
-one that was authorized.
-It closes that fd again and calls `umount2(name, UMOUNT_NOFOLLOW)`, adding
-`MNT_DETACH` if `lazy` is true.
+directory to the parent fd, and asks `name_to_handle_at()` about `name`
+again to check that its `mnt_id` is still the one that was authorized.
+It then calls `umount2(name, UMOUNT_NOFOLLOW)`, adding `MNT_DETACH` if `lazy`
+is true.
 No defused process holds an fd on the mount at that point, since any such
 reference would make a non-lazy unmount fail with `EBUSY`.
 
@@ -209,9 +208,10 @@ After validating and authorizing the request, it forks a short-lived child that
 installs an enforcing seccomp filter and then joins the namespace.
 For mounts, the parent creates a detached FUSE mount first, leaving the child
 only `setns()` and `move_mount()`.
-For unmounts, the child can additionally open `name` under the parent
-directory, read its `fdinfo` through the trusted procfs file descriptor opened
-by the parent, close it, and call `umount2()`.
+For unmounts, the child can additionally `fchdir()` to the parent directory,
+`name_to_handle_at()` `name` under it, and call `umount2()`.
+Both may `write()` their result back and exit.
+
 The post-`setns()` code uses explicit syscall wrappers so the filter's
 allowlist fully describes its possible kernel interface.
 
@@ -219,10 +219,21 @@ allowlist fully describes its possible kernel interface.
 
 Passing an fd on the mountpoint itself makes non-lazy `umount2()` see an
 additional open reference and return `EBUSY`.
-The same applies to fds the service opens: the `O_PATH` fd it uses to read the
-target's `mnt_id` is closed before `umount2()` runs, and the final call names
-the target as `name` relative to the parent directory, mirroring libfuse's own
-`fusermount3` flow.
+The same applies to fds the service would open, which is why the `mnt_id`
+checks take no fd at all, and why the final call names the target as `name`
+relative to the parent directory, mirroring libfuse's own `fusermount3` flow.
+
+Those mount-id reads use `name_to_handle_at()` rather than `statx()`, which
+would be the obvious choice.
+`statx()` calls the filesystem's `getattr()`, and `fuse_getattr()` answers
+`EACCES` to any non-empty request from a process that is neither the mount's
+`user_id` nor covered by `allow_other` -- running as root is no help.
+It would therefore refuse exactly the mounts this service exists to unmount.
+`name_to_handle_at()` never calls `getattr()`; `AT_HANDLE_FID` asks for a
+handle that need not be decodable, which every filesystem can produce, and
+`AT_HANDLE_MNT_ID_UNIQUE` returns the 64-bit mount id the kernel never
+reuses, so an id recycled inside the window cannot pass for the mount that
+was authorized.
 
 That parent-relative lookup is what the sandboxed child re-checks right before
 `umount2()`: `name` must still resolve to the authorized `mnt_id`, so a rename
