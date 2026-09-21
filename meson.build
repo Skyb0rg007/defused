@@ -62,6 +62,12 @@ fusermount3_exe = executable(
   install : true,
 )
 
+install_symlink(
+  'fusermount',
+  install_dir : get_option('bindir'),
+  pointing_to : 'fusermount3',
+)
+
 unit_conf = configuration_data()
 unit_conf.set('DEFUSED_PATH', defused_install_dir / 'defused')
 configure_file(

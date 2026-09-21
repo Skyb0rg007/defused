@@ -14,6 +14,20 @@
 let
   cfg = config.services.defused;
   package = cfg.package;
+
+  # The same binary under either libfuse's helper name, unprivileged: the
+  # wrapper is only here to take over the path libfuse execs.
+  mkWrapper = name: {
+    enable = true;
+    program = name;
+    source = "${package}/bin/${name}";
+    owner = "root";
+    group = "root";
+    permissions = "u+rx,g+x,o+x";
+    capabilities = "";
+    setuid = false;
+    setgid = false;
+  };
 in
 {
   options = {
@@ -34,6 +48,17 @@ in
           Install defused's fusermount3 as {file}`/run/wrappers/bin/fusermount3`,
           where libfuse looks for it, in place of the setuid helper from
           {option}`programs.fuse`.
+        '';
+      };
+
+      replaceFusermount = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Install defused's helper as {file}`/run/wrappers/bin/fusermount`
+          too, where libfuse2 looks for it, in place of the setuid helper
+          from {option}`programs.fuse`. The same binary serves both libfuse
+          generations.
         '';
       };
 
@@ -78,8 +103,11 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    # hiPrio: programs.fuse also puts a fusermount3 into the system path.
-    environment.systemPackages = [ (if cfg.replaceFusermount3 then lib.hiPrio package else package) ];
+    # hiPrio: programs.fuse also puts a fusermount and a fusermount3 into the
+    # system path, and defused ships both names too.
+    environment.systemPackages = [
+      (if cfg.replaceFusermount3 || cfg.replaceFusermount then lib.hiPrio package else package)
+    ];
 
     warnings =
       lib.optional (config.programs.fuse.enable && !cfg.replaceFusermount3) ''
@@ -88,11 +116,17 @@ in
         programs use it instead of defused. Programs started with
         no_new_privs still cannot mount.
       ''
+      ++ lib.optional (config.programs.fuse.enable && !cfg.replaceFusermount) ''
+        services.defused.replaceFusermount is off while programs.fuse is on,
+        so /run/wrappers/bin/fusermount is libfuse2's setuid helper and
+        libfuse2 filesystems use it instead of defused. Programs started
+        with no_new_privs still cannot mount.
+      ''
       ++
         lib.optional
           (
             config.programs.fuse.enable
-            && cfg.replaceFusermount3
+            && (cfg.replaceFusermount3 || cfg.replaceFusermount)
             && (config.programs.fuse.userAllowOther || config.programs.fuse.mountMax != 1000)
           )
           ''
@@ -102,21 +136,14 @@ in
             allowOther.
           '';
 
-    # mkForce: programs.fuse defines the same wrapper, as setuid libfuse.
+    # mkForce: programs.fuse defines the same wrappers, as setuid libfuse.
     # Every submodule option is set so none of its definition survives.
-    security.wrappers.fusermount3 = lib.mkIf cfg.replaceFusermount3 (
-      lib.mkForce {
-        enable = true;
-        program = "fusermount3";
-        source = "${package}/bin/fusermount3";
-        owner = "root";
-        group = "root";
-        permissions = "u+rx,g+x,o+x";
-        capabilities = "";
-        setuid = false;
-        setgid = false;
-      }
-    );
+    security.wrappers = lib.mkMerge [
+      (lib.mkIf cfg.replaceFusermount3 {
+        fusermount3 = lib.mkForce (mkWrapper "fusermount3");
+      })
+      (lib.mkIf cfg.replaceFusermount { fusermount = lib.mkForce (mkWrapper "fusermount"); })
+    ];
 
     security.apparmor = {
       policies.defused.path = "${package}/etc/apparmor.d/defused";

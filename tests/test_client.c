@@ -117,6 +117,40 @@ static int wait_exit_code(pid_t pid) {
     return WEXITSTATUS(wstatus);
 }
 
+/* The one binary is installed under both helper names, so the -V banner
+ * follows argv[0]: libfuse2 callers must see "fusermount version:". */
+static void check_version_banner(const char *client, const char *argv0,
+                                 const char *name) {
+    int pipefd[2];
+    if (pipe(pipefd) < 0) {
+        CHECK(false);
+        return;
+    }
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        (void)dup2(pipefd[1], STDOUT_FILENO);
+        (void)close(pipefd[0]);
+        (void)close(pipefd[1]);
+        char *argv[] = {(char *)argv0, (char *)"-V", NULL};
+        execv(client, argv);
+        _exit(127);
+    }
+    (void)close(pipefd[1]);
+    char buf[256] = {0};
+    ssize_t n = read(pipefd[0], buf, sizeof(buf) - 1);
+    (void)close(pipefd[0]);
+    CHECK(wait_exit_code(pid) == 0);
+    CHECK(n > 0);
+
+    char expected[64];
+    snprintf(expected, sizeof(expected), "%s version: ", name);
+    bool ok = strncmp(buf, expected, strlen(expected)) == 0;
+    CHECK(ok);
+    if (!ok)
+        fprintf(stderr, "  argv[0] %s printed: %s", argv0, buf);
+}
+
 /* The client forwards the device fd to _FUSE_COMMFD framed the way libfuse's
  * receive_fd() expects: one zero byte plus SCM_RIGHTS. */
 static void check_forwarded_fd(int comm_fd) {
@@ -132,9 +166,12 @@ static void check_forwarded_fd(int comm_fd) {
 }
 
 /* The -o string test_mount() and test_privileged_mount() send, and what
- * method_mount() expects it to have been parsed into. */
+ * method_mount() expects it to have been parsed into. noatime,atime and
+ * large_read are here for libfuse2's fusermount, whose option set is a
+ * subset of fusermount3's apart from those two. */
 #define MOUNT_OPTS                                                             \
-    "ro,noexec,suid,dev,sync,dirsync,fsname=test\\,fs,subtype=mem\\,fs,"       \
+    "ro,noexec,suid,dev,sync,dirsync,noatime,atime,large_read,"                \
+    "fsname=test\\,fs,subtype=mem\\,fs,"                                       \
     "max_read=4096,default_permissions,nonempty,x-gvfs-hide"
 static const char mount_opts[] = MOUNT_OPTS;
 static const char privileged_mount_opts[] = MOUNT_OPTS ",blkdev";
@@ -179,7 +216,9 @@ static int method_mount(sd_varlink *link, sd_json_variant *parameters,
                               DEFUSED_MOUNT_SYNCHRONOUS |
                               DEFUSED_MOUNT_DIRSYNC |
                               DEFUSED_FUSE_DEFAULT_PERMISSIONS;
-    /* suid and dev are ignored for an unprivileged caller and honored for a
+    /* No NOATIME: the later atime in the -o string clears what noatime set.
+     *
+     * suid and dev are ignored for an unprivileged caller and honored for a
      * privileged one, which also sends blkdev (see privileged_mount_opts). */
     if (strcmp(getenv("DEFUSED_TEST_UID"), "0") == 0)
         expected_flags |= DEFUSED_MOUNT_ALLOW_SUID | DEFUSED_MOUNT_ALLOW_DEV |
@@ -366,6 +405,10 @@ int main(int argc, char *argv[]) {
         return 2;
     }
     test_set_timeout();
+
+    check_version_banner(argv[1], "fusermount3", "fusermount3");
+    check_version_banner(argv[1], "fusermount", "fusermount");
+    check_version_banner(argv[1], "/usr/bin/fusermount", "fusermount");
 
     /* spawn_client() hands the client /dev/null as the FUSE device. */
     int devnull = open("/dev/null", O_RDWR | O_CLOEXEC);

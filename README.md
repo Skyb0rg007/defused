@@ -51,7 +51,8 @@ passing API. Debian 13 (systemd 257) and Ubuntu 24.04 (255) are too old.
 This project provides the following:
 
 - A system service that listens on `/run/defused/defused.sock`.
-- A replacement `fusermount3` binary to communicate with the service.
+- A replacement `fusermount3` and `fusermount` binary to communicate with
+  the service.
 
 The system service is written to use systemd socket activation with
 `Accept=yes`.
@@ -134,8 +135,10 @@ works.
 }
 ```
 
-This replaces `/run/wrappers/bin/fusermount3` with defused's, so every FUSE
-program uses it.
+This replaces `/run/wrappers/bin/fusermount3` and `/run/wrappers/bin/fusermount`
+with defused's, so every FUSE program uses it, libfuse2 and libfuse3 alike.
+`services.defused.replaceFusermount3` and `replaceFusermount` turn either
+takeover off.
 `services.defused.maxMounts`, `allowGroups` and `allowOther` configure the
 policy.
 See `services.defused.*` for the options.
