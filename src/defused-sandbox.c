@@ -372,17 +372,17 @@ static int sandbox_do_unmount(const struct sandbox_job *job,
 
 /* Forks the sandboxed child and returns what it reported. */
 static int run_sandboxed(struct sandbox_job *job, struct defused_error *err) {
-    const char *fail_id = job->op == DEFUSED_OP_MOUNT
-                              ? DEFUSED_ERROR_MOUNT_FAILED
-                              : DEFUSED_ERROR_UNMOUNT_FAILED;
+    uint32_t fail_code = job->op == DEFUSED_OP_MOUNT
+                             ? DEFUSED_ERR_MOUNT_FAILED
+                             : DEFUSED_ERR_UNMOUNT_FAILED;
     _cleanup_close_pair_ int pipefd[2] = EBADF_PAIR;
     if (pipe2(pipefd, O_CLOEXEC) == -1)
-        return defused_error_setf(err, fail_id, errno,
+        return defused_error_setf(err, fail_code, errno,
                                   "pipe2() for the sandboxed helper failed");
     job->pipe_fd = pipefd[1];
     pid_t pid = fork();
     if (pid == -1)
-        return defused_error_setf(err, fail_id, errno,
+        return defused_error_setf(err, fail_code, errno,
                                   "fork() of the sandboxed helper failed");
     if (pid == 0) {
         /* Only reached before pinning, when no filter is loaded either and
@@ -406,7 +406,7 @@ static int run_sandboxed(struct sandbox_job *job, struct defused_error *err) {
                       : sandbox_do_unmount(job, &detail);
         result->ret = ret;
         if (ret < 0)
-            defused_error_set(&result->err, fail_id, -ret, detail);
+            defused_error_set(&result->err, fail_code, -ret, detail);
         /* Under PIPE_BUF, so it arrives whole or not at all. */
         (void)sys_write(job->pipe_fd, result, sizeof(*result));
         sandbox_exit(ret == 0 ? 0 : 1);
@@ -428,11 +428,11 @@ static int run_sandboxed(struct sandbox_job *job, struct defused_error *err) {
     /* SIGSYS here means the seccomp filter refused a syscall. */
     if (WIFSIGNALED(status))
         return defused_error_setf(
-            err, fail_id, read_errno,
+            err, fail_code, read_errno,
             "the sandboxed helper was killed by signal %d%s before reporting "
             "a result",
             WTERMSIG(status), WTERMSIG(status) == SIGSYS ? " (seccomp)" : "");
-    return defused_error_setf(err, fail_id, read_errno,
+    return defused_error_setf(err, fail_code, read_errno,
                               "the sandboxed helper exited with status %d "
                               "without reporting a result",
                               WEXITSTATUS(status));
@@ -458,7 +458,7 @@ int defused_sandbox_unmount(int pidfd, int parent_fd, const char *name,
     int ret = peer_fuse_mount_owner(pidfd, mnt_id, &owner);
     if (ret < 0) {
         defused_error_setf(
-            err, DEFUSED_ERROR_NOT_A_FUSE_MOUNT, 0, "mnt_id %llu %s (%s)",
+            err, DEFUSED_ERR_NOT_A_FUSE_MOUNT, 0, "mnt_id %llu %s (%s)",
             (unsigned long long)mnt_id,
             ret == -ENOENT   ? "is not in the caller's mountinfo"
             : ret == -EINVAL ? "is not a FUSE mount with a user_id= option"
@@ -467,7 +467,7 @@ int defused_sandbox_unmount(int pidfd, int parent_fd, const char *name,
         return ret;
     }
     if (owner != uid) {
-        defused_error_setf(err, DEFUSED_ERROR_NOT_ALLOWED, 0,
+        defused_error_setf(err, DEFUSED_ERR_NOT_ALLOWED, 0,
                            "the FUSE mount with mnt_id %llu belongs to uid "
                            "%u, not the caller's uid %u",
                            (unsigned long long)mnt_id, (unsigned)owner,

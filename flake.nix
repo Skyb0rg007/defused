@@ -32,43 +32,14 @@
         fileset = lib.fileset.gitTracked ./.;
       };
 
-      # pkgsStatic needs nudging before libsystemd can go into a static
-      # binary at all.
       staticPackages =
         pkgs:
         pkgs.pkgsStatic.extend (
-          final: prev: {
+          _: prev: {
             # Its test suite defines fgetxattr()/fsetxattr(), which collide
             # with musl's static libc.
             libcap_ng = prev.libcap_ng.overrideAttrs (_: {
               doCheck = false;
-            });
-            # systemd only installs libsystemd.a when asked, and nixpkgs
-            # marks the package unsupported on static platforms because
-            # systemd itself needs NSS (systemd#20600). defused uses only
-            # sd-varlink, sd-event and sd-daemon, which do not.
-            systemdLibs = prev.systemdLibs.overrideAttrs (old: {
-              mesonFlags = (old.mesonFlags or [ ]) ++ [ "-Dstatic-libsystemd=true" ];
-              env = (old.env or { }) // {
-                NIX_CFLAGS_LINK =
-                  # systemd builds libsystemd.so and libsystemd-shared.so
-                  # whatever we ask for, and -shared cannot be combined with
-                  # the -static the static stdenv adds.
-                  lib.replaceStrings [ " -static" ] [ "" ] (old.env.NIX_CFLAGS_LINK or "")
-                  # libucontext.a has no .note.GNU-stack, which systemd turns
-                  # from a linker warning into an error.
-                  + " -Wl,--no-warn-execstack";
-              };
-              # libsystemd.pc lists no private dependencies, so a static
-              # link never hears about the libucontext systemd needs on musl.
-              postInstall = (old.postInstall or "") + ''
-                echo "Libs.private: -L${final.libucontext}/lib -lucontext" >>"$dev/lib/pkgconfig/libsystemd.pc"
-              '';
-              # Something in the musl build puts a bash reference in $dev.
-              disallowedRequisites = [ ];
-              meta = old.meta // {
-                badPlatforms = [ ];
-              };
             });
           }
         );
@@ -89,7 +60,6 @@
             # <linux/mount.h> and <asm/socket.h>: the new mount API and
             # SO_PEERPIDFD, which musl does not declare itself.
             pkgs.linuxHeaders
-            pkgs.systemdLibs
           ];
 
           doCheck = true;
@@ -133,10 +103,8 @@
           default = self.packages.${system}.defused;
           defused = mkDefused pkgs;
           # Runs on a musl system with no shared libraries at all.
-          defused-static = (mkDefused (staticPackages pkgs)).overrideAttrs (old: {
+          defused-static = (mkDefused (staticPackages pkgs)).overrideAttrs (_: {
             pname = "defused-static";
-            # Without this Meson takes libsystemd.so over libsystemd.a.
-            mesonFlags = (old.mesonFlags or [ ]) ++ [ "-Dprefer_static=true" ];
           });
         }
       );

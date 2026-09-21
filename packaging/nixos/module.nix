@@ -175,12 +175,8 @@ in
 
       socketConfig = {
         Accept = true;
-        ListenStream = "/run/defused/defused.sock";
+        ListenSequentialPacket = "/run/defused/defused.sock";
         RuntimeDirectory = "defused";
-      }
-      # XAttrEntryPoint= is new in systemd 262; older versions warn "Unknown key".
-      // lib.optionalAttrs (lib.versionAtLeast config.systemd.package.version "262") {
-        XAttrEntryPoint = "user.varlink=entrypoint";
       };
     };
 

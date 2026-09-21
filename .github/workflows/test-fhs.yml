@@ -39,7 +39,6 @@ jobs:
             git \
             libc6-dev \
             libseccomp-dev \
-            libsystemd-dev \
             meson \
             ninja-build \
             pkgconf \

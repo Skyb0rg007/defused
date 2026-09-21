@@ -4,7 +4,7 @@
 #ifndef DEFUSED_SANDBOX_H
 #define DEFUSED_SANDBOX_H
 
-#include "defused_proto.h"
+#include "defused-proto.h"
 
 #include <stdint.h>
 #include <sys/types.h>

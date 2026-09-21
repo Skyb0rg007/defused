@@ -3,38 +3,22 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * Exercises defused's handling of a client in a different mount namespace
- * from the service, without requiring host root:
+ * defused handling a client in a different mount namespace, without host
+ * root. Both cases send an unmount request for a non-FUSE bind mount, so
+ * neither reaches a real FUSE unmount.
  *
- *  - test_can_join: defused runs inside a freshly unshare(CLONE_NEWUSER|
- *    CLONE_NEWNS)'d namespace A (mapped so the test is "root" and holds
- *    CAP_SYS_ADMIN over A and everything descended from it -- the same
- *    unprivileged-rootless-container trick real sandboxes use). The client
- *    is a *grandchild* that additionally unshare(CLONE_NEWNS)'d into its
- *    own namespace B, a descendant of A. defused should be able to setns()
- *    into B (it has CAP_SYS_ADMIN there) and proceed with the request; we
- *    prove the join happened by sending an unmount request for a non-FUSE
- *    bind mount and checking the response is NotAFuseMount rather than
- *    UnmountFailed.
+ * test_can_join: defused runs in a mapped-root namespace A and the client
+ * in a descendant B, so defused has CAP_SYS_ADMIN over B. The join is
+ * proven by the answer being NotAFuseMount rather than UnmountFailed.
  *
- *  - test_cannot_join: defused runs unprivileged in the plain host
- *    namespace, like every other test in this suite. The client
- *    unshare(CLONE_NEWUSER|CLONE_NEWNS)'s into a namespace of its own that
- *    defused has no ancestry over. defused cannot legitimately setns()
- *    into it (no CAP_SYS_ADMIN there), and the test checks that this
- *    surfaces cleanly as UnmountFailed/EPERM -- never as a silent
- *    fallback to operating on defused's own namespace instead, which would
- *    be a namespace-confusion bug (e.g. counting FUSE mounts or mounting
- *    against the wrong mount table while believing it's the client's).
- *
- * Neither test reaches a real FUSE mount/unmount. The client creates only a
- * private bind mount inside its own mount namespace.
- *
- * Unprivileged, policy or the mountinfo check refuses both before setns().
+ * test_cannot_join: defused runs unprivileged on the host and the client
+ * in a user namespace of its own. defused cannot setns() there, and must
+ * say so rather than fall back to its own namespace -- that would be a
+ * namespace-confusion bug.
  */
 #define _GNU_SOURCE
 #include "common.h"
-#include "defused_proto.h"
+#include "defused-proto.h"
 #include "test_util.h"
 
 #include <errno.h>
@@ -51,8 +35,6 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
-#include <systemd/sd-json.h>
-#include <systemd/sd-varlink.h>
 #include <unistd.h>
 
 /* Maps the calling process to uid/gid 0 inside the user namespace it just
@@ -141,20 +123,10 @@ static int send_non_fuse_umount_request(int sock_fd,
         return ret;
     }
 
-    _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *link = NULL;
-    ret = sd_varlink_connect_fd(&link, sock);
-    if (ret < 0)
-        return ret;
-    TAKE_FD(sock);
-    ret = sd_varlink_set_allow_fd_passing_output(link, true);
-    if (ret < 0)
-        return ret;
-    ret = sd_varlink_push_dup_fd(link, parent_fd);
-    if (ret < 0)
-        return ret;
-    struct defused_umount_req req = {
-        .parent_fd = 0, .name = "target", .lazy = true};
-    return defused_call_umount(link, &req, err);
+    struct defused_request req = {
+        .magic = DEFUSED_MAGIC, .op = DEFUSED_OP_UNMOUNT, .lazy = 1};
+    strcpy(req.name, "target");
+    return defused_call(sock, &req, (const int[]){parent_fd}, err);
 }
 
 static int abstract_addr(struct sockaddr_un *sa, socklen_t *len,
@@ -174,7 +146,8 @@ static int listen_addr(struct sockaddr_un *sa, socklen_t *len,
     if (ret < 0)
         return ret;
 
-    _cleanup_close_ int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    _cleanup_close_ int fd =
+        socket(AF_UNIX, DEFUSED_SOCKET_TYPE | SOCK_CLOEXEC, 0);
     if (fd == -1 || bind(fd, (struct sockaddr *)sa, *len) == -1 ||
         listen(fd, 1) == -1) {
         perror("listen");
@@ -184,7 +157,8 @@ static int listen_addr(struct sockaddr_un *sa, socklen_t *len,
 }
 
 static int connect_addr(const struct sockaddr_un *sa, socklen_t len) {
-    _cleanup_close_ int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    _cleanup_close_ int fd =
+        socket(AF_UNIX, DEFUSED_SOCKET_TYPE | SOCK_CLOEXEC, 0);
     if (fd == -1 || connect(fd, (const struct sockaddr *)sa, len) == -1) {
         perror("connect");
         return -errno;
@@ -205,12 +179,13 @@ static void run_client_and_exit(const struct sockaddr_un *sa, socklen_t salen,
 
     struct defused_error err;
     int ret = send_non_fuse_umount_request(client_sock, &err);
-    bool ok = ret == 0 && (!strcmp(err.id, DEFUSED_ERROR_NOT_A_FUSE_MOUNT) ||
-                           !strcmp(err.id, DEFUSED_ERROR_UNMOUNT_FAILED));
+    bool ok = ret == 0 && (err.code == DEFUSED_ERR_NOT_A_FUSE_MOUNT ||
+                           err.code == DEFUSED_ERR_UNMOUNT_FAILED);
     if (!ok)
         fprintf(stderr, "%s: got %s, expected %s or %s\n", who,
-                err.id[0] ? err.id : "a successful reply",
-                DEFUSED_ERROR_NOT_A_FUSE_MOUNT, DEFUSED_ERROR_UNMOUNT_FAILED);
+                defused_error_description(err.code),
+                defused_error_description(DEFUSED_ERR_NOT_A_FUSE_MOUNT),
+                defused_error_description(DEFUSED_ERR_UNMOUNT_FAILED));
     _exit(ok ? 0 : 1);
 }
 

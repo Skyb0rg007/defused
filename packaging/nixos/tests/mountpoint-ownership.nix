@@ -20,7 +20,7 @@ common.mkTest {
 
     machine.succeed(
         "journalctl -u 'defused@*' --no-pager | "
-        "grep -F 'website.soss.defused.NotAllowed'"
+        "grep -F ': not allowed ('"
     )
   '';
 }
