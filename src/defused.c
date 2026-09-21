@@ -33,6 +33,7 @@
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/vfs.h>
@@ -41,6 +42,49 @@
 #include <systemd/sd-json.h>
 #include <systemd/sd-varlink.h>
 #include <unistd.h>
+
+/* The kernel's own constants: SO_PEERPIDFD, and the new mount API's
+ * FSOPEN_*, FSCONFIG_*, MOUNT_ATTR_* and MOVE_MOUNT_*. musl declares none of
+ * them, and both libcs are written to tolerate these alongside their own
+ * <sys/mount.h> and <sys/socket.h>. */
+#include <asm/socket.h>
+#include <linux/mount.h>
+
+/*
+ * The new mount API, by syscall number: glibc only grew wrappers in 2.36 and
+ * musl has none, while the syscalls themselves are as old as the API.
+ */
+static int sys_fsopen(const char *fsname, unsigned int flags) {
+    return (int)syscall(SYS_fsopen, fsname, flags);
+}
+
+static int sys_fsconfig(int fd, unsigned int cmd, const char *key,
+                        const void *value, int aux) {
+    return (int)syscall(SYS_fsconfig, fd, cmd, key, value, aux);
+}
+
+static int sys_fsmount(int fs_fd, unsigned int flags,
+                       unsigned int attr_flags) {
+    return (int)syscall(SYS_fsmount, fs_fd, flags, attr_flags);
+}
+
+static int sys_move_mount(int from_dfd, const char *from_path, int to_dfd,
+                          const char *to_path, unsigned int flags) {
+    return (int)syscall(SYS_move_mount, from_dfd, from_path, to_dfd, to_path,
+                        flags);
+}
+
+/* glibc's strerror_r() returns the message; POSIX's, which musl has, fills
+ * the buffer and returns an error number. */
+static const char *strerror_buf(int errnum, char *buf, size_t size) {
+#if defined(__GLIBC__)
+    return strerror_r(errnum, buf, size);
+#else
+    if (strerror_r(errnum, buf, size) != 0)
+        (void)snprintf(buf, size, "Unknown error %d", errnum);
+    return buf;
+#endif
+}
 
 /* Sizes of log-only strings; truncation is harmless there. */
 #define PATH_BUF_SIZE 256
@@ -350,13 +394,13 @@ static int get_peer_cred(int sock, struct ucred *cred) {
 static int neg_errno(void) { return -errno; }
 
 static int mount_fsconfig_string(int fsfd, const char *key, const char *value) {
-    if (fsconfig(fsfd, FSCONFIG_SET_STRING, key, value, 0) == -1)
+    if (sys_fsconfig(fsfd, FSCONFIG_SET_STRING, key, value, 0) == -1)
         return neg_errno();
     return 0;
 }
 
 static int mount_fsconfig_flag(int fsfd, const char *key) {
-    if (fsconfig(fsfd, FSCONFIG_SET_FLAG, key, NULL, 0) == -1)
+    if (sys_fsconfig(fsfd, FSCONFIG_SET_FLAG, key, NULL, 0) == -1)
         return neg_errno();
     return 0;
 }
@@ -477,7 +521,7 @@ create_detached_mount(const struct prepared_mount *mnt,
                       struct defused_error *err) {
     char msg[128];
 
-    _cleanup_close_ int fsfd = fsopen(mnt->type, FSOPEN_CLOEXEC);
+    _cleanup_close_ int fsfd = sys_fsopen(mnt->type, FSOPEN_CLOEXEC);
     if (fsfd == -1)
         return defused_error_setf(
             err, DEFUSED_VARLINK_ERROR_MOUNT_FAILED, errno,
@@ -530,7 +574,7 @@ create_detached_mount(const struct prepared_mount *mnt,
                 fs_context_message(fsfd, msg, sizeof(msg)));
     }
 
-    if (fsconfig(fsfd, FSCONFIG_CMD_CREATE, NULL, NULL, 0) == -1) {
+    if (sys_fsconfig(fsfd, FSCONFIG_CMD_CREATE, NULL, NULL, 0) == -1) {
         int sys_errno = errno;
         return defused_error_setf(
             err, DEFUSED_VARLINK_ERROR_MOUNT_FAILED, sys_errno,
@@ -539,7 +583,7 @@ create_detached_mount(const struct prepared_mount *mnt,
             mnt->type, fs_context_message(fsfd, msg, sizeof(msg)));
     }
 
-    int mountfd = fsmount(fsfd, FSMOUNT_CLOEXEC, mnt->mount_attrs);
+    int mountfd = sys_fsmount(fsfd, FSMOUNT_CLOEXEC, mnt->mount_attrs);
     if (mountfd == -1) {
         int sys_errno = errno;
         return defused_error_setf(err, DEFUSED_VARLINK_ERROR_MOUNT_FAILED,
@@ -680,7 +724,7 @@ mount_request(const struct request_context *ctx,
         return mountfd;
 
     if (ctx->privileged) {
-        if (move_mount(mountfd, "", mnt_fd, "",
+        if (sys_move_mount(mountfd, "", mnt_fd, "",
                        MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH) == 0)
             return 0;
         return defused_error_setf(err, DEFUSED_VARLINK_ERROR_MOUNT_FAILED,
@@ -705,9 +749,10 @@ log_request_error(const char *what, const char *target,
             "defused: %s request from pid %lld (uid %u) for %s failed with %s "
             "(ret=%d: %s, errno=%d: %s)%s%s\n",
             what, (long long)cred->pid, (unsigned)cred->uid, target, err->id,
-            ret, strerror_r(-ret, ret_str, sizeof(ret_str)), err->sys_errno,
+            ret, strerror_buf(-ret, ret_str, sizeof(ret_str)),
+            err->sys_errno,
             err->sys_errno
-                ? strerror_r(err->sys_errno, errno_str, sizeof(errno_str))
+                ? strerror_buf(err->sys_errno, errno_str, sizeof(errno_str))
                 : "none",
             err->detail[0] ? " -- " : "", err->detail);
 }
