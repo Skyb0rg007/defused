@@ -25,8 +25,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+/* MOVE_MOUNT_*, which musl does not declare. */
+#include <linux/mount.h>
+
 /* Skips <linux/fcntl.h>'s struct redefinitions, which otherwise clash with
- * glibc's <fcntl.h> above. */
+ * <fcntl.h> above. */
 #define _ASM_GENERIC_FCNTL_H
 #include <linux/pidfd.h>
 
