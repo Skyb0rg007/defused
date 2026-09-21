@@ -34,9 +34,9 @@ pkgs.testers.nixosTest {
       # which is where nixpkgs' libfuse looks for its helper.
       programs.fuse.enable = true;
 
-      # Not the blanket grant from baseNode: a desktop runs on the module's
-      # own default, the recommended rule.
-      security.polkit.extraConfig = lib.mkForce "";
+      # Not the allow_other grant from baseNode: a desktop runs on the
+      # module's own defaults.
+      services.defused.allowOther = lib.mkForce false;
 
       # A stock libfuse filesystem, to mount through that helper.
       environment.systemPackages = [ pkgs.fuse-overlayfs ];
@@ -63,13 +63,6 @@ pkgs.testers.nixosTest {
           machine.succeed("test -u /run/wrappers/bin/fusermount")
           machine.succeed("test -e /etc/fuse.conf")
 
-      with subtest("the recommended polkit rule is installed"):
-          machine.succeed(
-              "cmp /etc/polkit-1/rules.d/50-defused-mount-policy.rules "
-              "${../../polkit/examples/50-defused-mount-policy.rules}"
-          )
-          machine.fail("grep -F defused /etc/polkit-1/rules.d/10-nixos.rules")
-
       with subtest("the system path prefers defused's fusermount3 too"):
           machine.succeed(
               "test \"$(readlink -f /run/current-system/sw/bin/fusermount3)\" = "
@@ -92,7 +85,7 @@ pkgs.testers.nixosTest {
           machine.succeed("test \"$(runuser -u alice -- cat /home/alice/mnt/file)\" = hello")
           machine.succeed("journalctl -u 'defused@*' --no-pager | grep -F defused")
 
-      with subtest("but allow_other still needs an administrator"):
+      with subtest("but allow_other still needs --allow-other"):
           machine.succeed("install -d -o alice -g users /home/alice/mnt-other")
           machine.succeed(
               "timeout 45s runuser -u alice -- "

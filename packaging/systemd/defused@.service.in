@@ -5,16 +5,15 @@
 [Unit]
 Description=defused FUSE mount service
 Documentation=https://github.com/Skyb0rg007/defused
-@POLKIT_UNIT_DEPS@
 
 [Service]
-# Override with a drop-in, e.g. Environment=DEFUSED_POLICY=builtin.
-Environment=DEFUSED_POLICY=@DEFAULT_POLICY@
-# Built-in policy only; see `defused --help`.
+# Override with a drop-in; see `defused --help`.
 Environment=DEFUSED_MAX_MOUNTS=100
 Environment=DEFUSED_ALLOW_GROUPS=
-Environment=DEFUSED_ALLOW_PRIVILEGED_FLAGS=
-ExecStart=@DEFUSED_PATH@ --policy=${DEFUSED_POLICY} --max-mounts=${DEFUSED_MAX_MOUNTS} --allow-groups=${DEFUSED_ALLOW_GROUPS} --allow-privileged-flags=${DEFUSED_ALLOW_PRIVILEGED_FLAGS}
+# Split on whitespace, so it can carry flag-only options like
+# --allow-other; see `defused --help`.
+Environment=DEFUSED_EXTRA_ARGS=
+ExecStart=@DEFUSED_PATH@ --max-mounts=${DEFUSED_MAX_MOUNTS} --allow-groups=${DEFUSED_ALLOW_GROUPS} $DEFUSED_EXTRA_ARGS
 AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SYS_PTRACE
 CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SYS_PTRACE
 NoNewPrivileges=yes

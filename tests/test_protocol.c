@@ -220,47 +220,6 @@ static bool fuse_device_usable(void) {
     return probe >= 0;
 }
 
-#ifdef HAVE_POLKIT
-/* Only that an unauthorized request never reaches the mount syscalls. */
-static int test_polkit_gate(const char *defused_path) {
-    if (!fuse_device_usable()) {
-        fprintf(stderr,
-                "SKIP: /dev/fuse not usable here (%s), skipping polkit gate "
-                "test\n",
-                strerror(errno));
-        return 0;
-    }
-
-    char dir_template[] = "/tmp/defused-polkit-test-XXXXXX";
-    _cleanup_(rmdirp) const char *dir = mkdtemp(dir_template);
-    if (dir == NULL) {
-        perror("mkdtemp");
-        return -errno;
-    }
-
-    struct defused_mount_req req = {};
-    struct defused_error err;
-    int ret = run_mount_req(defused_path, NULL, &req, dir, "/dev/fuse", &err);
-    if (ret < 0)
-        return ret;
-
-    /* Without an interactive polkit agent, an AUTH_ADMIN_KEEP action can
-     * never succeed; either polkit is reachable and says no (NotAllowed), or
-     * it isn't reachable at all in this sandbox and the check fails closed
-     * (MountFailed). Either is a pass -- a successful reply (or any earlier,
-     * deterministic error) would mean the gate was skipped or something
-     * regressed before it. */
-    if (strcmp(err.id, DEFUSED_VARLINK_ERROR_NOT_ALLOWED) != 0 &&
-        strcmp(err.id, DEFUSED_VARLINK_ERROR_MOUNT_FAILED) != 0) {
-        fprintf(stderr,
-                "FAIL: expected the polkit gate to block the mount (got %s)\n",
-                err.id[0] ? err.id : "a successful reply");
-        return -EINVAL;
-    }
-    return 0;
-}
-#endif /* HAVE_POLKIT */
-
 static gid_t foreign_gid(void) {
     gid_t groups[NGROUPS_MAX];
     int n = getgroups(NGROUPS_MAX, groups);
@@ -275,11 +234,11 @@ static gid_t foreign_gid(void) {
     }
 }
 
-static int expect_builtin_reply(const char *defused_path,
-                                const char *const *extra_args,
-                                const struct defused_mount_req *req,
-                                const char *dir, const char *expect_id,
-                                const char *why) {
+static int expect_policy_reply(const char *defused_path,
+                               const char *const *extra_args,
+                               const struct defused_mount_req *req,
+                               const char *dir, const char *expect_id,
+                               const char *why) {
     struct defused_error err;
     int ret =
         run_mount_req(defused_path, extra_args, req, dir, "/dev/fuse", &err);
@@ -294,16 +253,16 @@ static int expect_builtin_reply(const char *defused_path,
 }
 
 /* MountFailed: past the gate, the unprivileged mount syscall failed. */
-static int test_builtin_policy(const char *defused_path) {
+static int test_policy(const char *defused_path) {
     if (!fuse_device_usable()) {
         fprintf(stderr,
-                "SKIP: /dev/fuse not usable here (%s), skipping built-in "
-                "policy test\n",
+                "SKIP: /dev/fuse not usable here (%s), skipping the policy "
+                "test\n",
                 strerror(errno));
         return 0;
     }
 
-    char dir_template[] = "/tmp/defused-builtin-test-XXXXXX";
+    char dir_template[] = "/tmp/defused-policy-test-XXXXXX";
     _cleanup_(rmdirp) const char *dir = mkdtemp(dir_template);
     if (dir == NULL) {
         perror("mkdtemp");
@@ -313,29 +272,27 @@ static int test_builtin_policy(const char *defused_path) {
     char groups_arg[64];
     snprintf(groups_arg, sizeof(groups_arg), "--allow-groups=%u",
              (unsigned)foreign_gid());
-    const char *const wrong_group[] = {"--policy=builtin", groups_arg, NULL};
+    const char *const wrong_group[] = {groups_arg, NULL};
     struct defused_mount_req plain = {};
-    int ret = expect_builtin_reply(defused_path, wrong_group, &plain, dir,
-                                   DEFUSED_VARLINK_ERROR_NOT_ALLOWED,
-                                   "caller outside --allow-groups");
+    int ret = expect_policy_reply(defused_path, wrong_group, &plain, dir,
+                                  DEFUSED_VARLINK_ERROR_NOT_ALLOWED,
+                                  "caller outside --allow-groups");
     if (ret < 0)
         return ret;
 
-    const char *const no_privileged[] = {"--policy=builtin", NULL};
     struct defused_mount_req allow_other = {
         .mount_flags = DEFUSED_FUSE_ALLOW_OTHER,
     };
-    ret = expect_builtin_reply(defused_path, no_privileged, &allow_other, dir,
-                               DEFUSED_VARLINK_ERROR_NOT_ALLOWED,
-                               "allow_other without --allow-privileged-flags");
+    ret = expect_policy_reply(defused_path, NULL, &allow_other, dir,
+                              DEFUSED_VARLINK_ERROR_NOT_ALLOWED,
+                              "allow_other without --allow-other");
     if (ret < 0)
         return ret;
 
-    const char *const with_privileged[] = {
-        "--policy=builtin", "--allow-privileged-flags=allow_other", NULL};
-    return expect_builtin_reply(defused_path, with_privileged, &allow_other,
-                                dir, DEFUSED_VARLINK_ERROR_MOUNT_FAILED,
-                                "allow_other with --allow-privileged-flags");
+    const char *const with_allow_other[] = {"--allow-other", NULL};
+    return expect_policy_reply(defused_path, with_allow_other, &allow_other,
+                               dir, DEFUSED_VARLINK_ERROR_MOUNT_FAILED,
+                               "allow_other with --allow-other");
 }
 
 /* Rejected args: EXIT_FAILURE before touching the connection, so EOF. */
@@ -372,14 +329,11 @@ static int expect_rejected_args(const char *defused_path,
 
 static int test_bad_args(const char *defused_path) {
     static const char *const cases[][3] = {
-        {"--policy=bogus", NULL},
-#ifndef HAVE_POLKIT
-        {"--policy=polkit", NULL},
-#endif
+        {"--policy=builtin", NULL},
         {"--max-mounts=0", NULL},
         {"--max-mounts=ten", NULL},
         {"--allow-groups=defused-no-such-group", NULL},
-        {"--allow-privileged-flags=suid", NULL},
+        {"--allow-other=yes", NULL},
         {"--daemon", "--child", NULL},
         {"stray-argument", NULL},
     };
@@ -684,7 +638,7 @@ int main(int argc, char *argv[]) {
 
     /* Refused for its shape; this only checks the options parse. */
     static const char *const all_policy_args[] = {
-        "--max-mounts=5", "--allow-groups=", "--allow-privileged-flags=", NULL};
+        "--max-mounts=5", "--allow-groups=", "--allow-other", NULL};
     struct defused_mount_req bad_opt = {
         .mount_flags = 1u << 31, /* never in DEFUSED_MOUNT_FLAGS_MASK */
     };
@@ -725,11 +679,7 @@ int main(int argc, char *argv[]) {
                 return 1;
         }
 
-#ifdef HAVE_POLKIT
-        if (test_polkit_gate(argv[1]) != 0)
-            return 1;
-#endif
-        if (test_builtin_policy(argv[1]) != 0)
+        if (test_policy(argv[1]) != 0)
             return 1;
     }
 

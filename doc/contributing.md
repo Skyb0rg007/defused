@@ -44,8 +44,7 @@ nix flake check
 This covers three things:
 
 - `checks.<system>.meson-tests` builds the package, which runs `meson test`
-  in the Nix build sandbox (the package sets `doCheck = true`);
-  `meson-tests-no-polkit` does the same for a `-Dpolkit=false` build.
+  in the Nix build sandbox (the package sets `doCheck = true`).
 - The NixOS VM test suite in `packaging/nixos/tests/`, which is where the
   privileged mount and unmount paths are actually exercised. Every VM test
   runs once per kernel listed in `packaging/nixos/tests/default.nix`, so the

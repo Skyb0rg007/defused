@@ -20,15 +20,9 @@ systemd_dep = dependency('libsystemd', version : '>= 258')
 defused_install_dir = get_option('prefix') / 'lib/defused'
 systemd_unit_dir = get_option('prefix') / 'lib/systemd/system'
 
-polkit = get_option('polkit')
-
 common_c_args = []
 if cc.has_function('close_range', prefix : '#include <unistd.h>', args : ['-D_GNU_SOURCE'])
   common_c_args += ['-DHAVE_CLOSE_RANGE']
-endif
-defused_c_args = common_c_args
-if polkit
-  defused_c_args += ['-DHAVE_POLKIT']
 endif
 fusermount3_c_args = common_c_args + [
   '-DDEFUSED_VERSION="@0@"'.format(meson.project_version()),
@@ -51,7 +45,7 @@ defused_exe = executable(
   'src/defused-policy.c',
   'src/defused-varlink.c',
   'src/util.c',
-  c_args : defused_c_args,
+  c_args : common_c_args,
   dependencies : [seccomp_dep, systemd_dep],
   link_with : sandbox_lib,
   install_dir : defused_install_dir,
@@ -68,18 +62,8 @@ fusermount3_exe = executable(
   install : true,
 )
 
-if polkit
-  install_data(
-    'packaging/polkit/website.soss.defused.policy',
-    install_dir : get_option('datadir') / 'polkit-1/actions',
-  )
-endif
-
-# The unit's default policy follows the build.
 unit_conf = configuration_data()
 unit_conf.set('DEFUSED_PATH', defused_install_dir / 'defused')
-unit_conf.set('DEFAULT_POLICY', polkit ? 'polkit' : 'builtin')
-unit_conf.set('POLKIT_UNIT_DEPS', polkit ? 'Wants=polkit.service\nAfter=polkit.service' : '')
 configure_file(
   input : 'packaging/systemd/defused@.service.in',
   output : 'defused@.service',
@@ -103,8 +87,7 @@ test_protocol_exe = executable(
   'test-protocol',
   'tests/test_protocol.c',
   'src/defused-varlink.c',
-  # For HAVE_POLKIT.
-  c_args : defused_c_args,
+  c_args : common_c_args,
   dependencies : [systemd_dep],
   include_directories : include_directories('src'),
 )

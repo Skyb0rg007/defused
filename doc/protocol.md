@@ -85,12 +85,7 @@ Policy applied before the mount is attempted:
   (`NotAllowed` otherwise). Directories must also be searchable by
   the caller.
 - The service asks its policy whether the caller may create this mount at
-  all. With `--policy=polkit` that is
-  `org.freedesktop.PolicyKit1.Authority.CheckAuthorization` for
-  `website.soss.defused.mount`, with the requested privileged options in the
-  `privileged-flags` detail and the total number of FUSE mounts in
-  `current-mounts`; with `--policy=builtin`, see
-  [Running without polkit](#running-without-polkit).
+  all -- see [The mount policy](#the-mount-policy) (`NotAllowed` otherwise).
 
 On success, the service creates the mount with Linux's file-descriptor-based
 mount API (`fsopen()`/`fsconfig()`/`fsmount()`), attaches it to the received
@@ -117,9 +112,8 @@ The target must be a mountpoint under the parent, not just a regular directory
 inside the same mount, so the target and parent mount IDs must differ.
 From here on the `mnt_id` is what identifies the target.
 
-The service then asks its policy whether the caller may unmount at all
-(`website.soss.defused.unmount` under polkit, the `--allow-groups` check
-under the built-in policy), failing otherwise.
+The service then asks its policy whether the caller may unmount at all (the
+`--allow-groups` check), failing otherwise.
 The check only answers whether the caller may use unmount at all, and thus
 the default policy is to always allow.
 The service then reads the caller's `/proc/<pid>/mountinfo` (the pid comes
@@ -141,8 +135,8 @@ A `fusermount3` caller that is root or holds `CAP_SYS_ADMIN` does not use the
 service: it spawns `defused --child` with `sd_varlink_connect_exec(3)` and
 speaks the same protocol to it.
 The child validates the request for shape, skips the ownership rule, the
-filesystem-type allowlist, polkit, and the unmount `user_id=` check, and calls
-`move_mount()` or `umount2()` directly in the caller's mount namespace.
+filesystem-type allowlist, the policy, and the unmount `user_id=` check, and
+calls `move_mount()` or `umount2()` directly in the caller's mount namespace.
 Like root's `umount`, it unmounts any mount below the parent directory.
 
 It is also the only path that accepts `DEFUSED_MOUNT_ALLOW_SUID` (`suid`),
@@ -150,8 +144,8 @@ It is also the only path that accepts `DEFUSED_MOUNT_ALLOW_SUID` (`suid`),
 `fuseblk` mount whose `fsName` is the block device path, so it may contain
 slashes here), as libfuse's `fusermount3` does for root: `suid` and `dev` are
 the two options its own table marks unsafe.
-The service answers `BadMountOption` to all three rather than asking polkit,
-since a rule granting `suid` or `dev` would let a user's FUSE server hand out
+The service answers `BadMountOption` to all three rather than consulting its
+policy, since granting `suid` or `dev` would let a user's FUSE server hand out
 setuid-root binaries or device nodes.
 
 ## Errors
@@ -173,8 +167,8 @@ error UnmountFailed(errno: int)
 | `BadMountOption` | `mountFlags` outside its allowed mask, or a privileged-only flag sent to the service |
 | `NotAllowed` | The mountpoint/mount is not the caller's to use, or policy denied the operation |
 | `NotAFuseMount` | Unmount target is not a FUSE mount |
-| `MountFailed` | Mount setup, joining the caller's mount namespace, or attachment failed, or polkit could not be reached |
-| `UnmountFailed` | Joining the caller's mount namespace or `umount2(2)` failed, or polkit could not be reached |
+| `MountFailed` | Mount setup, joining the caller's mount namespace, or attachment failed |
+| `UnmountFailed` | Joining the caller's mount namespace or `umount2(2)` failed |
 
 `errno` is the Linux error number behind the failure, following the
 `io.systemd.System` convention.
@@ -233,82 +227,33 @@ The kernel also refuses to rename a mountpoint, or over one, within the
 caller's mount namespace, so what remains is a window of two syscalls in which
 only the mount table itself could change under the same directory entry.
 
-## Why defused asks polkit
+## The mount policy
 
 Because defused runs as a system service, it is unable to use process-specific
 information when making filesystem access decisions such as those enforced via
 LSMs.
-It may also be desirable to set different mount limits for different users and
-groups, or to allow some privileged FUSE options after interactive
-authentication.
-defused uses polkit to implement these features.
+What it can decide is who may use the service at all, and how much: a policy
+like "one group may create up to 100 mounts, with no privileged options".
+The service takes that policy from its command line, applies it to every
+request from an unprivileged caller, and logs the reason for every denial:
 
-By default, defused is installed with a policy that requires `AUTH_ADMIN_KEEP`
-for all mount requests.
-This is likely overly restrictive.
-The project provides an example polkit rules file to allow unprivileged FUSE
-options to all users, and to only require authentication as admin for possibly
-insecure options such as `ALLOW_OTHER`.
+| Option | Meaning | Default |
+| --- | --- | --- |
+| `--max-mounts=N` | Refuse a mount once N FUSE filesystems are mounted | 100 |
+| `--allow-groups=GROUP[,GROUP...]` | Only members of these groups (names or gids, supplementary groups included via `SO_PEERGROUPS`) may mount and unmount | any user |
+| `--allow-other` | Let callers set the `allow_other` mount option | refused |
 
-The mount action includes additional information that should be queried when
-writing polkit rules:
+A refused request is answered with `NotAllowed`.
+Nothing can be asked interactively: a caller either satisfies the policy or is
+refused.
+For unmount only the group check applies, for the reason given below.
 
-| Key | Value |
-| --- | --- |
-| `current-mounts` | The caller's live FUSE mount count, decimal. A rule wanting a mount-count limit implements it entirely from this. |
-| `privileged-flags` | Comma-separated names of the privileged mount options (see `privileged_mount_flags[]` in `defused.c`; currently just `allow_other`) the request actually sets. Omitted entirely when the request sets none. |
+### Why unmount's policy differs from mount's
 
-Both values are strings, so a rule comparing `current-mounts` numerically needs
-to call `parseInt()` first, and one inspecting `privileged-flags` needs to call
-`.split(",")` on it.
-`packaging/polkit/examples/50-defused-mount-policy.rules` is a complete,
-installable rule using both: it grants ordinary mounts (fewer than 100 open,
-requesting no privileged option the rule doesn't explicitly allowlist) without
-prompting, and falls back to `AUTH_ADMIN_KEEP` for anything past that limit or
-outside the allowlist.
-
-### Why `privileged-flags` is a name list
-
-Flags like `ALLOW_OTHER` grant the caller additional privileges that need to be
-individually allow-listed.
-If each option was a separate polkit detail, a new release could result in a
-policy becoming insecure.
-By using a comma-separated list the polkit rule can simply require auth for
-every option it doesn't recognize: see
-`packaging/polkit/examples/50-defused-mount-policy.rules` for an example.
-
-### Running without polkit
-
-Servers often have no polkit, and a policy like "one group may create up to
-100 mounts, with no privileged options" is enough for them.
-`defused --policy=builtin` applies such a policy from the command line
-without touching D-Bus:
-
-| Option | Polkit equivalent |
-| --- | --- |
-| `--max-mounts=N` | The recommended rule's `current-mounts < 100` |
-| `--allow-groups=GROUP[,GROUP...]` | `subject.isInGroup()`; empty means any user |
-| `--allow-privileged-flags=NAME[,NAME...]` | The recommended rule's `allowedPrivilegedFlags`; empty means none |
-
-Denials are `NotAllowed`, with the reason in the service log.
-There is no `AUTH_ADMIN_KEEP` equivalent: nothing can be asked interactively.
-For unmount only the group check applies, for the reason given in the next
-section.
-
-`meson setup -Dpolkit=false` builds only the built-in policy: no sd-bus code
-is compiled (`HAVE_POLKIT` is undefined), the `.policy` file is not
-installed, and the generated `defused@.service` defaults to
-`DEFUSED_POLICY=builtin`.
-
-### Why unmount's default policy differs from mount's
-
-The permissions on the mount functionality is gated behind `AUTH_ADMIN_KEEP`,
-but `website.soss.defused.unmount`'s default is `YES`.
-This is because the ownership check that follows the polkit check (that the
-mount's `user_id=` must match the caller) is a sufficient answer to "is this
-caller allowed to tear down this specific mount".
-A deployment that wants to log unmounts or needs to prevent a specific pid from
-unmounting FUSE mounts owned by its uid can do so by modifying
-`website.soss.defused.unmount`'s policy.
+Unmount is subject to the group check but not to `--max-mounts` or the
+`--allow-other` check, neither of which describes a teardown.
+The ownership check that follows (that the mount's `user_id=` must match the
+caller) is a sufficient answer to "is this caller allowed to tear down this
+specific mount".
 
 [Varlink UAPI Spec]: https://uapi-group.org/specifications/specs/varlink/
