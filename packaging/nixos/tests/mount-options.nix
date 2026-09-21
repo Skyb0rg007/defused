@@ -5,7 +5,8 @@
 {
   self,
   pkgs,
-  system,
+  package,
+  variant,
   kernelPackages,
 }:
 
@@ -14,13 +15,13 @@ let
     inherit
       self
       pkgs
-      system
+      package
       kernelPackages
       ;
   };
 in
 pkgs.testers.nixosTest {
-  name = "defused-mount-options-${kernelPackages.kernel.version}";
+  name = "defused-mount-options-${variant}-${kernelPackages.kernel.version}";
 
   nodes.machine = common.baseNode;
 

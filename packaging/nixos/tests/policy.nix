@@ -5,7 +5,8 @@
 {
   self,
   pkgs,
-  system,
+  package,
+  variant,
   kernelPackages,
 }:
 
@@ -14,11 +15,11 @@ let
     inherit
       self
       pkgs
-      system
+      package
       kernelPackages
       ;
   };
-  inherit (common) package mountHelper;
+  inherit (common) mountHelper;
 
   # Not common.baseNode: it grants allow_other to everyone.
   policyNode =
@@ -44,7 +45,7 @@ let
     };
 in
 pkgs.testers.nixosTest {
-  name = "defused-policy-${kernelPackages.kernel.version}";
+  name = "defused-policy-${variant}-${kernelPackages.kernel.version}";
 
   nodes = {
     # Issue #59's policy; the limit is 1 so the test can reach it.

@@ -5,7 +5,8 @@
 {
   self,
   pkgs,
-  system,
+  package,
+  variant,
   kernelPackages,
 }:
 
@@ -14,14 +15,13 @@ let
     inherit
       self
       pkgs
-      system
+      package
       kernelPackages
       ;
   };
-  package = common.package;
 in
 pkgs.testers.nixosTest {
-  name = "defused-daemon-${kernelPackages.kernel.version}";
+  name = "defused-daemon-${variant}-${kernelPackages.kernel.version}";
 
   # This test deliberately does not use services.defused.enable (see
   # common.nix's baseNode) -- the whole point of --daemon is running without
