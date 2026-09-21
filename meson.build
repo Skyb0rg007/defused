@@ -10,7 +10,6 @@ project(
   default_options : ['warning_level=3'],
 )
 
-cc = meson.get_compiler('c')
 seccomp_dep = dependency('libseccomp')
 # sd-varlink fd passing (SD_VARLINK_SERVER_FD_PASSING_INPUT_STRICT,
 # sd_varlink_get_n_fds) is new in systemd 258.
@@ -20,11 +19,7 @@ systemd_dep = dependency('libsystemd', version : '>= 258')
 defused_install_dir = get_option('prefix') / 'lib/defused'
 systemd_unit_dir = get_option('prefix') / 'lib/systemd/system'
 
-common_c_args = []
-if cc.has_function('close_range', prefix : '#include <unistd.h>', args : ['-D_GNU_SOURCE'])
-  common_c_args += ['-DHAVE_CLOSE_RANGE']
-endif
-fusermount3_c_args = common_c_args + [
+fusermount3_c_args = [
   '-DDEFUSED_VERSION="@0@"'.format(meson.project_version()),
   # Spawned as `defused --child` by privileged callers.
   '-DDEFUSED_PATH="@0@"'.format(defused_install_dir / 'defused'),
@@ -41,11 +36,7 @@ sandbox_lib = static_library(
 defused_exe = executable(
   'defused',
   'src/defused.c',
-  'src/defused-daemon.c',
-  'src/defused-policy.c',
   'src/defused-varlink.c',
-  'src/util.c',
-  c_args : common_c_args,
   dependencies : [seccomp_dep, systemd_dep],
   link_with : sandbox_lib,
   install_dir : defused_install_dir,
@@ -56,7 +47,6 @@ fusermount3_exe = executable(
   'fusermount3',
   'src/fusermount3.c',
   'src/defused-varlink.c',
-  'src/util.c',
   c_args : fusermount3_c_args,
   dependencies : [systemd_dep],
   install : true,
@@ -88,14 +78,14 @@ install_data(
 
 # Backstop above each test's own alarm() (see tests/test_timeout.h).
 test_timeout = 120
+test_inc = include_directories('src')
 
 test_protocol_exe = executable(
   'test-protocol',
   'tests/test_protocol.c',
   'src/defused-varlink.c',
-  c_args : common_c_args,
   dependencies : [systemd_dep],
-  include_directories : include_directories('src'),
+  include_directories : test_inc,
 )
 
 test('protocol', test_protocol_exe, args : [defused_exe], timeout : test_timeout)
@@ -105,15 +95,14 @@ test_client_exe = executable(
   'tests/test_client.c',
   'src/defused-varlink.c',
   dependencies : [systemd_dep],
-  include_directories : include_directories('src'),
+  include_directories : test_inc,
 )
 
 test_fusermount3_exe = executable(
   'test-fusermount3',
   'src/fusermount3.c',
   'src/defused-varlink.c',
-  'src/util.c',
-  c_args : common_c_args + [
+  c_args : [
     '-DDEFUSED_TEST',
     '-DDEFUSED_VERSION="@0@"'.format(meson.project_version()),
     # test-client doubles as the fake `defused --child` for privileged callers.
@@ -129,7 +118,7 @@ test_mountns_exe = executable(
   'tests/test_mountns.c',
   'src/defused-varlink.c',
   dependencies : [systemd_dep],
-  include_directories : include_directories('src'),
+  include_directories : test_inc,
 )
 
 test('mountns', test_mountns_exe, args : [defused_exe], timeout : test_timeout)
@@ -140,7 +129,7 @@ test_sandbox_exe = executable(
   'src/defused-sandbox.c',
   c_args : ['-DDEFUSED_TEST', '-ffreestanding'],
   dependencies : [seccomp_dep],
-  include_directories : include_directories('src'),
+  include_directories : test_inc,
 )
 
 test('sandbox', test_sandbox_exe, timeout : test_timeout)

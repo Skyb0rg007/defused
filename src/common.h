@@ -6,9 +6,8 @@
  * Scope-based resource cleanup, after systemd's coding style: a resource is
  * released when the variable holding it goes out of scope, and ownership is
  * handed off with TAKE_FD()/TAKE_PTR() so the handler becomes a no-op.
- *
- * File descriptors are "empty" at -EBADF (any negative value is treated as
- * unset), pointers at NULL.
+ * File descriptors are "empty" at -EBADF (any negative value), pointers at
+ * NULL.
  */
 
 #ifndef DEFUSED_COMMON_H
@@ -19,18 +18,17 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+
 #define _cleanup_(x) __attribute__((__cleanup__(x)))
 
-/* Defines func##p(), a _cleanup_ handler that calls func() on a non-empty
- * value. */
-#define DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(type, func, empty)                    \
+/* Defines func##p(), a _cleanup_ handler that calls func() on non-NULL. */
+#define DEFINE_TRIVIAL_CLEANUP_FUNC(type, func)                                \
     static inline void func##p(type *p) {                                      \
-        if (*p != (empty))                                                     \
+        if (*p != NULL)                                                        \
             func(*p);                                                          \
     }                                                                          \
     struct defused_useless_struct_to_allow_trailing_semicolon_
-#define DEFINE_TRIVIAL_CLEANUP_FUNC(type, func)                                \
-    DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(type, func, NULL)
 
 /* close() that is a no-op on an unset fd, preserves errno, and returns the
  * empty value so it can be used as `fd = safe_close(fd);`. */
@@ -59,9 +57,6 @@ static inline void freep(void *p) { free(*(void **)p); }
 DEFINE_TRIVIAL_CLEANUP_FUNC(FILE *, fclose);
 #define _cleanup_fclose_ _cleanup_(fclosep)
 
-/* Ownership transfer: yields the held value and marks the variable empty.
- * Written as inline helpers rather than statement expressions so they stay
- * within -Wpedantic. */
 static inline int take_fd(int *fd) {
     int r = *fd;
     *fd = -EBADF;

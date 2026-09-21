@@ -152,33 +152,19 @@ static int send_non_fuse_umount_request(int sock_fd,
     }
 
     _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *link = NULL;
-    /* Borrowed from the link, valid until its next call; not ours to unref. */
-    sd_json_variant *reply = NULL;
-    const char *error_id = NULL;
     ret = sd_varlink_connect_fd(&link, sock);
     if (ret < 0)
         return ret;
     TAKE_FD(sock);
-    ret = sd_varlink_set_allow_fd_passing_input(link, true);
-    if (ret < 0)
-        return ret;
     ret = sd_varlink_set_allow_fd_passing_output(link, true);
     if (ret < 0)
         return ret;
     ret = sd_varlink_push_dup_fd(link, parent_fd);
     if (ret < 0)
         return ret;
-    ret = sd_varlink_callbo(
-        link, DEFUSED_VARLINK_METHOD_UNMOUNT, &reply, &error_id,
-        SD_JSON_BUILD_PAIR_UNSIGNED("parentFileDescriptor", 0),
-        SD_JSON_BUILD_PAIR_STRING("name", "target"),
-        SD_JSON_BUILD_PAIR_BOOLEAN("lazy", true));
-    if (ret < 0)
-        return ret;
-    ret = defused_error_from_reply(error_id, reply, err);
-    if (ret < 0)
-        return ret;
-    return 0;
+    struct defused_umount_req req = {
+        .parent_fd = 0, .name = "target", .lazy = true};
+    return defused_call_umount(link, &req, err);
 }
 
 static int abstract_addr(struct sockaddr_un *sa, socklen_t *len,
@@ -312,13 +298,11 @@ static int test_can_join(const char *defused_path) {
                 _exit(1);
             struct defused_error err;
             int ret = send_non_fuse_umount_request(client_sock, &err);
-            _exit(
-                ret == 0 &&
-                        (!strcmp(err.id,
-                                 DEFUSED_VARLINK_ERROR_NOT_A_FUSE_MOUNT) ||
-                         !strcmp(err.id, DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED))
-                    ? 0
-                    : 1);
+            _exit(ret == 0 &&
+                          (!strcmp(err.id, DEFUSED_ERROR_NOT_A_FUSE_MOUNT) ||
+                           !strcmp(err.id, DEFUSED_ERROR_UNMOUNT_FAILED))
+                      ? 0
+                      : 1);
         }
 
         _cleanup_close_ int conn = accept_client(listen_fd);
@@ -389,14 +373,13 @@ static int test_cannot_join(const char *defused_path) {
         struct defused_error err;
         int ret = send_non_fuse_umount_request(client_sock, &err);
         bool accepted =
-            ret == 0 &&
-            (!strcmp(err.id, DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED) ||
-             !strcmp(err.id, DEFUSED_VARLINK_ERROR_NOT_A_FUSE_MOUNT));
+            ret == 0 && (!strcmp(err.id, DEFUSED_ERROR_UNMOUNT_FAILED) ||
+                         !strcmp(err.id, DEFUSED_ERROR_NOT_A_FUSE_MOUNT));
         if (!accepted)
             fprintf(stderr, "test_cannot_join: got %s, expected %s or %s\n",
                     err.id[0] ? err.id : "a successful reply",
-                    DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED,
-                    DEFUSED_VARLINK_ERROR_NOT_A_FUSE_MOUNT);
+                    DEFUSED_ERROR_UNMOUNT_FAILED,
+                    DEFUSED_ERROR_NOT_A_FUSE_MOUNT);
         _exit(accepted ? 0 : 1);
     }
 
