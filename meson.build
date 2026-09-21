@@ -18,9 +18,11 @@ systemd_unit_dir = get_option('prefix') / 'lib/systemd/system'
 
 fusermount3_c_args = [
   '-DDEFUSED_VERSION="@0@"'.format(meson.project_version()),
-  # Spawned as `defused --child` by privileged callers.
-  '-DDEFUSED_PATH="@0@"'.format(defused_install_dir / 'defused'),
 ]
+
+# The request handling both binaries share: shape checks, the FUSE
+# superblock, and -- for a privileged fusermount3 -- carrying it out.
+defused_mount_sources = ['src/defused-mount.c', 'src/defused-proto.c']
 
 sandbox_lib = static_library(
   'defused-sandbox',
@@ -33,7 +35,7 @@ sandbox_lib = static_library(
 defused_exe = executable(
   'defused',
   'src/defused.c',
-  'src/defused-proto.c',
+  defused_mount_sources,
   dependencies : [seccomp_dep],
   link_with : sandbox_lib,
   install_dir : defused_install_dir,
@@ -43,7 +45,7 @@ defused_exe = executable(
 fusermount3_exe = executable(
   'fusermount3',
   'src/fusermount3.c',
-  'src/defused-proto.c',
+  defused_mount_sources,
   c_args : fusermount3_c_args,
   install : true,
 )
@@ -93,14 +95,23 @@ endforeach
 test_fusermount3_exe = executable(
   'test-fusermount3',
   'src/fusermount3.c',
-  'src/defused-proto.c',
+  defused_mount_sources,
   c_args : [
     '-DDEFUSED_TEST',
     '-DDEFUSED_VERSION="@0@"'.format(meson.project_version()),
-    # test-client doubles as the fake `defused --child` for privileged callers.
-    '-DDEFUSED_PATH="@0@"'.format(protocol_tests['client'].full_path()),
   ],
 )
+
+# The shared request handling, driven directly: the privileged path has no
+# IPC left to intercept, so its shape checks are tested here instead.
+test_perform_exe = executable(
+  'test-perform',
+  'tests/test_perform.c',
+  defused_mount_sources,
+  include_directories : test_inc,
+)
+
+test('perform', test_perform_exe, timeout : test_timeout)
 
 foreach name, driven : {
   'protocol': defused_exe,

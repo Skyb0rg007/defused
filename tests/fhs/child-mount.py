@@ -5,7 +5,7 @@
 """Mount and unmount a FUSE mountpoint as root through fusermount3.
 
 libfuse mounts directly with mount(2) when it runs as root, so a real FUSE
-client never reaches the privileged `defused --child` path; this drives
+client never reaches defused's privileged path; this drives
 fusermount3 --comm-fd by hand instead, the way libfuse would for an
 unprivileged caller. Usage: child-mount.py /usr/bin/fusermount3 MOUNTPOINT
 """

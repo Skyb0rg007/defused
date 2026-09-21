@@ -40,8 +40,6 @@ It must be started as root.
   `DEFUSED_SOCKET_PATH` by default, also mode 0666), then forks a child per
   accepted connection to run the same one-request-per-connection handling
   as the `Accept=yes` path.
-- **`--child`**: the same handover, but on a socket pair from `fusermount3`
-  itself; see [Privileged callers](#privileged-callers).
 
 A connection carries exactly one request and one reply, and the service
 exits when it has answered.
@@ -174,15 +172,30 @@ reference would make a non-lazy unmount fail with `EBUSY`.
 
 ## Privileged callers
 
-A `fusermount3` caller that is root or holds `CAP_SYS_ADMIN` does not use the
-service: it creates a `SOCK_SEQPACKET` socket pair, forks, hands the child
-end over as fd 3 with `$LISTEN_PID`/`$LISTEN_FDS`, and execs
-`defused --child`, which speaks the same protocol on it and exits once it
-has replied.
-The child validates the request for shape, skips the ownership rule, the
-filesystem-type allowlist, the policy, and the unmount `user_id=` check, and
-calls `move_mount()` or `umount2()` directly in the caller's mount namespace.
+A `fusermount3` caller that is root or holds `CAP_SYS_ADMIN` speaks no
+protocol at all. It already holds the privilege the service exists to lend
+out, and it is already in the mount namespace the mount belongs in, so
+there is nothing to ask anyone for and nothing to enter: it calls
+`defused_perform()` (`src/defused-mount.c`) and does the work in its own
+process.
+
+That path validates the request for shape and then calls `move_mount()` or
+`umount2()` directly. It applies no policy, no mountpoint ownership rule,
+no filesystem-type allowlist and no unmount `user_id=` check.
 Like root's `umount`, it unmounts any mount below the parent directory.
+
+Both binaries link `src/defused-mount.c`, so the shape checks and the
+superblock construction are the same code either way. Only what surrounds
+them differs: the service puts its authorization between the steps, and
+hands the finished mount to a sandboxed child rather than attaching it
+itself.
+
+Two things follow from the privileged path no longer being the service:
+
+- `defused` has no branch that skips an authorization step, because it
+  has no caller that would need one.
+- `fusermount3` needs neither the socket nor the `defused` binary
+  installed.
 
 It is also the only path that accepts `DEFUSED_MOUNT_ALLOW_SUID` (`suid`),
 `DEFUSED_MOUNT_ALLOW_DEV` (`dev`) and `DEFUSED_MOUNT_BLKDEV` (`blkdev`: a

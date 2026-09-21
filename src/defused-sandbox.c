@@ -102,11 +102,6 @@ static int sandbox_mnt_id(int dir_fd, const char *name, struct sandbox_buf *buf,
     return 0;
 }
 
-int defused_mnt_id(int dir_fd, const char *name, uint64_t *out_id) {
-    struct sandbox_buf buf;
-    return sandbox_mnt_id(dir_fd, name, &buf, out_id);
-}
-
 /* Maps the path read-only and the scratch writable, at the addresses
  * install_seccomp() pins. mprotect() is not allowed, so the path cannot be
  * rewritten once the filter is up. */

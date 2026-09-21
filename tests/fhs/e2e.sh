@@ -110,7 +110,7 @@ check_mount "unprivileged mount through the service" "$uid" as_user
 check_mount "unprivileged mount with no_new_privs, where a setuid helper cannot work" \
     "$uid" as_user setpriv --no-new-privs --
 
-echo "# root mount and unmount, spawning $defused --child"
+echo "# root mount and unmount, performed by fusermount3 itself"
 rootmnt=$(mktemp -d)
 as_root python3 "$here/child-mount.py" "$fusermount3" "$rootmnt"
 rmdir "$rootmnt"

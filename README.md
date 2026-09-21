@@ -97,12 +97,13 @@ like `--allow-other` is passed:
 Environment=DEFUSED_EXTRA_ARGS=--allow-other
 ```
 
-A caller that is root or holds `CAP_SYS_ADMIN` does not need the service:
-`fusermount3` instead spawns `defused --child`, which performs the request
-with the caller's own privileges and none of the service's policy (no mount
-limit, no mountpoint ownership rule, no filesystem-type allowlist), and honors
-the `suid`, `dev` and `blkdev` options like libfuse's `fusermount3` does for
-root.
+A caller that is root or holds `CAP_SYS_ADMIN` does not need the service at
+all: it already holds the privilege, and it is already in the mount
+namespace the mount belongs in, so `fusermount3` mounts directly in its own
+process -- no socket, no helper, and none of the service's policy (no mount
+limit, no mountpoint ownership rule, no filesystem-type allowlist). It
+honors the `suid`, `dev` and `blkdev` options like libfuse's `fusermount3`
+does for root, and the `defused` service binary need not even be installed.
 libfuse's own `fusermount3` is therefore not needed at all.
 
 ## Mountpoint ownership model

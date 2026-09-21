@@ -35,10 +35,6 @@ int defused_sandbox_unmount(int pidfd, int parent_fd, const char *name,
                             bool lazy, uint64_t mnt_id, uid_t uid,
                             struct defused_error *err);
 
-/* The mount id of name under dir_fd: the 64-bit one the kernel never
- * reuses. From the VFS, so it works even when the FUSE server is dead. */
-int defused_mnt_id(int dir_fd, const char *name, uint64_t *out_id);
-
 /* The mount namespace pidfd's process is in, to aim statmount() and
  * listmount() at it. */
 int defused_peer_mnt_ns_id(int pidfd, uint64_t *out_id);
