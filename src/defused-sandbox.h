@@ -39,6 +39,10 @@ int defused_sandbox_unmount(int pidfd, int parent_fd, const char *name,
  * reuses. From the VFS, so it works even when the FUSE server is dead. */
 int defused_mnt_id(int dir_fd, const char *name, uint64_t *out_id);
 
+/* The mount namespace pidfd's process is in, to aim statmount() and
+ * listmount() at it. */
+int defused_peer_mnt_ns_id(int pidfd, uint64_t *out_id);
+
 /* 1 if mnt_id names a FUSE mount in namespace mnt_ns_id (0 for the
  * caller's own), 0 for any other mount, or a negative errno. The optional
  * out_blkdev distinguishes "fuseblk"; the optional out_uid gets user_id=,

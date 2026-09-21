@@ -85,12 +85,17 @@ static int parse_long(const char *s, long *out) {
 
 /*** Policy: whether the caller may use defused at all ***/
 
-/* Like libfuse's mount_max: the FUSE mounts in the service's own mount
- * namespace. */
-static int count_fuse_mounts(void) {
+/* Like libfuse's mount_max: the FUSE mounts in the client's mount
+ * namespace, the one the new mount lands in. */
+static int count_fuse_mounts(int pidfd) {
+    uint64_t ns_id;
+    int ret = defused_peer_mnt_ns_id(pidfd, &ns_id);
+    if (ret < 0)
+        return ret;
     struct mnt_id_req req = {
         .size = MNT_ID_REQ_SIZE_VER1,
         .mnt_id = LSMT_ROOT,
+        .mnt_ns_id = ns_id,
     };
     uint64_t ids[256];
     int count = 0;
@@ -101,7 +106,7 @@ static int count_fuse_mounts(void) {
         for (ssize_t i = 0; i < n; i++) {
             /* libfuse's mount_max counts "fuse" and not "fuseblk". */
             bool blkdev = false;
-            int ret = defused_is_fuse_mount(0, ids[i], &blkdev, NULL);
+            ret = defused_is_fuse_mount(ns_id, ids[i], &blkdev, NULL);
             /* A mount that went away is one fewer mount, not an error. */
             if (ret == 1 && !blkdev)
                 count++;
@@ -139,7 +144,7 @@ static int peer_in_allowed_groups(sd_varlink *link, gid_t gid) {
 /* -EACCES, with *err filled in, for a refusal. Unmount only gets the group
  * check: --max-mounts and --allow-other describe no teardown, and whether
  * the mount is the caller's is checked separately. */
-static int policy_check(sd_varlink *link, const struct peer *peer,
+static int policy_check(sd_varlink *link, const struct peer *peer, int pidfd,
                         enum defused_op op, uint32_t mount_flags,
                         struct defused_error *err) {
     const char *what = op == DEFUSED_OP_MOUNT ? "mount" : "unmount";
@@ -167,7 +172,7 @@ static int policy_check(sd_varlink *link, const struct peer *peer,
                            "granted by --allow-other");
         return -EACCES;
     }
-    int mounts = count_fuse_mounts();
+    int mounts = count_fuse_mounts(pidfd);
     if (mounts < 0)
         return defused_error_setf(err, fail_id, -mounts,
                                   "could not count the existing FUSE mounts");
@@ -507,7 +512,8 @@ static int mount_request(sd_varlink *link, const struct defused_mount_req *req,
             return defused_error_setf(err, DEFUSED_ERROR_MOUNT_FAILED, -pidfd,
                                       "SO_PEERPIDFD on the client socket "
                                       "failed");
-        ret = policy_check(link, peer, DEFUSED_OP_MOUNT, req->mount_flags, err);
+        ret = policy_check(link, peer, pidfd, DEFUSED_OP_MOUNT,
+                           req->mount_flags, err);
         if (ret < 0)
             return ret;
     }
@@ -610,7 +616,7 @@ static int umount_request(sd_varlink *link,
     if (pidfd < 0)
         return defused_error_setf(err, DEFUSED_ERROR_UNMOUNT_FAILED, -pidfd,
                                   "SO_PEERPIDFD on the client socket failed");
-    ret = policy_check(link, peer, DEFUSED_OP_UNMOUNT, 0, err);
+    ret = policy_check(link, peer, pidfd, DEFUSED_OP_UNMOUNT, 0, err);
     if (ret < 0)
         return ret;
     return defused_sandbox_unmount(pidfd, parent_fd, req->name, req->lazy,
