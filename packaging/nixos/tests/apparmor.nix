@@ -2,24 +2,10 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-{
-  self,
-  pkgs,
-  package,
-  variant,
-  kernelPackages,
-}:
+{ pkgs, common, ... }:
 
 let
-  common = import ./common.nix {
-    inherit
-      self
-      pkgs
-      package
-      kernelPackages
-      ;
-  };
-  inherit (common) mountHelper;
+  inherit (common) package;
 
   # Accept=yes ties one defused@ instance to each connection, so holding one
   # open keeps an instance around to inspect.
@@ -36,8 +22,8 @@ let
   # Only the mediation probe needs this: the profile grants no execute of its own.
   probeRules = pkgs.apparmorRulesFromClosure { name = "defused-test-probe"; } [ pkgs.coreutils ];
 in
-pkgs.testers.nixosTest {
-  name = "defused-apparmor-${variant}-${kernelPackages.kernel.version}";
+common.mkTest {
+  name = "apparmor";
 
   nodes.machine =
     { ... }:
@@ -49,17 +35,14 @@ pkgs.testers.nixosTest {
       '';
     };
 
-  testScript =
+  script =
     { nodes, ... }:
     let
       socketPath = nodes.machine.systemd.sockets.defused.socketConfig.ListenStream;
     in
     ''
-      start_all()
-
-      machine.wait_for_unit("multi-user.target")
+      boot(machine)
       machine.wait_for_unit("apparmor.service")
-      machine.wait_for_unit("defused.socket")
 
       with subtest("the defused profile is loaded in enforce mode"):
           machine.succeed("grep -Fx 'defused (enforce)' /sys/kernel/security/apparmor/profiles")
@@ -99,14 +82,19 @@ pkgs.testers.nixosTest {
 
       with subtest("a confined defused@ can mount and lazily unmount"):
           machine.succeed("test -e /dev/fuse")
-          machine.succeed("install -d -o alice -g users /home/alice/aa-mnt")
-          machine.succeed(
-              "timeout 45s runuser -u alice -- "
-              "${pkgs.python3}/bin/python3 ${mountHelper} "
-              "assert-mount /home/alice/aa-mnt 'fsname=aafs,subtype=aa' "
-              "' - fuse.aa aafs ' rw nosuid nodev user_id= group_id="
+          mkmnt(machine, "/home/alice/aa-mnt")
+          mount(
+              machine,
+              "/home/alice/aa-mnt",
+              "fsname=aafs,subtype=aa",
+              " - fuse.aa aafs ",
+              "rw",
+              "nosuid",
+              "nodev",
+              "user_id=",
+              "group_id=",
           )
-          machine.wait_until_succeeds("! grep -F ' /home/alice/aa-mnt ' /proc/self/mountinfo")
+          wait_unmounted(machine, "/home/alice/aa-mnt")
 
       with subtest("no AppArmor denials for the defused profile"):
           # Kernel-mediated denials land in the kernel log; the journal catches

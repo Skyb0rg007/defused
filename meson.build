@@ -76,27 +76,24 @@ install_data(
 
 ## Tests ##
 
-# Backstop above each test's own alarm() (see tests/test_timeout.h).
+# Backstop above each test's own alarm() (see tests/test_util.h).
 test_timeout = 120
 test_inc = include_directories('src')
 
-test_protocol_exe = executable(
-  'test-protocol',
-  'tests/test_protocol.c',
-  'src/defused-varlink.c',
-  dependencies : [systemd_dep],
-  include_directories : test_inc,
-)
-
-test('protocol', test_protocol_exe, args : [defused_exe], timeout : test_timeout)
-
-test_client_exe = executable(
-  'test-client',
-  'tests/test_client.c',
-  'src/defused-varlink.c',
-  dependencies : [systemd_dep],
-  include_directories : test_inc,
-)
+# These three speak the Varlink protocol, so each links the client helpers
+# and takes the binary it drives as its single argument.
+varlink_tests = {}
+foreach name : ['protocol', 'client', 'mountns']
+  varlink_tests += {
+    name: executable(
+      'test-' + name,
+      'tests/test_@0@.c'.format(name),
+      'src/defused-varlink.c',
+      dependencies : [systemd_dep],
+      include_directories : test_inc,
+    ),
+  }
+endforeach
 
 test_fusermount3_exe = executable(
   'test-fusermount3',
@@ -106,22 +103,18 @@ test_fusermount3_exe = executable(
     '-DDEFUSED_TEST',
     '-DDEFUSED_VERSION="@0@"'.format(meson.project_version()),
     # test-client doubles as the fake `defused --child` for privileged callers.
-    '-DDEFUSED_PATH="@0@"'.format(test_client_exe.full_path()),
+    '-DDEFUSED_PATH="@0@"'.format(varlink_tests['client'].full_path()),
   ],
   dependencies : [systemd_dep],
 )
 
-test('client', test_client_exe, args : [test_fusermount3_exe], timeout : test_timeout)
-
-test_mountns_exe = executable(
-  'test-mountns',
-  'tests/test_mountns.c',
-  'src/defused-varlink.c',
-  dependencies : [systemd_dep],
-  include_directories : test_inc,
-)
-
-test('mountns', test_mountns_exe, args : [defused_exe], timeout : test_timeout)
+foreach name, driven : {
+  'protocol': defused_exe,
+  'client': test_fusermount3_exe,
+  'mountns': defused_exe,
+}
+  test(name, varlink_tests[name], args : [driven], timeout : test_timeout)
+endforeach
 
 test_sandbox_exe = executable(
   'test-sandbox',

@@ -2,35 +2,19 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-{
-  self,
-  pkgs,
-  package,
-  variant,
-  kernelPackages,
-}:
+{ self, common, ... }:
 
 let
-  common = import ./common.nix {
-    inherit
-      self
-      pkgs
-      package
-      kernelPackages
-      ;
-  };
-  inherit (common) mountHelper;
-
   # Not common.baseNode: it grants allow_other to everyone.
   policyNode =
     { ... }:
     {
       imports = [ self.nixosModules.defused ];
-      boot.kernelPackages = kernelPackages;
+      boot.kernelPackages = common.kernelPackages;
       boot.kernelModules = [ "fuse" ];
       services.defused = {
         enable = true;
-        package = package;
+        package = common.package;
       };
       users.groups.fusers = { };
       users.users.alice = {
@@ -44,8 +28,8 @@ let
       };
     };
 in
-pkgs.testers.nixosTest {
-  name = "defused-policy-${variant}-${kernelPackages.kernel.version}";
+common.mkTest {
+  name = "policy";
 
   nodes = {
     # Issue #59's policy; the limit is 1 so the test can reach it.
@@ -66,12 +50,8 @@ pkgs.testers.nixosTest {
       };
   };
 
-  testScript = ''
-    start_all()
-
-    for machine in (restricted, allowOther):
-        machine.wait_for_unit("multi-user.target")
-        machine.wait_for_unit("defused.socket")
+  script = ''
+    boot(restricted, allowOther)
 
     with subtest("the unit carries the policy options"):
         restricted.succeed(
@@ -82,63 +62,34 @@ pkgs.testers.nixosTest {
         )
 
     with subtest("a member of --allow-groups mounts and unmounts"):
-        restricted.succeed("install -d -o alice -g users /home/alice/mnt-a")
-        restricted.succeed(
-            "timeout 45s runuser -u alice -- "
-            "${pkgs.python3}/bin/python3 ${mountHelper} "
-            "assert-unmount /home/alice/mnt-a __empty__"
-        )
+        mkmnt(restricted, "/home/alice/mnt-a")
+        mount_unmount(restricted, "/home/alice/mnt-a")
 
     with subtest("a user outside --allow-groups is refused"):
-        restricted.succeed("install -d -o bob -g users /home/bob/mnt")
-        restricted.succeed(
-            "timeout 45s runuser -u bob -- "
-            "${pkgs.python3}/bin/python3 ${mountHelper} "
-            "expect-failure /home/bob/mnt ro "
-            "'not allowed by the defused service'"
-        )
+        mkmnt(restricted, "/home/bob/mnt", user="bob")
+        refuse(restricted, "/home/bob/mnt", "ro", run="runuser -u bob --")
 
     with subtest("allow_other is refused unless --allow-other grants it"):
-        restricted.succeed(
-            "timeout 45s runuser -u alice -- "
-            "${pkgs.python3}/bin/python3 ${mountHelper} "
-            "expect-failure /home/alice/mnt-a allow_other "
-            "'not allowed by the defused service'"
-        )
-        allowOther.succeed("install -d -o alice -g users /home/alice/mnt-other")
-        allowOther.succeed(
-            "timeout 45s runuser -u alice -- "
-            "${pkgs.python3}/bin/python3 ${mountHelper} "
-            "assert-mount /home/alice/mnt-other allow_other "
-            "' - fuse fuse ' allow_other"
-        )
+        refuse(restricted, "/home/alice/mnt-a", "allow_other")
+        mkmnt(allowOther, "/home/alice/mnt-other")
+        mount(allowOther, "/home/alice/mnt-other", "allow_other", " - fuse fuse ", "allow_other")
 
     with subtest("--max-mounts refuses a mount past the limit"):
-        restricted.succeed("install -d -o alice -g users /home/alice/mnt-b")
-        restricted.succeed(
-            "timeout 120s runuser -u alice -- "
-            "${pkgs.python3}/bin/python3 ${mountHelper} "
-            "hold-mount /home/alice/mnt-a __empty__ "
-            "/tmp/defused-ready /tmp/defused-release ' - fuse fuse ' "
-            ">/tmp/defused-hold.log 2>&1 &"
+        mkmnt(restricted, "/home/alice/mnt-b")
+        hold(
+            restricted,
+            "/home/alice/mnt-a",
+            "__empty__",
+            " - fuse fuse ",
+            timeout=120,
+            suffix=" >/tmp/defused-hold.log 2>&1 &",
         )
         restricted.wait_until_succeeds("test -s /tmp/defused-ready")
-        restricted.succeed(
-            "timeout 45s runuser -u alice -- "
-            "${pkgs.python3}/bin/python3 ${mountHelper} "
-            "expect-failure /home/alice/mnt-b ro "
-            "'not allowed by the defused service'"
-        )
+        refuse(restricted, "/home/alice/mnt-b", "ro")
         restricted.succeed("touch /tmp/defused-release")
-        restricted.wait_until_succeeds(
-            "! grep -F ' /home/alice/mnt-a ' /proc/self/mountinfo"
-        )
+        wait_unmounted(restricted, "/home/alice/mnt-a")
 
     with subtest("the limit counts live mounts: released, the next one goes through"):
-        restricted.succeed(
-            "timeout 45s runuser -u alice -- "
-            "${pkgs.python3}/bin/python3 ${mountHelper} "
-            "assert-mount /home/alice/mnt-b __empty__ ' - fuse fuse '"
-        )
+        mount(restricted, "/home/alice/mnt-b", "__empty__", " - fuse fuse ")
   '';
 }

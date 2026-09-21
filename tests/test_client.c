@@ -25,7 +25,7 @@
 #define _GNU_SOURCE
 #include "common.h"
 #include "defused_proto.h"
-#include "test_timeout.h"
+#include "test_util.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -44,19 +44,6 @@
 #include <systemd/sd-json.h>
 #include <systemd/sd-varlink.h>
 #include <unistd.h>
-
-static int failures;
-
-/* Meson reads 77 as a skip. */
-#define MESON_EXIT_SKIP 77
-
-#define CHECK(cond)                                                            \
-    do {                                                                       \
-        if (!(cond)) {                                                         \
-            fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);    \
-            failures++;                                                        \
-        }                                                                      \
-    } while (0)
 
 static int recv_with_fd(int sock, void *buf, size_t len, ssize_t *out_len,
                         int *out_fd) {
@@ -165,7 +152,7 @@ static void check_forwarded_fd(int comm_fd) {
     CHECK(fstat(fuse_fd, &fuse_st) == 0 && S_ISCHR(fuse_st.st_mode));
 }
 
-/* The -o string test_mount() and test_privileged_mount() send, and what
+/* The -o string test_mount() sends, and what
  * method_mount() expects it to have been parsed into. noatime,atime and
  * large_read are here for libfuse2's fusermount, whose option set is a
  * subset of fusermount3's apart from those two. */
@@ -283,63 +270,45 @@ static int serve_connection(int conn_fd) {
     return sd_event_loop(event);
 }
 
-static int test_mount(const char *client, int listen_fd) {
+/* Accepts one connection on listen_fd and plays the service to completion. */
+static void serve_one(int listen_fd) {
+    _cleanup_close_ int conn = accept(listen_fd, NULL, NULL);
+    CHECK(conn >= 0);
+    CHECK(serve_connection(TAKE_FD(conn)) == 0);
+}
+
+/* listen_fd >= 0 drives the unprivileged path, where the client connects to
+ * the socket and this process plays the service; listen_fd < 0 drives the
+ * privileged one, where the client spawns fake_defused_child() itself and
+ * the socket is never touched. */
+static void test_mount(const char *client, int listen_fd, const char *opts) {
     _cleanup_close_pair_ int comm[2] = EBADF_PAIR;
     CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, comm) == 0);
 
-    char *args[] = {(char *)"-o", (char *)mount_opts, (char *)"."};
+    char *args[] = {(char *)"-o", (char *)opts, (char *)"."};
     pid_t pid;
     CHECK(spawn_client(client, comm[1], args, 3, &pid) == 0);
     comm[1] = safe_close(comm[1]);
 
-    _cleanup_close_ int conn = accept(listen_fd, NULL, NULL);
-    CHECK(conn >= 0);
-
-    /* Play the service's success path. The client already opened the device
-     * fd it sent to the service, so the response carries no fd. */
-    CHECK(serve_connection(TAKE_FD(conn)) == 0);
+    /* The success path. The client already opened the device fd it sent to
+     * the service, so the response carries no fd. */
+    if (listen_fd >= 0)
+        serve_one(listen_fd);
 
     check_forwarded_fd(comm[0]);
     CHECK(wait_exit_code(pid) == 0);
-    return failures ? -EINVAL : 0;
 }
 
-static int test_unmount(const char *client, int listen_fd) {
+static void test_unmount(const char *client, int listen_fd) {
     char *args[] = {(char *)"-u", (char *)"-z", (char *)"."};
     pid_t pid;
     CHECK(spawn_client(client, -1, args, 3, &pid) == 0);
 
-    _cleanup_close_ int conn = accept(listen_fd, NULL, NULL);
-    CHECK(conn >= 0);
-    CHECK(serve_connection(TAKE_FD(conn)) == 0);
+    if (listen_fd >= 0)
+        serve_one(listen_fd);
 
     /* An error status must surface as a nonzero exit. */
     CHECK(wait_exit_code(pid) == 1);
-    return failures ? -EINVAL : 0;
-}
-
-/* Same as test_mount()/test_unmount(), but the service side is played by
- * fake_defused_child() in a process the client spawns itself. */
-static int test_privileged_mount(const char *client) {
-    _cleanup_close_pair_ int comm[2] = EBADF_PAIR;
-    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, comm) == 0);
-
-    char *args[] = {(char *)"-o", (char *)privileged_mount_opts, (char *)"."};
-    pid_t pid;
-    CHECK(spawn_client(client, comm[1], args, 3, &pid) == 0);
-    comm[1] = safe_close(comm[1]);
-
-    check_forwarded_fd(comm[0]);
-    CHECK(wait_exit_code(pid) == 0);
-    return failures ? -EINVAL : 0;
-}
-
-static int test_privileged_unmount(const char *client) {
-    char *args[] = {(char *)"-u", (char *)"-z", (char *)"."};
-    pid_t pid;
-    CHECK(spawn_client(client, -1, args, 3, &pid) == 0);
-    CHECK(wait_exit_code(pid) == 1);
-    return failures ? -EINVAL : 0;
 }
 
 /* Runs as the `defused --child` the client spawned. The socket arrives as
@@ -382,8 +351,8 @@ int main(int argc, char *argv[]) {
      * that fails immediately so a wrong turn is an error, not a hang. */
     setenv("DEFUSED_TEST_UID", "0", 1);
     setenv("DEFUSED_SOCKET", "/nonexistent/defused.sock", 1);
-    (void)test_privileged_mount(argv[1]);
-    (void)test_privileged_unmount(argv[1]);
+    test_mount(argv[1], -1, privileged_mount_opts);
+    test_unmount(argv[1], -1);
 
     setenv("DEFUSED_TEST_UID", "1", 1);
 
@@ -411,8 +380,8 @@ int main(int argc, char *argv[]) {
     }
     setenv("DEFUSED_SOCKET", sock_path, 1);
 
-    (void)test_mount(argv[1], listen_fd);
-    (void)test_unmount(argv[1], listen_fd);
+    test_mount(argv[1], listen_fd, mount_opts);
+    test_unmount(argv[1], listen_fd);
 
     unlink(sock_path);
     rmdir(dir);

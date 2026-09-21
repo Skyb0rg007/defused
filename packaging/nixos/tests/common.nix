@@ -6,6 +6,7 @@
   self,
   pkgs,
   package,
+  variant,
   kernelPackages,
 }:
 
@@ -24,6 +25,12 @@ let
     FUSE_INIT = 26
     FUSE_KERNEL_VERSION = 7
     FUSE_KERNEL_MINOR_VERSION = 31
+
+    def echo(stdout, stderr):
+        if stdout:
+            print(stdout, end="")
+        if stderr:
+            print(stderr, end="", file=sys.stderr)
 
     def recv_fd(sock):
         sock.settimeout(10)
@@ -51,15 +58,9 @@ let
                 timeout=10,
             )
         except subprocess.TimeoutExpired as e:
-            if e.stdout:
-                print(e.stdout, end="")
-            if e.stderr:
-                print(e.stderr, end="", file=sys.stderr)
+            echo(e.stdout, e.stderr)
             raise RuntimeError(f"fusermount3 timed out: {args!r}") from e
-        if proc.stdout:
-            print(proc.stdout, end="")
-        if proc.stderr:
-            print(proc.stderr, end="", file=sys.stderr)
+        echo(proc.stdout, proc.stderr)
         return proc
 
     def mount_fuse(mountpoint, opts):
@@ -79,19 +80,11 @@ let
         try:
             fuse_fd = recv_fd(local)
         except Exception:
-            stdout, stderr = proc.communicate(timeout=10)
-            if stdout:
-                print(stdout, end="")
-            if stderr:
-                print(stderr, end="", file=sys.stderr)
+            echo(*proc.communicate(timeout=10))
             raise
         finally:
             local.close()
-        stdout, stderr = proc.communicate(timeout=10)
-        if stdout:
-            print(stdout, end="")
-        if stderr:
-            print(stderr, end="", file=sys.stderr)
+        echo(*proc.communicate(timeout=10))
         if proc.returncode != 0:
             os.close(fuse_fd)
             raise RuntimeError(f"fusermount3 mount failed with {proc.returncode}")
@@ -129,22 +122,26 @@ let
         os.write(fuse_fd, struct.pack("<IiQ", 16 + len(out), 0, unique) + out)
 
     def unmount_fuse(mountpoint, lazy=False):
-        args = ["-u"]
-        if lazy:
-            args.append("-z")
-        args.append(mountpoint)
+        args = ["-u"] + (["-z"] if lazy else []) + [mountpoint]
         proc = run_fusermount3(args)
         if proc.returncode != 0:
             raise RuntimeError(f"fusermount3 unmount failed with {proc.returncode}")
 
-    def mountinfo_for(mountpoint):
+    def mountinfo_line(mountpoint):
+        """The /proc/self/mountinfo line for mountpoint, or None if unmounted."""
         mountpoint = os.path.abspath(mountpoint)
         with open("/proc/self/mountinfo", encoding="utf-8") as f:
             for line in f:
                 fields = line.split()
                 if len(fields) >= 5 and fields[4] == mountpoint:
                     return line.strip()
-        raise RuntimeError(f"no mountinfo entry for {mountpoint}")
+        return None
+
+    def mountinfo_for(mountpoint):
+        line = mountinfo_line(mountpoint)
+        if line is None:
+            raise RuntimeError(f"no mountinfo entry for {mountpoint}")
+        return line
 
     def assert_tokens(line, tokens):
         """A token starting with '!' must be absent from the line."""
@@ -155,13 +152,24 @@ let
                 f"missing {missing!r}, unexpected {present!r} in mountinfo line: {line}"
             )
 
-    def assert_mount(mountpoint, opts, tokens):
+    def assert_mount(mountpoint, opts, tokens, ready=None, release=None):
+        """Mount, check the mountinfo line against tokens, lazily unmount.
+
+        Given ready/release, write the line to the ready path and hold the
+        mount open until the release path appears, so another process can
+        observe it live.
+        """
         fuse_fd = mount_fuse(mountpoint, opts)
         try:
             init_fuse(fuse_fd)
             line = mountinfo_for(mountpoint)
             print(line, flush=True)
             assert_tokens(line, tokens)
+            if ready:
+                with open(ready, "w", encoding="utf-8") as f:
+                    f.write(line + "\n")
+                while not os.path.exists(release):
+                    time.sleep(0.1)
         finally:
             try:
                 unmount_fuse(mountpoint, lazy=True)
@@ -179,30 +187,10 @@ let
             except RuntimeError:
                 unmount_fuse(mountpoint, lazy=True)
                 raise
-            with open("/proc/self/mountinfo", encoding="utf-8") as f:
-                for line in f:
-                    fields = line.split()
-                    if len(fields) >= 5 and fields[4] == os.path.abspath(mountpoint):
-                        raise AssertionError(f"still mounted after unmount: {line}")
+            line = mountinfo_line(mountpoint)
+            if line is not None:
+                raise AssertionError(f"still mounted after unmount: {line}")
         finally:
-            os.close(fuse_fd)
-
-    def hold_mount(mountpoint, opts, ready, release, tokens):
-        fuse_fd = mount_fuse(mountpoint, opts)
-        try:
-            init_fuse(fuse_fd)
-            line = mountinfo_for(mountpoint)
-            print(line, flush=True)
-            assert_tokens(line, tokens)
-            with open(ready, "w", encoding="utf-8") as f:
-                f.write(line + "\n")
-            while not os.path.exists(release):
-                time.sleep(0.1)
-        finally:
-            try:
-                unmount_fuse(mountpoint, lazy=True)
-            except RuntimeError as e:
-                print(e, file=sys.stderr)
             os.close(fuse_fd)
 
     def expect_failure(mountpoint, opts, expected):
@@ -213,7 +201,6 @@ let
             remote.close()
             local.close()
         output = proc.stdout + proc.stderr
-        print(output, end="")
         if proc.returncode == 0:
             raise AssertionError("fusermount3 unexpectedly succeeded")
         if expected not in output:
@@ -225,7 +212,7 @@ let
     elif mode == "assert-unmount":
         assert_unmount(sys.argv[2], sys.argv[3])
     elif mode == "hold-mount":
-        hold_mount(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6:])
+        assert_mount(sys.argv[2], sys.argv[3], sys.argv[6:], sys.argv[4], sys.argv[5])
     elif mode == "expect-failure":
         expect_failure(sys.argv[2], sys.argv[3], sys.argv[4])
     else:
@@ -253,7 +240,89 @@ let
         createHome = true;
       };
     };
+
+  # Wrappers around the helper above, so a test says what it is checking
+  # instead of respelling the runuser/timeout/python incantation. `run` is
+  # the command prefix the helper is launched under, and `suffix` is appended
+  # to the shell command unquoted, for redirections and `&`.
+  prelude = ''
+    import shlex
+
+    HELPER = "${pkgs.python3}/bin/python3 ${mountHelper}"
+    READY, RELEASE = "/tmp/defused-ready", "/tmp/defused-release"
+
+
+    def helper(machine, *args, run="runuser -u alice --", timeout=45, suffix=""):
+        argv = " ".join(shlex.quote(str(a)) for a in args)
+        return machine.succeed(f"timeout {timeout}s {run} {HELPER} {argv}{suffix}")
+
+
+    def mount(machine, mnt, opts="__empty__", *tokens, **kw):
+        helper(machine, "assert-mount", mnt, opts, *tokens, **kw)
+
+
+    def mount_unmount(machine, mnt, opts="__empty__", **kw):
+        helper(machine, "assert-unmount", mnt, opts, **kw)
+
+
+    def hold(machine, mnt, opts, *tokens, ready=READY, release=RELEASE, **kw):
+        helper(machine, "hold-mount", mnt, opts, ready, release, *tokens, **kw)
+
+
+    def refuse(machine, mnt, opts, expected="not allowed by the defused service", **kw):
+        helper(machine, "expect-failure", mnt, opts, expected, **kw)
+
+
+    def mkmnt(machine, *paths, user="alice"):
+        for path in paths:
+            machine.succeed(f"install -d -o {user} -g users {path}")
+
+
+    def mounted(machine, mnt):
+        return machine.succeed(f"grep -F ' {mnt} ' /proc/self/mountinfo").strip()
+
+
+    def wait_unmounted(machine, mnt):
+        machine.wait_until_succeeds(f"! grep -F ' {mnt} ' /proc/self/mountinfo")
+
+
+    def boot(*machines, socket=True):
+        start_all()
+        for machine in machines:
+            machine.wait_for_unit("multi-user.target")
+            if socket:
+                machine.wait_for_unit("defused.socket")
+
+  '';
+
+  # Every test is the same nixosTest apart from its nodes and script, and
+  # every name carries the variant and kernel it was built for.
+  mkTest =
+    {
+      name,
+      nodes ? {
+        machine = baseNode;
+      },
+      script,
+    }:
+    pkgs.testers.nixosTest {
+      name = "defused-${name}-${variant}-${kernelPackages.kernel.version}";
+      inherit nodes;
+      # A script may be a function of the evaluated { nodes, ... }, as the
+      # NixOS test driver allows, or a plain string. The wrapper has to
+      # declare `nodes` itself: the driver auto-calls testScript with only
+      # the arguments its formals name.
+      testScript =
+        if builtins.isFunction script then { nodes, ... }@args: prelude + script args else prelude + script;
+    };
 in
 {
-  inherit package mountHelper baseNode;
+  inherit
+    package
+    mountHelper
+    baseNode
+    kernelPackages
+    mkTest
+    ;
+  kernelVersion = kernelPackages.kernel.version;
 }

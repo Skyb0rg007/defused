@@ -2,41 +2,20 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-{
-  self,
-  pkgs,
-  package,
-  variant,
-  kernelPackages,
-}:
+{ common, ... }:
 
-let
-  common = import ./common.nix {
-    inherit
-      self
-      pkgs
-      package
-      kernelPackages
-      ;
-  };
-in
-pkgs.testers.nixosTest {
-  name = "defused-mountpoint-ownership-${variant}-${kernelPackages.kernel.version}";
+common.mkTest {
+  name = "mountpoint-ownership";
 
-  nodes.machine = common.baseNode;
-
-  testScript = ''
-    start_all()
-
-    machine.wait_for_unit("multi-user.target")
-    machine.wait_for_unit("defused.socket")
+  script = ''
+    boot(machine)
 
     machine.succeed("install -d -m 0777 -o root -g root /srv/root-owned-mnt")
-    machine.succeed(
-        "timeout 45s runuser -u alice -- env DEFUSED_FUSE_DEVICE=/dev/null "
-        "${pkgs.python3}/bin/python3 ${common.mountHelper} "
-        "expect-failure /srv/root-owned-mnt fsname=denied "
-        "'not allowed by the defused service'"
+    refuse(
+        machine,
+        "/srv/root-owned-mnt",
+        "fsname=denied",
+        run="runuser -u alice -- env DEFUSED_FUSE_DEVICE=/dev/null",
     )
 
     machine.succeed(

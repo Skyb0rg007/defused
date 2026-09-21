@@ -2,24 +2,10 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-{
-  self,
-  pkgs,
-  package,
-  variant,
-  kernelPackages,
-}:
+{ pkgs, common, ... }:
 
 let
-  common = import ./common.nix {
-    inherit
-      self
-      pkgs
-      package
-      kernelPackages
-      ;
-  };
-  inherit (common) mountHelper;
+  inherit (common) package;
   inherit (pkgs) lib;
 
   # A libfuse2 filesystem, from libfuse2's own example: nixpkgs has no
@@ -36,8 +22,8 @@ let
           $(pkg-config --cflags --libs fuse)
       '';
 in
-pkgs.testers.nixosTest {
-  name = "defused-desktop-${variant}-${kernelPackages.kernel.version}";
+common.mkTest {
+  name = "desktop";
 
   nodes.machine =
     { ... }:
@@ -60,14 +46,11 @@ pkgs.testers.nixosTest {
       ];
     };
 
-  testScript =
+  script =
     { nodes, ... }:
     assert lib.filter (lib.hasInfix "defused") nodes.machine.warnings == [ ];
     ''
-      start_all()
-
-      machine.wait_for_unit("multi-user.target")
-      machine.wait_for_unit("defused.socket")
+      boot(machine)
       machine.succeed("test -e /dev/fuse")
 
       with subtest("/run/wrappers/bin/fusermount3 is defused's, and not setuid"):
@@ -96,7 +79,7 @@ pkgs.testers.nixosTest {
               )
 
       with subtest("a libfuse filesystem mounts through defused under no_new_privs"):
-          machine.succeed("install -d -o alice -g users /home/alice/lower /home/alice/mnt")
+          mkmnt(machine, "/home/alice/lower", "/home/alice/mnt")
           machine.succeed("echo hello > /home/alice/lower/file && chown alice:users /home/alice/lower/file")
           # setpriv: libfuse's own setuid helper would fail here with EPERM.
           machine.succeed(
@@ -104,7 +87,7 @@ pkgs.testers.nixosTest {
               "${pkgs.fuse-overlayfs}/bin/fuse-overlayfs "
               "-o lowerdir=/home/alice/lower /home/alice/mnt"
           )
-          line = machine.succeed("grep -F ' /home/alice/mnt ' /proc/self/mountinfo").strip()
+          line = mounted(machine, "/home/alice/mnt")
           print(line)
           assert " - fuse.fuse-overlayfs " in line, line
           assert "nosuid" in line and "nodev" in line, line
@@ -112,12 +95,12 @@ pkgs.testers.nixosTest {
           machine.succeed("journalctl -u 'defused@*' --no-pager | grep -F defused")
 
       with subtest("a libfuse2 filesystem mounts through defused as well"):
-          machine.succeed("install -d -o alice -g users /home/alice/mnt2")
+          mkmnt(machine, "/home/alice/mnt2")
           machine.succeed(
               "timeout 45s runuser -u alice -- setpriv --no-new-privs -- "
               "${fuse2Hello}/bin/fuse2-hello /home/alice/mnt2"
           )
-          line = machine.succeed("grep -F ' /home/alice/mnt2 ' /proc/self/mountinfo").strip()
+          line = mounted(machine, "/home/alice/mnt2")
           print(line)
           # libfuse2's fuse_main() derives subtype= from the program name.
           assert " - fuse.fuse2-hello " in line, line
@@ -130,22 +113,17 @@ pkgs.testers.nixosTest {
               "timeout 45s runuser -u alice -- setpriv --no-new-privs -- "
               "/run/wrappers/bin/fusermount -u /home/alice/mnt2"
           )
-          machine.wait_until_succeeds("! grep -F ' /home/alice/mnt2 ' /proc/self/mountinfo")
+          wait_unmounted(machine, "/home/alice/mnt2")
 
       with subtest("but allow_other still needs --allow-other"):
-          machine.succeed("install -d -o alice -g users /home/alice/mnt-other")
-          machine.succeed(
-              "timeout 45s runuser -u alice -- "
-              "${pkgs.python3}/bin/python3 ${mountHelper} "
-              "expect-failure /home/alice/mnt-other allow_other "
-              "'not allowed by the defused service'"
-          )
+          mkmnt(machine, "/home/alice/mnt-other")
+          refuse(machine, "/home/alice/mnt-other", "allow_other")
 
       with subtest("and unmounts through it"):
           machine.succeed(
               "timeout 45s runuser -u alice -- setpriv --no-new-privs -- "
               "/run/wrappers/bin/fusermount3 -u /home/alice/mnt"
           )
-          machine.wait_until_succeeds("! grep -F ' /home/alice/mnt ' /proc/self/mountinfo")
+          wait_unmounted(machine, "/home/alice/mnt")
     '';
 }

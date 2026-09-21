@@ -15,6 +15,15 @@ let
   cfg = config.services.defused;
   package = cfg.package;
 
+  # Granted and bounded alike: the service needs exactly these, and nothing
+  # it execs should be able to regain more.
+  capabilities = [
+    "CAP_DAC_READ_SEARCH"
+    "CAP_SYS_ADMIN"
+    "CAP_SYS_CHROOT"
+    "CAP_SYS_PTRACE"
+  ];
+
   # The same binary under either libfuse's helper name, unprivileged: the
   # wrapper is only here to take over the path libfuse execs.
   mkWrapper = name: {
@@ -110,18 +119,24 @@ in
     ];
 
     warnings =
-      lib.optional (config.programs.fuse.enable && !cfg.replaceFusermount3) ''
-        services.defused.replaceFusermount3 is off while programs.fuse is on,
-        so /run/wrappers/bin/fusermount3 is libfuse's setuid helper and FUSE
-        programs use it instead of defused. Programs started with
-        no_new_privs still cannot mount.
-      ''
-      ++ lib.optional (config.programs.fuse.enable && !cfg.replaceFusermount) ''
-        services.defused.replaceFusermount is off while programs.fuse is on,
-        so /run/wrappers/bin/fusermount is libfuse2's setuid helper and
-        libfuse2 filesystems use it instead of defused. Programs started
-        with no_new_privs still cannot mount.
-      ''
+      # One per helper defused was told not to take over while programs.fuse
+      # still defines it as a setuid wrapper.
+      lib.flatten (
+        lib.mapAttrsToList
+          (
+            option: helper:
+            lib.optional (config.programs.fuse.enable && !cfg.${option}) ''
+              services.defused.${option} is off while programs.fuse is on, so
+              /run/wrappers/bin/${helper} is libfuse's setuid helper and the
+              programs looking there use it instead of defused. Programs
+              started with no_new_privs still cannot mount.
+            ''
+          )
+          {
+            replaceFusermount3 = "fusermount3";
+            replaceFusermount = "fusermount";
+          }
+      )
       ++
         lib.optional
           (
@@ -183,18 +198,8 @@ in
           ++ lib.optional cfg.allowOther "--allow-other"
           ++ cfg.extraArgs
         );
-        AmbientCapabilities = [
-          "CAP_DAC_READ_SEARCH"
-          "CAP_SYS_ADMIN"
-          "CAP_SYS_CHROOT"
-          "CAP_SYS_PTRACE"
-        ];
-        CapabilityBoundingSet = [
-          "CAP_DAC_READ_SEARCH"
-          "CAP_SYS_ADMIN"
-          "CAP_SYS_CHROOT"
-          "CAP_SYS_PTRACE"
-        ];
+        AmbientCapabilities = capabilities;
+        CapabilityBoundingSet = capabilities;
         NoNewPrivileges = true;
         AppArmorProfile = if config.security.apparmor.enable then "defused" else "-defused";
 

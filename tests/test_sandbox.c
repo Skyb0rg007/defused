@@ -6,7 +6,7 @@
 #define _GNU_SOURCE
 #include "common.h"
 #include "defused-sandbox.h"
-#include "test_timeout.h"
+#include "test_util.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -15,16 +15,6 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
-static int failures;
-
-#define CHECK(expr)                                                            \
-    do {                                                                       \
-        if (!(expr)) {                                                         \
-            fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #expr);    \
-            failures++;                                                        \
-        }                                                                      \
-    } while (0)
 
 struct filter_result {
     int install_ret;
@@ -48,9 +38,6 @@ static int read_full(int fd, void *buf, size_t size) {
     }
     return 0;
 }
-
-/* Meson reads 77 as a skip. */
-#define MESON_EXIT_SKIP 77
 
 /* Probes in a child so the filter never lands on the test process. */
 static int seccomp_available(void) {

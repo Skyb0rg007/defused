@@ -2,43 +2,22 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-{
-  self,
-  pkgs,
-  package,
-  variant,
-  kernelPackages,
-}:
+{ common, ... }:
 
-let
-  common = import ./common.nix {
-    inherit
-      self
-      pkgs
-      package
-      kernelPackages
-      ;
-  };
-in
-pkgs.testers.nixosTest {
-  name = "defused-file-mountpoint-${variant}-${kernelPackages.kernel.version}";
+common.mkTest {
+  name = "file-mountpoint";
 
-  nodes.machine = common.baseNode;
-
-  testScript = ''
-    start_all()
-
-    machine.wait_for_unit("multi-user.target")
-    machine.wait_for_unit("defused.socket")
+  script = ''
+    boot(machine)
     machine.succeed("test -e /dev/fuse")
     machine.succeed("install -o alice -g users -m 0600 /dev/null /home/alice/file-mnt")
 
-    machine.succeed(
-        "timeout 45s runuser -u alice -- "
-        "${pkgs.python3}/bin/python3 ${common.mountHelper} "
-        "assert-mount /home/alice/file-mnt "
-        "'fsname=filefs,subtype=file' "
-        "' /home/alice/file-mnt ' ' - fuse.file filefs '"
+    mount(
+        machine,
+        "/home/alice/file-mnt",
+        "fsname=filefs,subtype=file",
+        " /home/alice/file-mnt ",
+        " - fuse.file filefs ",
     )
   '';
 }

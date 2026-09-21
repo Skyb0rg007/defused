@@ -17,8 +17,16 @@
     { self, nixpkgs }:
     let
       inherit (nixpkgs) lib;
-      systems = lib.platforms.linux;
-      forAllSystems = lib.genAttrs systems;
+      # Each output body takes the platform it is being built for.
+      forAllSystems =
+        f:
+        lib.genAttrs lib.platforms.linux (
+          system:
+          f {
+            inherit system;
+            pkgs = nixpkgs.legacyPackages.${system};
+          }
+        );
       src = lib.fileset.toSource {
         root = ./.;
         fileset = lib.fileset.gitTracked ./.;
@@ -102,10 +110,7 @@
       };
 
       checks = forAllSystems (
-        system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
-        in
+        { system, pkgs }:
         (import ./packaging/nixos/tests {
           inherit self pkgs system;
         })
@@ -123,10 +128,7 @@
       );
 
       packages = forAllSystems (
-        system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
-        in
+        { system, pkgs }:
         {
           default = self.packages.${system}.defused;
           defused = mkDefused pkgs;
@@ -140,10 +142,7 @@
       );
 
       devShells = forAllSystems (
-        system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
-        in
+        { system, pkgs }:
         {
           default = pkgs.mkShell {
             inputsFrom = [

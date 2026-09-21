@@ -2,27 +2,13 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-{
-  self,
-  pkgs,
-  package,
-  variant,
-  kernelPackages,
-}:
+{ common, ... }:
 
 let
-  common = import ./common.nix {
-    inherit
-      self
-      pkgs
-      package
-      kernelPackages
-      ;
-  };
-  inherit (common) mountHelper;
+  inherit (common) package;
 in
-pkgs.testers.nixosTest {
-  name = "defused-privileged-${variant}-${kernelPackages.kernel.version}";
+common.mkTest {
+  name = "privileged";
 
   # Deliberately not common.baseNode, and not services.defused.enable: a
   # caller that is root or holds CAP_SYS_ADMIN gets a `defused --child`
@@ -31,7 +17,7 @@ pkgs.testers.nixosTest {
   nodes.machine =
     { ... }:
     {
-      boot.kernelPackages = kernelPackages;
+      boot.kernelPackages = common.kernelPackages;
       boot.kernelModules = [ "fuse" ];
 
       environment.systemPackages = [ package ];
@@ -42,60 +28,41 @@ pkgs.testers.nixosTest {
       };
     };
 
-  testScript = ''
-    start_all()
-
-    machine.wait_for_unit("multi-user.target")
+  script = ''
+    boot(machine, socket=False)
 
     machine.fail("test -e /run/defused/defused.sock")
     machine.succeed("test -x ${package}/lib/defused/defused")
 
-    helper = "timeout 45s ${pkgs.python3}/bin/python3 ${mountHelper} "
-
     with subtest("root mounts and unmounts without the service"):
         machine.succeed("install -d /root/mnt")
-        machine.succeed(
-            helper + "assert-mount /root/mnt __empty__ "
-            "' - fuse fuse ' rw nosuid nodev user_id=0 group_id=0"
+        mount(
+            machine, "/root/mnt", "__empty__",
+            " - fuse fuse ", "rw", "nosuid", "nodev", "user_id=0", "group_id=0",
+            run="",
         )
-        machine.succeed(helper + "assert-unmount /root/mnt __empty__")
+        mount_unmount(machine, "/root/mnt", run="")
 
     with subtest("privileged options need no service policy"):
-        machine.succeed(
-            helper + "assert-mount /root/mnt allow_other "
-            "' - fuse fuse ' allow_other"
-        )
+        mount(machine, "/root/mnt", "allow_other", " - fuse fuse ", "allow_other", run="")
 
     with subtest("suid, dev and blkdev work like libfuse's root path"):
-        machine.succeed(
-            helper + "assert-mount /root/mnt suid ' - fuse fuse ' rw '!nosuid'"
-        )
-        machine.succeed(
-            helper + "assert-mount /root/mnt dev ' - fuse fuse ' rw '!nodev'"
-        )
+        mount(machine, "/root/mnt", "suid", " - fuse fuse ", "rw", "!nosuid", run="")
+        mount(machine, "/root/mnt", "dev", " - fuse fuse ", "rw", "!nodev", run="")
         machine.succeed("truncate -s 1M /root/blk.img")
         dev = machine.succeed("losetup -f --show /root/blk.img").strip()
-        machine.succeed(
-            helper + f"assert-mount /root/mnt blkdev,fsname={dev} "
-            f"' - fuseblk {dev} ' rw"
-        )
+        mount(machine, "/root/mnt", f"blkdev,fsname={dev}", f" - fuseblk {dev} ", "rw", run="")
         machine.succeed(f"losetup -d {dev}")
 
     with subtest("the mountpoint need not be owned by the caller"):
-        machine.succeed("install -d -o alice -g users /home/alice/mnt")
-        machine.succeed(
-            helper + "assert-mount /home/alice/mnt fsname=alicefs "
-            "' - fuse alicefs ' user_id=0"
-        )
+        mkmnt(machine, "/home/alice/mnt")
+        mount(machine, "/home/alice/mnt", "fsname=alicefs", " - fuse alicefs ", "user_id=0", run="")
 
     with subtest("the mountpoint's filesystem type is not restricted"):
         # cgroup2 is not in the allowlist the service applies to
         # unprivileged callers (check_nonroot_fstype() in util.c).
         machine.succeed("mkdir /sys/fs/cgroup/defused-test")
-        machine.succeed(
-            helper + "assert-mount /sys/fs/cgroup/defused-test __empty__ "
-            "' - fuse fuse '"
-        )
+        mount(machine, "/sys/fs/cgroup/defused-test", "__empty__", " - fuse fuse ", run="")
         machine.succeed("rmdir /sys/fs/cgroup/defused-test")
 
     with subtest("unmounting a non-mount is still refused"):
@@ -107,13 +74,12 @@ pkgs.testers.nixosTest {
 
     with subtest("CAP_SYS_ADMIN without uid 0 takes the same path"):
         uid = machine.succeed("id -u alice").strip()
-        machine.succeed("install -d -o alice -g users /home/alice/mnt-cap")
-        machine.succeed(
-            "timeout 45s setpriv --reuid=alice --regid=users --init-groups "
-            "--inh-caps=+sys_admin --ambient-caps=+sys_admin -- "
-            "${pkgs.python3}/bin/python3 ${mountHelper} "
-            "assert-mount /home/alice/mnt-cap __empty__ "
-            f"' - fuse fuse ' user_id={uid} group_id="
+        mkmnt(machine, "/home/alice/mnt-cap")
+        mount(
+            machine, "/home/alice/mnt-cap", "__empty__",
+            " - fuse fuse ", f"user_id={uid}", "group_id=",
+            run="setpriv --reuid=alice --regid=users --init-groups "
+                "--inh-caps=+sys_admin --ambient-caps=+sys_admin --",
         )
 
     with subtest("no service ever ran"):

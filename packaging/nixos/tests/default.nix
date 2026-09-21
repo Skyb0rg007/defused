@@ -25,19 +25,19 @@ let
     musl-static = self.packages.${system}.defused-static;
   };
 
-  tests = {
-    simple = ./simple.nix;
-    daemon = ./daemon.nix;
-    mount-namespace = ./mount-namespace.nix;
-    mountpoint-ownership = ./mountpoint-ownership.nix;
-    mount-options = ./mount-options.nix;
-    file-mountpoint = ./file-mountpoint.nix;
-    non-lazy-unmount = ./non-lazy-unmount.nix;
-    policy = ./policy.nix;
-    apparmor = ./apparmor.nix;
-    privileged = ./privileged.nix;
-    desktop = ./desktop.nix;
-  };
+  tests = [
+    "simple"
+    "daemon"
+    "mount-namespace"
+    "mountpoint-ownership"
+    "mount-options"
+    "file-mountpoint"
+    "non-lazy-unmount"
+    "policy"
+    "apparmor"
+    "privileged"
+    "desktop"
+  ];
 
   # "linux-6_12": stable across point releases.
   kernelSuffix =
@@ -53,17 +53,20 @@ lib.listToAttrs (
       map (
         kernelPackages:
         lib.nameValuePair "${name}-${variant}-${kernelSuffix kernelPackages}" (
-          import tests.${name} {
-            inherit
-              self
-              pkgs
-              variant
-              kernelPackages
-              ;
-            package = variants.${variant};
+          import (./. + "/${name}.nix") {
+            inherit self pkgs;
+            common = import ./common.nix {
+              inherit
+                self
+                pkgs
+                variant
+                kernelPackages
+                ;
+              package = variants.${variant};
+            };
           }
         )
       ) kernels
     ) (lib.attrNames variants)
-  ) (lib.attrNames tests)
+  ) tests
 )

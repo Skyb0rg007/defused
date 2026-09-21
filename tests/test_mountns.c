@@ -35,7 +35,7 @@
 #define _GNU_SOURCE
 #include "common.h"
 #include "defused_proto.h"
-#include "test_timeout.h"
+#include "test_util.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -54,16 +54,6 @@
 #include <systemd/sd-json.h>
 #include <systemd/sd-varlink.h>
 #include <unistd.h>
-
-static int failures;
-
-#define CHECK(cond)                                                            \
-    do {                                                                       \
-        if (!(cond)) {                                                         \
-            fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);    \
-            failures++;                                                        \
-        }                                                                      \
-    } while (0)
 
 /* Maps the calling process to uid/gid 0 inside the user namespace it just
  * unshare(CLONE_NEWUSER)'d into -- the standard rootless-container dance.
@@ -202,6 +192,28 @@ static int connect_addr(const struct sockaddr_un *sa, socklen_t len) {
     return TAKE_FD(fd);
 }
 
+/* The client side of both tests: connect, send the unmount request, and exit
+ * 0 only if the service answered with one of the two errors that mean it
+ * looked at the real mount in the client's namespace. Anything else -- a
+ * success, or an error raised before the namespace was reached -- fails.
+ * Never returns; it always runs in a forked client process. */
+static void run_client_and_exit(const struct sockaddr_un *sa, socklen_t salen,
+                                const char *who) {
+    int client_sock = connect_addr(sa, salen);
+    if (client_sock < 0)
+        _exit(1);
+
+    struct defused_error err;
+    int ret = send_non_fuse_umount_request(client_sock, &err);
+    bool ok = ret == 0 && (!strcmp(err.id, DEFUSED_ERROR_NOT_A_FUSE_MOUNT) ||
+                           !strcmp(err.id, DEFUSED_ERROR_UNMOUNT_FAILED));
+    if (!ok)
+        fprintf(stderr, "%s: got %s, expected %s or %s\n", who,
+                err.id[0] ? err.id : "a successful reply",
+                DEFUSED_ERROR_NOT_A_FUSE_MOUNT, DEFUSED_ERROR_UNMOUNT_FAILED);
+    _exit(ok ? 0 : 1);
+}
+
 /* A client that dies before connecting would otherwise leave accept()
  * blocked for the rest of the test. */
 static int accept_client(int listen_fd) {
@@ -293,16 +305,7 @@ static int test_can_join(const char *defused_path) {
                 perror("unshare(NEWNS)");
                 _exit(1);
             }
-            int client_sock = connect_addr(&sa, salen);
-            if (client_sock < 0)
-                _exit(1);
-            struct defused_error err;
-            int ret = send_non_fuse_umount_request(client_sock, &err);
-            _exit(ret == 0 &&
-                          (!strcmp(err.id, DEFUSED_ERROR_NOT_A_FUSE_MOUNT) ||
-                           !strcmp(err.id, DEFUSED_ERROR_UNMOUNT_FAILED))
-                      ? 0
-                      : 1);
+            run_client_and_exit(&sa, salen, "test_can_join");
         }
 
         _cleanup_close_ int conn = accept_client(listen_fd);
@@ -322,7 +325,7 @@ static int test_can_join(const char *defused_path) {
         waitpid(defused_pid, &defused_status, 0);
 
         char byte = ok ? 1 : 0;
-        write(result_pipe[1], &byte, 1);
+        (void)!write(result_pipe[1], &byte, 1);
         result_pipe[1] = safe_close(result_pipe[1]);
         _exit(0);
     }
@@ -367,20 +370,7 @@ static int test_cannot_join(const char *defused_path) {
             perror("map root");
             _exit(1);
         }
-        int client_sock = connect_addr(&sa, salen);
-        if (client_sock < 0)
-            _exit(1);
-        struct defused_error err;
-        int ret = send_non_fuse_umount_request(client_sock, &err);
-        bool accepted =
-            ret == 0 && (!strcmp(err.id, DEFUSED_ERROR_UNMOUNT_FAILED) ||
-                         !strcmp(err.id, DEFUSED_ERROR_NOT_A_FUSE_MOUNT));
-        if (!accepted)
-            fprintf(stderr, "test_cannot_join: got %s, expected %s or %s\n",
-                    err.id[0] ? err.id : "a successful reply",
-                    DEFUSED_ERROR_UNMOUNT_FAILED,
-                    DEFUSED_ERROR_NOT_A_FUSE_MOUNT);
-        _exit(accepted ? 0 : 1);
+        run_client_and_exit(&sa, salen, "test_cannot_join");
     }
 
     _cleanup_close_ int conn = accept_client(listen_fd);
@@ -407,9 +397,6 @@ static int test_cannot_join(const char *defused_path) {
                 "a client from an unrelated mount namespace\n");
     return failures ? -EINVAL : 0;
 }
-
-/* Meson reads 77 as a skip. */
-#define MESON_EXIT_SKIP 77
 
 /* Both tests below need a nested user namespace they can map themselves
  * root in; under AppArmor's unprivileged-userns restriction the unshare()

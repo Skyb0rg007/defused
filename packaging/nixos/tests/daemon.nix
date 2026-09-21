@@ -2,38 +2,25 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-{
-  self,
-  pkgs,
-  package,
-  variant,
-  kernelPackages,
-}:
+{ pkgs, common, ... }:
 
 let
-  common = import ./common.nix {
-    inherit
-      self
-      pkgs
-      package
-      kernelPackages
-      ;
-  };
+  inherit (common) package kernelVersion;
+  # user.* xattrs on socket inodes need Linux >= 7.0.
+  socketXattrSupported = pkgs.lib.versionAtLeast kernelVersion "7.0";
 in
-pkgs.testers.nixosTest {
-  name = "defused-daemon-${variant}-${kernelPackages.kernel.version}";
+common.mkTest {
+  name = "daemon";
 
-  # This test deliberately does not use services.defused.enable (see
-  # common.nix's baseNode) -- the whole point of --daemon is running without
-  # systemd Accept=yes socket activation, so the unit here is a plain,
+  # Deliberately not common.baseNode: the whole point of --daemon is running
+  # without systemd Accept=yes socket activation, so the unit here is a plain,
   # always-running service that execs `defused --daemon` directly.
-  # RuntimeDirectory= is still required: --daemon does not create
-  # /run/defused itself, it just binds a socket inside a directory that
-  # must already exist.
+  # RuntimeDirectory= is still required: --daemon does not create /run/defused
+  # itself, it just binds a socket inside a directory that must already exist.
   nodes.machine =
     { ... }:
     {
-      boot.kernelPackages = kernelPackages;
+      boot.kernelPackages = common.kernelPackages;
       boot.kernelModules = [ "fuse" ];
 
       environment.systemPackages = [
@@ -57,72 +44,70 @@ pkgs.testers.nixosTest {
       };
     };
 
-  testScript =
-    { nodes, ... }:
-    let
-      kernelVersion = nodes.machine.boot.kernelPackages.kernel.version;
-      # user.* xattrs on socket inodes need Linux >= 7.0.
-      socketXattrSupported = pkgs.lib.versionAtLeast kernelVersion "7.0";
-    in
-    ''
-      start_all()
+  script = ''
+    boot(machine, socket=False)
+    machine.wait_for_unit("defused.service")
+    machine.wait_for_file("/run/defused/defused.sock")
 
-      machine.wait_for_unit("multi-user.target")
-      machine.wait_for_unit("defused.service")
-      machine.wait_for_file("/run/defused/defused.sock")
+    # No socket unit is involved in --daemon mode.
+    machine.fail("systemctl status defused.socket")
 
-      # No socket unit is involved in --daemon mode.
-      machine.fail("systemctl status defused.socket")
+    machine.succeed(
+        "grep '^ExecStart=' /etc/systemd/system/defused.service | "
+        "grep -F '${package}/lib/defused/defused --daemon'"
+    )
 
-      machine.succeed(
-          "grep '^ExecStart=' /etc/systemd/system/defused.service | "
-          "grep -F '${package}/lib/defused/defused --daemon'"
-      )
+    # --daemon binds the socket 0666 itself, unlike systemd's Accept=yes
+    # (mode 0644) -- see issue #3. wait_until_succeeds rather than succeed:
+    # bind() and chmod() are separate syscalls in create_listening_socket(),
+    # so wait_for_file above can observe the socket a moment before its mode
+    # is updated.
+    machine.wait_until_succeeds(
+        "stat -c '%a' /run/defused/defused.sock | grep -qx 666"
+    )
 
-      # --daemon binds the socket 0666 itself, unlike systemd's Accept=yes
-      # (mode 0644) -- see issue #3. wait_until_succeeds rather than succeed:
-      # bind() and chmod() are separate syscalls in create_listening_socket(),
-      # so wait_for_file above can observe the socket a moment before its mode
-      # is updated.
-      machine.wait_until_succeeds(
-          "stat -c '%a' /run/defused/defused.sock | grep -qx 666"
-      )
+    # This VM runs kernel ${kernelVersion}.
+    ${
+      if socketXattrSupported then
+        ''
+          machine.wait_until_succeeds(
+              "getfattr --only-values -n user.varlink /run/defused/defused.sock | "
+              "grep -qx entrypoint"
+          )
+        ''
+      else
+        ''
+          # setxattr() failed with EPERM; the daemon must have carried on.
+          machine.fail("getfattr -n user.varlink /run/defused/defused.sock")
+        ''
+    }
+    machine.succeed("test -e /dev/fuse")
+    mkmnt(machine, "/home/alice/daemon-mnt-a", "/home/alice/daemon-mnt-b")
 
-      # This VM runs kernel ${kernelVersion}.
-      ${
-        if socketXattrSupported then
-          ''
-            machine.wait_until_succeeds(
-                "getfattr --only-values -n user.varlink /run/defused/defused.sock | "
-                "grep -qx entrypoint"
-            )
-          ''
-        else
-          ''
-            # setxattr() failed with EPERM; the daemon must have carried on.
-            machine.fail("getfattr -n user.varlink /run/defused/defused.sock")
-          ''
-      }
+    mount(
+        machine,
+        "/home/alice/daemon-mnt-a",
+        "__empty__",
+        " - fuse fuse ",
+        "rw",
+        "nosuid",
+        "nodev",
+        "user_id=",
+        "group_id=",
+    )
+    mount(
+        machine,
+        "/home/alice/daemon-mnt-b",
+        "fsname=daemonfs,subtype=daemon",
+        " - fuse.daemon daemonfs ",
+        "rw",
+        "nosuid",
+        "nodev",
+        "user_id=",
+        "group_id=",
+    )
 
-      machine.succeed("test -e /dev/fuse")
-      machine.succeed("install -d -o alice -g users /home/alice/daemon-mnt-a")
-      machine.succeed("install -d -o alice -g users /home/alice/daemon-mnt-b")
-
-      machine.succeed(
-          "timeout 45s runuser -u alice -- "
-          "${pkgs.python3}/bin/python3 ${common.mountHelper} "
-          "assert-mount /home/alice/daemon-mnt-a __empty__ "
-          "' - fuse fuse ' rw nosuid nodev user_id= group_id="
-      )
-      machine.succeed(
-          "timeout 45s runuser -u alice -- "
-          "${pkgs.python3}/bin/python3 ${common.mountHelper} "
-          "assert-mount /home/alice/daemon-mnt-b "
-          "'fsname=daemonfs,subtype=daemon' "
-          "' - fuse.daemon daemonfs ' rw nosuid nodev user_id= group_id="
-      )
-
-      machine.succeed("systemctl is-active defused.service")
-      machine.succeed("journalctl -u defused.service --no-pager | grep -F defused")
-    '';
+    machine.succeed("systemctl is-active defused.service")
+    machine.succeed("journalctl -u defused.service --no-pager | grep -F defused")
+  '';
 }

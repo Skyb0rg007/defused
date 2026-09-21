@@ -2,58 +2,31 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-{
-  self,
-  pkgs,
-  package,
-  variant,
-  kernelPackages,
-}:
+{ common, ... }:
 
-pkgs.testers.nixosTest {
-  name = "defused-${variant}-${kernelPackages.kernel.version}";
+common.mkTest {
+  name = "simple";
 
-  nodes.machine =
-    { ... }:
-    {
-      imports = [ self.nixosModules.defused ];
-
-      boot.kernelPackages = kernelPackages;
-
-      services.defused = {
-        enable = true;
-        package = package;
-      };
-
-      users.users.alice = {
-        isNormalUser = true;
-        createHome = true;
-      };
-    };
-
-  testScript = ''
-    start_all()
-
-    machine.wait_for_unit("multi-user.target")
-    machine.wait_for_unit("defused.socket")
+  script = ''
+    boot(machine)
 
     machine.succeed("test -S /run/defused/defused.sock")
-    machine.succeed("test -x ${package}/lib/defused/defused")
-    machine.succeed("test -x ${package}/bin/fusermount3")
+    machine.succeed("test -x ${common.package}/lib/defused/defused")
+    machine.succeed("test -x ${common.package}/bin/fusermount3")
 
     machine.succeed(
         "grep '^ExecStart=' /etc/systemd/system/defused@.service | "
-        "grep -F '${package}/lib/defused/defused'"
+        "grep -F '${common.package}/lib/defused/defused'"
     )
 
     machine.succeed(
-        "su - alice -c '${package}/bin/fusermount3 -V' | "
+        "su - alice -c '${common.package}/bin/fusermount3 -V' | "
         "grep -F 'fusermount3 version:' | grep -F '(defused)'"
     )
 
-    machine.succeed("install -d -o alice -g users /home/alice/mnt")
+    mkmnt(machine, "/home/alice/mnt")
     status, output = machine.execute(
-        "su - alice -c '${package}/bin/fusermount3 -u /home/alice/mnt' 2>&1"
+        "su - alice -c '${common.package}/bin/fusermount3 -u /home/alice/mnt' 2>&1"
     )
     assert status != 0, "unmounting a non-FUSE directory unexpectedly succeeded"
     assert "is not a FUSE mount" in output, output
