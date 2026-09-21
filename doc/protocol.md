@@ -212,6 +212,14 @@ For unmounts, the child can additionally `fchdir()` to the parent directory,
 `name_to_handle_at()` `name` under it, and call `umount2()`.
 Both may `write()` their result back and exit.
 
+The filter pins every argument of all of those, not just the syscall numbers:
+each rule is an equality test against the exact descriptor, pointer and flag
+word the child is about to pass.
+seccomp-bpf cannot dereference pointers, so the child first copies its one
+path argument into an anonymous mapping and `mprotect()`s it read-only, and
+takes the kernel's output buffers from a second mapping.
+`mprotect()` is not on the allowlist, so those addresses are fixed for the
+child's life, and comparing them by value is as good as comparing the strings.
 The post-`setns()` code uses explicit syscall wrappers so the filter's
 allowlist fully describes its possible kernel interface.
 

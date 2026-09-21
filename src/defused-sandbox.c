@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -38,29 +39,138 @@
 #include <linux/fcntl.h>
 #include <linux/pidfd.h>
 
+DEFINE_TRIVIAL_CLEANUP_FUNC(scmp_filter_ctx, seccomp_release);
+
 /* AT_EMPTY_PATH asks about a directory fd itself. Without
  * AT_SYMLINK_FOLLOW a final symlink is never followed. */
 #define SANDBOX_HANDLE_FLAGS                                                   \
     (AT_EMPTY_PATH | AT_HANDLE_FID | AT_HANDLE_MNT_ID_UNIQUE)
+#define SANDBOX_MOVE_MOUNT_FLAGS                                               \
+    (MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH)
 
-DEFINE_TRIVIAL_CLEANUP_FUNC(scmp_filter_ctx, seccomp_release);
+struct sandbox_result {
+    struct defused_error err;
+    int32_t ret;
+};
 
-/* After setns() the filesystem is the client's; this is loaded before it.
- * Anything else fails with EPERM. */
-static int install_seccomp(enum defused_op op) {
-    static const struct {
+/* struct file_handle ends in a flexible array member, so it cannot be a
+ * member of anything else. The same layout, at the largest size. */
+struct sandbox_handle {
+    unsigned int handle_bytes;
+    int handle_type;
+    unsigned char f_handle[MAX_HANDLE_SZ];
+};
+_Static_assert(offsetof(struct sandbox_handle, f_handle) ==
+                   sizeof(struct file_handle),
+               "struct sandbox_handle must match struct file_handle");
+
+/* The child's writable pinned memory, kept out of the strings' mapping so
+ * that one can stay read-only. */
+struct sandbox_buf {
+    struct sandbox_handle handle;
+    uint64_t mnt_id;
+    struct sandbox_result result;
+};
+
+/* move_mount()'s empty path: one const object, so it sits in .rodata at a
+ * fixed address and the filter rule and the call site cannot differ. */
+static const char sandbox_empty[] = "";
+
+/* The read-only mapping a request-supplied path needs; sandbox_empty
+ * needs none. */
+struct sandbox_strings {
+    char path[DEFUSED_MAX_FILENAME];
+};
+
+/* exit_group() ends the process; the loop only keeps this noreturn. */
+static __attribute__((__noreturn__)) void sandbox_exit(int status) {
+    sys_exit_group(status);
+    for (;;)
+        sys_exit(status);
+}
+
+/* statx() would call fuse_getattr(), which refuses a non-empty request
+ * from anyone but the mount's user_id, root included. AT_HANDLE_FID
+ * encodes on any filesystem; buf is the child's pinned scratch. */
+static int sandbox_mnt_id(int dir_fd, const char *name, struct sandbox_buf *buf,
+                          uint64_t *out_id) {
+    buf->handle.handle_bytes = MAX_HANDLE_SZ;
+    if (sys_name_to_handle_at(dir_fd, name, &buf->handle, &buf->mnt_id,
+                              SANDBOX_HANDLE_FLAGS) == -1)
+        return -errno;
+    *out_id = buf->mnt_id;
+    return 0;
+}
+
+int defused_mnt_id(int dir_fd, const char *name, uint64_t *out_id) {
+    struct sandbox_buf buf;
+    return sandbox_mnt_id(dir_fd, name, &buf, out_id);
+}
+
+/* Maps the path read-only and the scratch writable, at the addresses
+ * install_seccomp() pins. mprotect() is not allowed, so the path cannot be
+ * rewritten once the filter is up. */
+static int pin_job_memory(struct sandbox_job *job) {
+    if (job->path != sandbox_empty) {
+        struct sandbox_strings *s =
+            mmap(NULL, sizeof(*s), PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (s == MAP_FAILED)
+            return -errno;
+        size_t len = strlen(job->path);
+        if (len >= sizeof(s->path))
+            return -ENAMETOOLONG;
+        memcpy(s->path, job->path, len + 1);
+        /* mprotect() rounds up to the whole page mmap() handed out. */
+        if (mprotect(s, sizeof(*s), PROT_READ) == -1)
+            return -errno;
+        job->path = s->path;
+    }
+
+    void *buf = mmap(NULL, sizeof(*job->buf), PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (buf == MAP_FAILED)
+        return -errno;
+    job->buf = buf;
+    return 0;
+}
+
+#define ARG(n, v) {(n), SCMP_CMP_EQ, (scmp_datum_t)(long)(v), 0}
+
+/* Each rule pins every argument of the one call the child will make, so an
+ * allowed syscall cannot be aimed elsewhere. Anything else is EPERM. */
+static int install_seccomp(const struct sandbox_job *job) {
+    const struct sandbox_buf *buf = job->buf;
+    const struct {
         int nr;
         int only; /* 0: both operations */
+        unsigned int nargs;
+        struct scmp_arg_cmp args[5];
     } rules[] = {
-        {SCMP_SYS(write), 0},
-        {SCMP_SYS(exit), 0},
-        {SCMP_SYS(exit_group), 0},
-        {SCMP_SYS(setns), 0},
-        {SCMP_SYS(rt_sigreturn), 0},
-        {SCMP_SYS(move_mount), DEFUSED_OP_MOUNT},
-        {SCMP_SYS(fchdir), DEFUSED_OP_UNMOUNT},
-        {SCMP_SYS(name_to_handle_at), DEFUSED_OP_UNMOUNT},
-        {SCMP_SYS(umount2), DEFUSED_OP_UNMOUNT},
+        {SCMP_SYS(rt_sigreturn), 0, 0, {{0}}},
+        {SCMP_SYS(exit), 0, 0, {{0}}},
+        {SCMP_SYS(exit_group), 0, 0, {{0}}},
+        {SCMP_SYS(write),
+         0,
+         3,
+         {ARG(0, job->pipe_fd), ARG(1, &buf->result),
+          ARG(2, sizeof(buf->result))}},
+        {SCMP_SYS(setns), 0, 2, {ARG(0, job->pidfd), ARG(1, CLONE_NEWNS)}},
+        {SCMP_SYS(move_mount),
+         DEFUSED_OP_MOUNT,
+         5,
+         {ARG(0, job->mountfd), ARG(1, job->path), ARG(2, job->mnt_fd),
+          ARG(3, job->path), ARG(4, SANDBOX_MOVE_MOUNT_FLAGS)}},
+        {SCMP_SYS(fchdir), DEFUSED_OP_UNMOUNT, 1, {ARG(0, job->parent_fd)}},
+        {SCMP_SYS(name_to_handle_at),
+         DEFUSED_OP_UNMOUNT,
+         5,
+         {ARG(0, job->parent_fd), ARG(1, job->path), ARG(2, &buf->handle),
+          ARG(3, &buf->mnt_id), ARG(4, SANDBOX_HANDLE_FLAGS)}},
+        {SCMP_SYS(umount2),
+         DEFUSED_OP_UNMOUNT,
+         2,
+         {ARG(0, job->path), ARG(1, job->umount_flags)}},
     };
     /* The kernel keeps its own copy of a loaded filter. */
     _cleanup_(seccomp_releasep) scmp_filter_ctx ctx =
@@ -68,20 +178,14 @@ static int install_seccomp(enum defused_op op) {
     if (!ctx)
         return -ENOMEM;
     for (size_t i = 0; i < ARRAY_SIZE(rules); i++) {
-        if (rules[i].only && rules[i].only != (int)op)
+        if (rules[i].only && rules[i].only != (int)job->op)
             continue;
-        int ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, rules[i].nr, 0);
+        int ret = seccomp_rule_add_array(ctx, SCMP_ACT_ALLOW, rules[i].nr,
+                                         rules[i].nargs, rules[i].args);
         if (ret < 0)
             return ret;
     }
     return seccomp_load(ctx);
-}
-
-/* exit_group() ends the process; the loop only keeps this noreturn. */
-static __attribute__((__noreturn__)) void sandbox_exit(int status) {
-    sys_exit_group(status);
-    for (;;)
-        sys_exit(status);
 }
 
 /* Linux 6.13+. ENODATA, not EINVAL, for a useless reply: EINVAL means the
@@ -179,8 +283,8 @@ int defused_is_fuse_mount(uint64_t mnt_ns_id, uint64_t mnt_id, bool *out_blkdev,
         return -errno;
     if (!(buf.sm.mask & STATMOUNT_FS_TYPE))
         return -EINVAL;
-    /* A "fuse.sshfs" mount reports its subtype separately, so these are the
-     * only two spellings. */
+    /* A "fuse.sshfs" mount reports its subtype separately, so these are
+     * the only two spellings. */
     const char *fstype = buf.sm.str + buf.sm.fs_type;
     bool blkdev = strcmp(fstype, "fuseblk") == 0;
     if (!blkdev && strcmp(fstype, "fuse") != 0)
@@ -223,45 +327,12 @@ static int peer_fuse_mount_owner(int pidfd, uint64_t mnt_id, uid_t *out_uid) {
     return ret < 0 ? ret : ret == 0 ? -EINVAL : 0;
 }
 
-/* Finds the "mnt_id:" line of a /proc/self/fdinfo/<fd> text. */
-/* struct file_handle ends in a flexible array member, so it cannot be a
- * member of anything else. The same layout, at the largest size. */
-struct sandbox_handle {
-    unsigned int handle_bytes;
-    int handle_type;
-    unsigned char f_handle[MAX_HANDLE_SZ];
-};
-_Static_assert(offsetof(struct sandbox_handle, f_handle) ==
-                   sizeof(struct file_handle),
-               "struct sandbox_handle must match struct file_handle");
-
-/* statx() would call fuse_getattr(), which refuses a non-empty request
- * from anyone but the mount's user_id, root included. AT_HANDLE_FID
- * encodes on any filesystem. */
-int defused_mnt_id(int dir_fd, const char *name, uint64_t *out_id) {
-    struct sandbox_handle h = {.handle_bytes = MAX_HANDLE_SZ};
-    uint64_t id = 0;
-    if (sys_name_to_handle_at(dir_fd, name, &h, &id, SANDBOX_HANDLE_FLAGS) ==
-        -1)
-        return -errno;
-    *out_id = id;
-    return 0;
-}
-
-struct sandbox_job {
-    enum defused_op op;
-    int mountfd, mnt_fd;         /* mount */
-    int parent_fd, umount_flags; /* unmount */
-    const char *name;
-    uint64_t mnt_id;
-};
-
 /* The rest runs after setns(). detail must be a fixed string: the child
  * cannot format one. */
 static int sandbox_do_mount(const struct sandbox_job *job,
                             const char **detail) {
-    if (sys_move_mount(job->mountfd, "", job->mnt_fd, "",
-                       MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH) == 0)
+    if (sys_move_mount(job->mountfd, job->path, job->mnt_fd, job->path,
+                       SANDBOX_MOVE_MOUNT_FLAGS) == 0)
         return 0;
     *detail = "move_mount() onto the mountpoint in the client's mount "
               "namespace failed";
@@ -279,7 +350,7 @@ static int sandbox_do_unmount(const struct sandbox_job *job,
      * name_to_handle_at() holds no reference, so it cannot make the
      * non-lazy umount2() below fail with EBUSY. */
     uint64_t id = 0;
-    int ret = defused_mnt_id(job->parent_fd, job->name, &id);
+    int ret = sandbox_mnt_id(job->parent_fd, job->path, job->buf, &id);
     if (ret < 0) {
         *detail = "reading the mountpoint's mnt_id in the client's mount "
                   "namespace failed";
@@ -290,7 +361,7 @@ static int sandbox_do_unmount(const struct sandbox_job *job,
                   "and the unmount";
         return -ESTALE;
     }
-    if (sys_umount2(job->name, UMOUNT_NOFOLLOW | job->umount_flags) == -1) {
+    if (sys_umount2(job->path, job->umount_flags) == -1) {
         *detail = job->umount_flags & MNT_DETACH
                       ? "umount2(MNT_DETACH) failed"
                       : "umount2() failed -- still busy?";
@@ -299,14 +370,8 @@ static int sandbox_do_unmount(const struct sandbox_job *job,
     return 0;
 }
 
-struct sandbox_result {
-    struct defused_error err;
-    int32_t ret;
-};
-
 /* Forks the sandboxed child and returns what it reported. */
-static int run_sandboxed(const struct sandbox_job *job, int pidfd,
-                         struct defused_error *err) {
+static int run_sandboxed(struct sandbox_job *job, struct defused_error *err) {
     const char *fail_id = job->op == DEFUSED_OP_MOUNT
                               ? DEFUSED_ERROR_MOUNT_FAILED
                               : DEFUSED_ERROR_UNMOUNT_FAILED;
@@ -314,26 +379,36 @@ static int run_sandboxed(const struct sandbox_job *job, int pidfd,
     if (pipe2(pipefd, O_CLOEXEC) == -1)
         return defused_error_setf(err, fail_id, errno,
                                   "pipe2() for the sandboxed helper failed");
+    job->pipe_fd = pipefd[1];
     pid_t pid = fork();
     if (pid == -1)
         return defused_error_setf(err, fail_id, errno,
                                   "fork() of the sandboxed helper failed");
     if (pid == 0) {
-        const char *detail = "installing the sandbox seccomp filter failed";
-        int ret = install_seccomp(job->op);
+        /* Only reached before pinning, when no filter is loaded either and
+         * any write() still goes through. */
+        struct sandbox_result fallback = {0};
+        struct sandbox_result *result = &fallback;
+        const char *detail = "pinning the sandboxed helper's memory failed";
+        int ret = pin_job_memory(job);
+        if (ret == 0) {
+            result = &job->buf->result;
+            detail = "installing the sandbox seccomp filter failed";
+            ret = install_seccomp(job);
+        }
         if (ret == 0) {
             detail = "setns() into the client's mount namespace failed";
-            ret = sys_setns(pidfd, CLONE_NEWNS) == -1 ? -errno : 0;
+            ret = sys_setns(job->pidfd, CLONE_NEWNS) == -1 ? -errno : 0;
         }
         if (ret == 0)
             ret = job->op == DEFUSED_OP_MOUNT
                       ? sandbox_do_mount(job, &detail)
                       : sandbox_do_unmount(job, &detail);
-        struct sandbox_result result = {.ret = ret};
+        result->ret = ret;
         if (ret < 0)
-            defused_error_set(&result.err, fail_id, -ret, detail);
+            defused_error_set(&result->err, fail_id, -ret, detail);
         /* Under PIPE_BUF, so it arrives whole or not at all. */
-        (void)sys_write(pipefd[1], &result, sizeof(result));
+        (void)sys_write(job->pipe_fd, result, sizeof(*result));
         sandbox_exit(ret == 0 ? 0 : 1);
     }
     pipefd[1] = safe_close(pipefd[1]);
@@ -365,9 +440,12 @@ static int run_sandboxed(const struct sandbox_job *job, int pidfd,
 
 int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd,
                           struct defused_error *err) {
-    struct sandbox_job job = {
-        .op = DEFUSED_OP_MOUNT, .mountfd = mountfd, .mnt_fd = mnt_fd};
-    return run_sandboxed(&job, pidfd, err);
+    struct sandbox_job job = {.op = DEFUSED_OP_MOUNT,
+                              .pidfd = pidfd,
+                              .mountfd = mountfd,
+                              .mnt_fd = mnt_fd,
+                              .path = sandbox_empty};
+    return run_sandboxed(&job, err);
 }
 
 int defused_sandbox_unmount(int pidfd, int parent_fd, const char *name,
@@ -382,9 +460,9 @@ int defused_sandbox_unmount(int pidfd, int parent_fd, const char *name,
         defused_error_setf(
             err, DEFUSED_ERROR_NOT_A_FUSE_MOUNT, 0, "mnt_id %llu %s (%s)",
             (unsigned long long)mnt_id,
-            ret == -ENOENT   ? "is not in the caller's mount namespace"
+            ret == -ENOENT   ? "is not in the caller's mountinfo"
             : ret == -EINVAL ? "is not a FUSE mount with a user_id= option"
-                             : "could not be looked up",
+                             : "could not be read from the caller's mountinfo",
             strerror(-ret));
         return ret;
     }
@@ -399,17 +477,36 @@ int defused_sandbox_unmount(int pidfd, int parent_fd, const char *name,
 
     struct sandbox_job job = {
         .op = DEFUSED_OP_UNMOUNT,
+        .pidfd = pidfd,
         .parent_fd = parent_fd,
-        .umount_flags = lazy ? MNT_DETACH : 0,
-        .name = name,
+        .umount_flags = UMOUNT_NOFOLLOW | (lazy ? MNT_DETACH : 0),
+        .path = name,
         .mnt_id = mnt_id,
     };
-    return run_sandboxed(&job, pidfd, err);
+    return run_sandboxed(&job, err);
 }
 
 #ifdef DEFUSED_TEST
-int defused_test_install_seccomp(enum defused_op op) {
-    return install_seccomp(op);
+int defused_test_pin_job(struct sandbox_job *job) {
+    return pin_job_memory(job);
+}
+
+int defused_test_install_seccomp(const struct sandbox_job *job) {
+    return install_seccomp(job);
+}
+
+const void *defused_test_handle_buf(const struct sandbox_job *job) {
+    return &job->buf->handle;
+}
+
+const void *defused_test_handle_id(const struct sandbox_job *job) {
+    return &job->buf->mnt_id;
+}
+
+const void *defused_test_result_buf(const struct sandbox_job *job,
+                                    size_t *size) {
+    *size = sizeof(job->buf->result);
+    return &job->buf->result;
 }
 
 int defused_test_mount_opts_owner(const char *opts, uid_t *out_uid) {

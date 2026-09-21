@@ -9,6 +9,24 @@
 #include <stdint.h>
 #include <sys/types.h>
 
+/* Scratch memory the child hands the kernel, pinned where its seccomp
+ * filter expects it. Only defused-sandbox.c looks inside. */
+struct sandbox_buf;
+
+/* One operation to run inside the client's mount namespace. Every syscall
+ * argument the child will pass is here before the filter is built. */
+struct sandbox_job {
+    enum defused_op op;
+    int pidfd, pipe_fd;
+    int mountfd, mnt_fd;         /* mount */
+    int parent_fd, umount_flags; /* unmount */
+    uint64_t mnt_id;             /* unmount; never reused */
+    /* The child's one path argument: a basename for an unmount, the empty
+     * path for a mount. Read-only memory after pin_job_memory(). */
+    const char *path;
+    struct sandbox_buf *buf;
+};
+
 /* The client's mount namespace is entered only by a forked child under a
  * seccomp allowlist; these run that child and return its result. */
 int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd,
@@ -29,7 +47,16 @@ int defused_is_fuse_mount(uint64_t mnt_ns_id, uint64_t mnt_id, bool *out_blkdev,
                           uid_t *out_uid);
 
 #ifdef DEFUSED_TEST
-int defused_test_install_seccomp(enum defused_op op);
+/* What the child does before setns(). A test pins without installing, to
+ * see what the kernel alone answers. */
+int defused_test_pin_job(struct sandbox_job *job);
+int defused_test_install_seccomp(const struct sandbox_job *job);
+/* The buffers pinning handed the filter: the handle, the mount id, and the
+ * result the child reports with, whose length the filter pins too. */
+const void *defused_test_handle_buf(const struct sandbox_job *job);
+const void *defused_test_handle_id(const struct sandbox_job *job);
+const void *defused_test_result_buf(const struct sandbox_job *job,
+                                    size_t *size);
 int defused_test_mount_opts_owner(const char *opts, uid_t *out_uid);
 pid_t defused_test_fdinfo_pid(const char *text);
 #endif
