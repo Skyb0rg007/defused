@@ -24,6 +24,18 @@ jobs:
             system-features: benchmark big-parallel nixos-test uid-range
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      # Ubuntu sets kernel.apparmor_restrict_unprivileged_userns=1, which
+      # lets an unprivileged process create a user namespace but confines it
+      # so it holds none of the capabilities it would normally get there.
+      # tests/test_sandbox.c needs CAP_SYS_ADMIN over a mount namespace to
+      # tell its seccomp filter's EPERM apart from the one move_mount()
+      # returns on its own, and tests/test_mountns.c needs to write a
+      # uid_map. Without this the aarch64 runner silently loses both.
+      - name: Restore upstream unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
         with:
           nix_path: nixpkgs=channel:nixos-unstable
