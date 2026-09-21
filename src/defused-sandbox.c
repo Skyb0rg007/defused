@@ -431,8 +431,9 @@ int defused_sandbox_unmount(int pidfd, int proc_fd, int parent_fd,
                             const char *name, bool lazy, long mnt_id, uid_t uid,
                             struct defused_error *err) {
     /* Before forking, so an unauthorized caller's namespace is never
-     * entered. */
-    uid_t owner;
+     * entered. GCC cannot see that owner is set whenever this returns 0,
+     * hence the initializer. */
+    uid_t owner = (uid_t)-1;
     int ret = peer_fuse_mount_owner(pidfd, mnt_id, &owner);
     if (ret < 0) {
         defused_error_setf(
