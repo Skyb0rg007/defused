@@ -18,6 +18,13 @@ let
     pkgs.linuxPackages_7_2
   ];
 
+  # ... and against both builds, so the statically-linked musl binaries are
+  # exercised in a VM, not just compiled.
+  variants = {
+    glibc = self.packages.${system}.defused;
+    musl-static = self.packages.${system}.defused-static;
+  };
+
   tests = {
     simple = ./simple.nix;
     daemon = ./daemon.nix;
@@ -41,18 +48,22 @@ in
 lib.listToAttrs (
   lib.concatMap (
     name:
-    map (
-      kernelPackages:
-      lib.nameValuePair "${name}-${kernelSuffix kernelPackages}" (
-        import tests.${name} {
-          inherit
-            self
-            pkgs
-            system
-            kernelPackages
-            ;
-        }
-      )
-    ) kernels
+    lib.concatMap (
+      variant:
+      map (
+        kernelPackages:
+        lib.nameValuePair "${name}-${variant}-${kernelSuffix kernelPackages}" (
+          import tests.${name} {
+            inherit
+              self
+              pkgs
+              variant
+              kernelPackages
+              ;
+            package = variants.${variant};
+          }
+        )
+      ) kernels
+    ) (lib.attrNames variants)
   ) (lib.attrNames tests)
 )

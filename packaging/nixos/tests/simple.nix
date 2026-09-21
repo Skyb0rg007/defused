@@ -5,15 +5,13 @@
 {
   self,
   pkgs,
-  system,
+  package,
+  variant,
   kernelPackages,
 }:
 
-let
-  package = self.packages.${system}.defused;
-in
 pkgs.testers.nixosTest {
-  name = "defused-${kernelPackages.kernel.version}";
+  name = "defused-${variant}-${kernelPackages.kernel.version}";
 
   nodes.machine =
     { ... }:

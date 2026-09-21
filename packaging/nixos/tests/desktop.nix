@@ -5,7 +5,8 @@
 {
   self,
   pkgs,
-  system,
+  package,
+  variant,
   kernelPackages,
 }:
 
@@ -14,11 +15,11 @@ let
     inherit
       self
       pkgs
-      system
+      package
       kernelPackages
       ;
   };
-  inherit (common) package mountHelper;
+  inherit (common) mountHelper;
   inherit (pkgs) lib;
 
   # A libfuse2 filesystem, from libfuse2's own example: nixpkgs has no
@@ -36,7 +37,7 @@ let
       '';
 in
 pkgs.testers.nixosTest {
-  name = "defused-desktop-${kernelPackages.kernel.version}";
+  name = "defused-desktop-${variant}-${kernelPackages.kernel.version}";
 
   nodes.machine =
     { ... }:

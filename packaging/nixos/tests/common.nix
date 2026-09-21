@@ -5,13 +5,11 @@
 {
   self,
   pkgs,
-  system,
+  package,
   kernelPackages,
 }:
 
 let
-  package = self.packages.${system}.defused;
-
   mountHelper = pkgs.writeText "defused-mount-helper.py" ''
     import array
     import os

@@ -5,7 +5,8 @@
 {
   self,
   pkgs,
-  system,
+  package,
+  variant,
   kernelPackages,
 }:
 
@@ -14,11 +15,11 @@ let
     inherit
       self
       pkgs
-      system
+      package
       kernelPackages
       ;
   };
-  inherit (common) package mountHelper;
+  inherit (common) mountHelper;
 
   # Accept=yes ties one defused@ instance to each connection, so holding one
   # open keeps an instance around to inspect.
@@ -36,7 +37,7 @@ let
   probeRules = pkgs.apparmorRulesFromClosure { name = "defused-test-probe"; } [ pkgs.coreutils ];
 in
 pkgs.testers.nixosTest {
-  name = "defused-apparmor";
+  name = "defused-apparmor-${variant}-${kernelPackages.kernel.version}";
 
   nodes.machine =
     { ... }:
