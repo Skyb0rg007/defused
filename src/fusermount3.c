@@ -3,72 +3,78 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * Drop-in replacement for libfuse's setuid-root fusermount3,
- * implemented as an unprivileged client of defused.service.
+ * Drop-in replacement for libfuse's setuid-root fusermount3, implemented as
+ * an unprivileged client of the defused service. The same binary is also
+ * installed as libfuse2's `fusermount`, whose command line is a subset.
  *
- * The same binary is installed under both helper names: libfuse2's
- * `fusermount` speaks the same protocol as libfuse3's `fusermount3` and
- * takes a subset of its command line. Only the -V banner follows argv[0];
- * everything else behaves identically under either name.
- *
- * The fusermount3 binary receives a communication file descriptor indicated
- * via the _FUSE_COMMFD environment variable or --comm-fd command-line option.
- * After the mount occurs, the the opened /dev/fuse file descriptor will be
- * sent to that file descriptor via SCM_RIGHTS (along with a single zero byte).
- *
- * FUSE option parsing happens here; the service wire protocol is Varlink.
+ * libfuse hands over a socket via _FUSE_COMMFD (or --comm-fd); after the
+ * mount, the opened /dev/fuse fd is sent back over it with SCM_RIGHTS.
  */
 #define _GNU_SOURCE
 #include "common.h"
 #include "defused_proto.h"
-#include "util.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
 #include <libgen.h>
 #include <limits.h>
 #include <linux/capability.h>
 #include <signal.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/un.h>
-#include <systemd/sd-json.h>
-#include <systemd/sd-varlink.h>
+#include <sys/syscall.h>
 #include <unistd.h>
-
-#include <errno.h>
-#include <stdarg.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdnoreturn.h>
-#include <string.h>
-
-#define FUSE_COMMFD_ENV "_FUSE_COMMFD"
 
 #ifndef DEFUSED_VERSION
 #define DEFUSED_VERSION "unknown"
 #endif
-
 #ifndef DEFUSED_PATH
 #define DEFUSED_PATH "/usr/lib/defused/defused"
 #endif
 
-/* This table is copied from libfuse */
-struct flag_opt {
-    /* Option name */
-    const char *opt;
-    /* Corresponding defused protocol bitmask */
-    uint32_t flag;
-    /* Does this option set or clear the bit? */
-    bool on;
-    /* Is this option available to defused's unprivileged client path? */
-    bool safe;
-};
+static const char *progname = "fusermount3";
+static bool quiet, auto_unmount, privileged;
 
-static const struct flag_opt flag_opts[] = {
+__attribute__((__noreturn__, __format__(__printf__, 1, 2))) static void
+die(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "%s: ", progname);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    va_end(ap);
+    exit(EXIT_FAILURE);
+}
+
+/* A non-root caller keeps CAP_SYS_ADMIN across exec only via the ambient
+ * set. */
+static bool caller_is_privileged(void) {
+#ifdef DEFUSED_TEST
+    const char *forced_uid = getenv("DEFUSED_TEST_UID");
+    if (forced_uid != NULL)
+        return strcmp(forced_uid, "0") == 0;
+#endif
+    return getuid() == 0 || geteuid() == 0 ||
+           prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_SYS_ADMIN, 0, 0) ==
+               0;
+}
+
+/*** Mount options ***/
+
+/* libfuse's table: option, its protocol bit, whether it sets or clears the
+ * bit, and whether an unprivileged caller may use it. */
+static const struct {
+    const char *opt;
+    uint32_t flag;
+    bool on, safe;
+} flag_opts[] = {
     {"rw", DEFUSED_MOUNT_RDONLY, false, true},
     {"ro", DEFUSED_MOUNT_RDONLY, true, true},
     {"suid", DEFUSED_MOUNT_ALLOW_SUID, true, false},
@@ -87,82 +93,409 @@ static const struct flag_opt flag_opts[] = {
     {"symfollow", DEFUSED_MOUNT_NOSYMFOLLOW, false, true},
     {"nosymfollow", DEFUSED_MOUNT_NOSYMFOLLOW, true, true},
     {"dirsync", DEFUSED_MOUNT_DIRSYNC, true, true},
-    {NULL, 0, false, false},
 };
 
-static const char *const short_opts = "hVo:uzq";
+static char fsname[DEFUSED_MAX_FSNAME], subtype[DEFUSED_MAX_NAME];
 
-static const struct option long_opts[] = {
-    {"unmount", no_argument, NULL, 'u'},
-    {"lazy", no_argument, NULL, 'z'},
-    {"quiet", no_argument, NULL, 'q'},
-    {"help", no_argument, NULL, 'h'},
-    {"version", no_argument, NULL, 'V'},
-    {"options", required_argument, NULL, 'o'},
-    {"auto-unmount", no_argument, NULL, 'U'},
-    {"comm-fd", required_argument, NULL, 'c'},
-    {"sync-init", no_argument, NULL, 'S'},
-    {NULL, 0, NULL, 0},
-};
+static bool opt_is(const char *s, size_t len, const char *opt) {
+    return strlen(opt) == len && strncmp(s, opt, len) == 0;
+}
 
-static int do_mount(const char *mnt, const char *opts, int cfd)
-    __attribute__((__nonnull__(1, 2), __warn_unused_result__));
-static int do_unmount(const char *mnt, bool lazy)
-    __attribute__((__nonnull__(1)));
-static int wait_and_auto_unmount(int cfd, const char *mnt)
-    __attribute__((__nonnull__(2), __warn_unused_result__));
-static int connect_service(sd_varlink **ret)
-    __attribute__((__nonnull__(1), __warn_unused_result__));
-static int transact(uint32_t op, const union defused_req *req, const int *fds,
-                    size_t fd_count, const char *mnt)
-    __attribute__((__nonnull__(2, 3, 5), __warn_unused_result__));
-static void print_service_error(uint32_t op, const char *mnt,
-                                const struct defused_error *err)
-    __attribute__((__nonnull__(2, 3)));
-static int parse_mount_opts(const char *opts, struct defused_mount_req *req)
-    __attribute__((__nonnull__(1, 2), __warn_unused_result__));
-static int copy_name(char *dst, size_t dstsz, const char *what, const char *s,
-                     unsigned len, bool allow_slash)
-    __attribute__((__nonnull__(1, 3, 4), __warn_unused_result__));
-static int parse_u32(const char *s, unsigned len, const char *pfx,
-                     uint32_t *out)
-    __attribute__((__nonnull__(1, 3, 4), __warn_unused_result__));
+static bool opt_starts(const char *s, const char *prefix) {
+    return strncmp(s, prefix, strlen(prefix)) == 0;
+}
 
-static noreturn void usage(void) __attribute__((__noreturn__));
-static noreturn void die(const char *fmt, ...)
-    __attribute__((__noreturn__, __format__(__printf__, 1, 2)));
-static bool caller_is_privileged(void);
+/* Copies an fsname=/subtype= value, resolving backslash escapes (an escaped
+ * comma is valid, as in libfuse's fuse_opt). */
+static void copy_name(char *dst, size_t dstsz, const char *what, const char *s,
+                      size_t len, bool allow_slash) {
+    size_t d = 0;
+    for (size_t i = 0; i < len; i++) {
+        char ch = s[i];
+        if (ch == '\\' && i + 1 < len)
+            ch = s[++i];
+        if (ch == '/' && !allow_slash)
+            die("invalid character '/' in %s", what);
+        if (d + 1 >= dstsz)
+            die("%s too long (max %zu characters)", what, dstsz - 1);
+        dst[d++] = ch;
+    }
+    dst[d] = '\0';
+}
 
-static const char *progname;
-/* argv[0] without directories: "fusermount3", or libfuse2's "fusermount". */
-static const char *progbase;
-static bool quiet;
-static bool auto_unmount;
-static bool privileged;
+static uint32_t parse_u32(const char *s, size_t len, const char *opt) {
+    char *end;
+    errno = 0;
+    unsigned long v = strtoul(s, &end, 10);
+    if (len == 0 || *s < '0' || *s > '9' || errno != 0 || end != s + len ||
+        v > UINT32_MAX)
+        die("invalid value for '%s' option", opt);
+    return (uint32_t)v;
+}
+
+/*
+ * Parses a fusermount3 -o string like libfuse's util/fusermount.c does:
+ * fsname=/subtype= honor backslash escapes, auto_unmount is remembered
+ * here, libfuse's internal and legacy options are dropped silently, the
+ * privileged options (suid, dev) are warned about and ignored for an
+ * unprivileged caller while blkdev is an error, and anything unrecognized
+ * is an error.
+ */
+static void parse_mount_opts(const char *opts, struct defused_mount_req *req) {
+    uint32_t flags = 0;
+    size_t len;
+    for (const char *s = opts; *s; s += len + (s[len] == ',')) {
+        bool escape_ok = opt_starts(s, "fsname=") || opt_starts(s, "subtype=");
+        for (len = 0; s[len]; len++) {
+            if (escape_ok && s[len] == '\\' && s[len + 1])
+                len++;
+            else if (s[len] == ',')
+                break;
+        }
+
+        if (opt_starts(s, "fsname="))
+            copy_name(fsname, sizeof(fsname), "fsname", s + 7, len - 7,
+                      privileged);
+        else if (opt_starts(s, "subtype="))
+            copy_name(subtype, sizeof(subtype), "subtype", s + 8, len - 8,
+                      false);
+        else if (opt_starts(s, "max_read="))
+            req->max_read = parse_u32(s + 9, len - 9, "max_read");
+        else if (opt_starts(s, "blksize="))
+            req->blksize = parse_u32(s + 8, len - 8, "blksize");
+        else if (opt_is(s, len, "auto_unmount"))
+            auto_unmount = true;
+        else if (opt_is(s, len, "default_permissions"))
+            flags |= DEFUSED_FUSE_DEFAULT_PERMISSIONS;
+        else if (opt_is(s, len, "allow_other"))
+            flags |= DEFUSED_FUSE_ALLOW_OTHER;
+        else if (opt_is(s, len, "blkdev")) {
+            if (!privileged)
+                die("option blkdev is privileged");
+            flags |= DEFUSED_MOUNT_BLKDEV;
+        } else if (opt_is(s, len, "nonempty") || opt_is(s, len, "large_read") ||
+                   opt_starts(s, "fd=") || opt_starts(s, "rootmode=") ||
+                   opt_starts(s, "user_id=") || opt_starts(s, "group_id=") ||
+                   opt_starts(s, "x-")) {
+            /* dropped silently */
+        } else {
+            size_t i = 0;
+            while (i < ARRAY_SIZE(flag_opts) &&
+                   !opt_is(s, len, flag_opts[i].opt))
+                i++;
+            if (i == ARRAY_SIZE(flag_opts))
+                die("unknown option '%.*s'", (int)len, s);
+            if (!flag_opts[i].safe && !privileged)
+                fprintf(stderr, "%s: unsafe option %s ignored\n", progname,
+                        flag_opts[i].opt);
+            else if (flag_opts[i].on)
+                flags |= flag_opts[i].flag;
+            else
+                flags &= ~flag_opts[i].flag;
+        }
+    }
+    req->mount_flags = flags;
+    req->fsname = fsname;
+    req->subtype = subtype;
+}
+
+/*** The service ***/
+
+/* Connects to the service, or spawns `defused --child` for a privileged
+ * caller, and attaches fds to the coming call. */
+static int connect_service(sd_varlink **out, const int *fds, size_t n_fds) {
+    _cleanup_(sd_varlink_close_unrefp) sd_varlink *link = NULL;
+    char *argv[] = {(char *)"defused", (char *)"--child", NULL};
+    const char *target = DEFUSED_PATH;
+    if (!privileged) {
+        target = getenv("DEFUSED_SOCKET");
+        if (target == NULL || *target == '\0')
+            target = DEFUSED_SOCKET_PATH;
+    }
+    int ret = privileged ? sd_varlink_connect_exec(&link, target, argv)
+                         : sd_varlink_connect_address(&link, target);
+    if (ret < 0) {
+        if (!quiet)
+            fprintf(stderr, "%s: cannot %s %s: %s\n", progname,
+                    privileged ? "spawn" : "connect to the defused service at",
+                    target, strerror(-ret));
+        return ret;
+    }
+    ret = sd_varlink_set_allow_fd_passing_output(link, true);
+    for (size_t i = 0; ret >= 0 && i < n_fds; i++)
+        ret = sd_varlink_push_dup_fd(link, fds[i]);
+    if (ret < 0)
+        return ret;
+    *out = TAKE_PTR(link);
+    return 0;
+}
+
+/* Reports a call's outcome: ret if the RPC itself failed, -EPERM for an
+ * error from the service (explained unless quiet), 0 for success. */
+static int check_reply(int ret, const char *what, const char *mnt,
+                       const struct defused_error *err) {
+    if (ret < 0) {
+        if (!quiet)
+            fprintf(stderr, "%s: %s request to %s failed: %s\n", progname, what,
+                    privileged ? DEFUSED_PATH : "the service", strerror(-ret));
+        return ret;
+    }
+    if (err->id[0] == '\0')
+        return 0;
+    if (quiet)
+        return -EPERM;
+    const char *reason = err->sys_errno ? strerror(err->sys_errno)
+                                        : "no reason given by the service";
+    if (!strcmp(err->id, DEFUSED_ERROR_MALFORMED))
+        fprintf(stderr, "%s: %s request rejected by the defused service: %s\n",
+                progname, what, reason);
+    else if (!strcmp(err->id, DEFUSED_ERROR_BAD_OPTION))
+        fprintf(stderr, "%s: mount options rejected by the defused service\n",
+                progname);
+    else if (!strcmp(err->id, DEFUSED_ERROR_NOT_ALLOWED))
+        fprintf(stderr,
+                !strcmp(what, "mount")
+                    ? "%s: mount of %s not allowed by the defused service\n"
+                    : "%s: not allowed to unmount %s: not mounted by you\n",
+                progname, mnt);
+    else if (!strcmp(err->id, DEFUSED_ERROR_NOT_A_FUSE_MOUNT))
+        fprintf(stderr, "%s: %s is not a FUSE mount\n", progname, mnt);
+    else if (!strcmp(err->id, DEFUSED_ERROR_MOUNT_FAILED) ||
+             !strcmp(err->id, DEFUSED_ERROR_UNMOUNT_FAILED))
+        fprintf(stderr, "%s: failed to %s %s: %s\n", progname, what, mnt,
+                reason);
+    else /* a Varlink-level error, e.g. one of libsystemd's own */
+        fprintf(stderr, "%s: %s request failed: %s\n", progname, what, err->id);
+    return -EPERM;
+}
+
+/* mnt is absolute and canonical, so its last component is the name. */
+static int do_unmount(const char *mnt, bool lazy) {
+    const char *name = strrchr(mnt, '/') + 1;
+    if (*name == '\0') {
+        if (!quiet)
+            fprintf(stderr, "%s: refusing to unmount /\n", progname);
+        return -EINVAL;
+    }
+    if (strlen(name) >= DEFUSED_MAX_FILENAME) {
+        if (!quiet)
+            fprintf(stderr, "%s: mountpoint name too long: %s\n", progname,
+                    name);
+        return -ENAMETOOLONG;
+    }
+    _cleanup_free_ char *parent =
+        strndup(mnt, name - 1 == mnt ? 1 : (size_t)(name - 1 - mnt));
+    if (parent == NULL)
+        return -ENOMEM;
+    /* The parent directory, not the mountpoint: an fd held open on the mount
+     * would make a non-lazy umount2() fail with EBUSY. */
+    _cleanup_close_ int parent_fd =
+        open(parent, O_PATH | O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC);
+    if (parent_fd == -1) {
+        int ret = -errno;
+        if (!quiet)
+            fprintf(stderr, "%s: failed to access %s: %s\n", progname, parent,
+                    strerror(errno));
+        return ret;
+    }
+
+    _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *link = NULL;
+    int ret = connect_service(&link, &parent_fd, 1);
+    if (ret < 0)
+        return ret;
+    struct defused_umount_req req = {
+        .parent_fd = 0, .name = name, .lazy = lazy};
+    struct defused_error err;
+    return check_reply(defused_call_umount(link, &req, &err), "unmount", mnt,
+                       &err);
+}
+
+/* Hands fd to libfuse over the _FUSE_COMMFD socket, framed the way its
+ * receive_fd() expects: one zero byte plus SCM_RIGHTS. */
+static int send_fd(int sock, int fd) {
+    char zero = 0;
+    struct iovec iov = {.iov_base = &zero, .iov_len = 1};
+    union {
+        struct cmsghdr hdr;
+        char buf[CMSG_SPACE(sizeof(int))];
+    } cmsg = {0};
+    struct msghdr msg = {.msg_iov = &iov,
+                         .msg_iovlen = 1,
+                         .msg_control = &cmsg,
+                         .msg_controllen = sizeof(cmsg)};
+    struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(c), &fd, sizeof(int));
+    ssize_t n;
+    do
+        n = sendmsg(sock, &msg, 0);
+    while (n == -1 && errno == EINTR);
+    if (n != 1) {
+        fprintf(stderr, "%s: sending the FUSE fd to the caller failed: %s\n",
+                progname, strerror(errno));
+        return -EIO;
+    }
+    return 0;
+}
+
+static int do_mount(const char *mnt, const char *opts, int cfd) {
+    struct defused_mount_req req = {.fuse_fd = 0, .mnt_fd = 1};
+    parse_mount_opts(opts, &req);
+
+    _cleanup_close_ int mnt_fd = open(mnt, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    if (mnt_fd == -1)
+        die("failed to access mountpoint %s: %s", mnt, strerror(errno));
+    const char *dev = getenv("DEFUSED_FUSE_DEVICE");
+    if (dev == NULL || *dev == '\0')
+        dev = "/dev/fuse";
+    _cleanup_close_ int fuse_fd = open(dev, O_RDWR | O_CLOEXEC);
+    if (fuse_fd == -1)
+        die("failed to open %s: %s", dev, strerror(errno));
+
+    _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *link = NULL;
+    int ret = connect_service(&link, (int[]){fuse_fd, mnt_fd}, 2);
+    if (ret < 0)
+        return ret;
+    struct defused_error err;
+    ret = check_reply(defused_call_mount(link, &req, &err), "mount", mnt, &err);
+    if (ret < 0)
+        return ret;
+
+    ret = send_fd(cfd, fuse_fd);
+    if (ret < 0) {
+        /* The library will never get the fd, so don't leave the filesystem
+         * mounted -- the same cleanup libfuse's fusermount3 does. */
+        quiet = true;
+        (void)do_unmount(mnt, true);
+    }
+    return ret;
+}
+
+/*** auto_unmount ***/
+
+/* Closes every inherited fd but cfd and points stdio at /dev/null: this
+ * process lingers for the FUSE server's lifetime and must not hold anything
+ * else open. */
+static int close_inherited_fds(int cfd) {
+    if (cfd <= STDERR_FILENO)
+        return -EINVAL; /* We can't even report an error */
+    if ((cfd > STDERR_FILENO + 1 &&
+         syscall(SYS_close_range, STDERR_FILENO + 1, cfd - 1, 0) < 0) ||
+        syscall(SYS_close_range, cfd + 1, ~0U, 0) < 0)
+        for (int fd = STDERR_FILENO + 1, max = (int)sysconf(_SC_OPEN_MAX);
+             fd < max; fd++)
+            if (fd != cfd)
+                close(fd);
+
+    int nullfd = open("/dev/null", O_RDWR);
+    if (nullfd < 0)
+        return -errno;
+    dup2(nullfd, STDIN_FILENO);
+    dup2(nullfd, STDOUT_FILENO);
+    dup2(nullfd, STDERR_FILENO);
+    if (nullfd > STDERR_FILENO)
+        close(nullfd);
+    return 0;
+}
+
+/* Detaches from the caller's session in place (no fork: the caller already
+ * has the FUSE fd and isn't waiting on this process), then blocks until the
+ * FUSE server exits -- seen as EOF on the communication socket -- and lazily
+ * unmounts the filesystem. */
+static int wait_and_auto_unmount(int cfd, const char *mnt) {
+    int ret = close_inherited_fds(cfd);
+    if (ret < 0)
+        return ret;
+    (void)setsid();
+    if (chdir("/") == -1)
+        return -errno;
+    sigset_t sigs;
+    sigfillset(&sigs);
+    sigprocmask(SIG_BLOCK, &sigs, NULL);
+
+    char buf[16];
+    ssize_t n;
+    do
+        n = recv(cfd, buf, sizeof(buf), 0);
+    while (n > 0 || (n < 0 && errno == EINTR));
+
+    quiet = true;
+    return do_unmount(mnt, true);
+}
+
+/*** Command line ***/
+
+/* realpath() of the mountpoint's parent plus its basename, like libfuse's
+ * fuse_mnt_resolve_path(): resolving the mountpoint itself would traverse
+ * into a FUSE mount whose server may be dead. */
+static char *resolve_mountpoint(const char *orig) {
+    _cleanup_free_ char *dir_copy = strdup(orig), *base_copy = strdup(orig);
+    if (dir_copy == NULL || base_copy == NULL)
+        die("failed to allocate memory");
+    const char *base = basename(base_copy);
+    char resolved[PATH_MAX];
+    char *dst = NULL;
+    if (!strcmp(base, ".") || !strcmp(base, "..") || !strcmp(base, "/")) {
+        if (realpath(orig, resolved) != NULL)
+            dst = strdup(resolved);
+    } else if (realpath(dirname(dir_copy), resolved) != NULL &&
+               asprintf(&dst, "%s/%s", strcmp(resolved, "/") ? resolved : "",
+                        base) < 0) {
+        dst = NULL;
+    }
+    if (dst == NULL)
+        die("bad mount point %s: %s", orig, strerror(errno));
+    return dst;
+}
+
+static __attribute__((__noreturn__)) void usage(void) {
+    printf("%s: [options] mountpoint\n"
+           "Options:\n"
+           " -h		    print help\n"
+           " -V		    print version\n"
+           " -o opt[,opt...]    mount options\n"
+           " -u		    unmount\n"
+           " -q		    quiet\n"
+           " -z		    lazy unmount\n",
+           progname);
+    exit(EXIT_FAILURE);
+}
 
 int main(int argc, char *argv[]) {
-    progname = argc > 0 && argv[0] != NULL && argv[0][0] != '\0'
-                   ? argv[0]
-                   : "fusermount3";
-    const char *slash = strrchr(progname, '/');
-    progbase = slash != NULL && slash[1] != '\0' ? slash + 1 : progname;
-
+    static const struct option long_opts[] = {
+        {"unmount", no_argument, NULL, 'u'},
+        {"lazy", no_argument, NULL, 'z'},
+        {"quiet", no_argument, NULL, 'q'},
+        {"help", no_argument, NULL, 'h'},
+        {"version", no_argument, NULL, 'V'},
+        {"options", required_argument, NULL, 'o'},
+        {"auto-unmount", no_argument, NULL, 'U'},
+        {"comm-fd", required_argument, NULL, 'c'},
+        {"sync-init", no_argument, NULL, 'S'},
+        {NULL, 0, NULL, 0},
+    };
+    if (argc > 0 && argv[0] != NULL && argv[0][0] != '\0')
+        progname = argv[0];
     privileged = caller_is_privileged();
 
-    bool unmount = false;
-    bool lazy = false;
-    bool setup_auto_unmount_only = false;
-    const char *opts = "";
-    const char *commfd_str = NULL;
-    int ch;
-    while ((ch = getopt_long(argc, argv, short_opts, long_opts, NULL)) != -1) {
-        switch (ch) {
+    bool unmount = false, lazy = false, auto_unmount_only = false;
+    const char *opts = "", *commfd_str = NULL;
+    for (int c;
+         (c = getopt_long(argc, argv, "hVo:uzq", long_opts, NULL)) != -1;) {
+        switch (c) {
         case 'h':
             usage();
-            break;
-        case 'V':
-            printf("%s version: %s (defused)\n", progbase, DEFUSED_VERSION);
-            return 0;
+        case 'V': {
+            /* Only the banner follows argv[0]: "fusermount3", or libfuse2's
+             * "fusermount". */
+            const char *slash = strrchr(progname, '/');
+            printf("%s version: %s (defused)\n",
+                   slash != NULL && slash[1] != '\0' ? slash + 1 : progname,
+                   DEFUSED_VERSION);
+            return EXIT_SUCCESS;
+        }
         case 'o':
             opts = optarg;
             break;
@@ -176,9 +509,7 @@ int main(int argc, char *argv[]) {
             quiet = true;
             break;
         case 'U':
-            unmount = true;
-            auto_unmount = true;
-            setup_auto_unmount_only = true;
+            unmount = auto_unmount = auto_unmount_only = true;
             break;
         case 'c':
             commfd_str = optarg;
@@ -189,469 +520,37 @@ int main(int argc, char *argv[]) {
             return EXIT_FAILURE;
         }
     }
-
     if (lazy && !unmount)
         die("-z can only be used with -u");
-
     if (optind >= argc)
         die("missing mountpoint argument");
-
     if (argc > optind + 1)
         die("extra arguments after the mountpoint");
 
-    _cleanup_free_ char *mnt = fuse_mnt_resolve_path(progname, argv[optind]);
-    if (mnt == NULL)
-        return EXIT_FAILURE;
-
-    if (unmount && !setup_auto_unmount_only)
+    _cleanup_free_ char *mnt = resolve_mountpoint(argv[optind]);
+    if (unmount && !auto_unmount_only)
         return do_unmount(mnt, lazy) < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 
     if (commfd_str == NULL)
-        commfd_str = getenv(FUSE_COMMFD_ENV);
-    if (commfd_str == NULL) {
-        fprintf(stderr, "%s: old style mounting not supported\n", progname);
-        return EXIT_FAILURE;
-    }
-
-    long cfd_long;
-    if (libfuse_strtol(commfd_str, &cfd_long) < 0 || cfd_long < 0 ||
-        cfd_long > INT_MAX) {
-        fprintf(stderr, "%s: invalid _FUSE_COMMFD: %s\n", progname, commfd_str);
-        return EXIT_FAILURE;
-    }
-    int cfd = (int)cfd_long;
-
+        commfd_str = getenv("_FUSE_COMMFD");
+    if (commfd_str == NULL)
+        die("old style mounting not supported");
+    char *end;
+    long cfd = strtol(commfd_str, &end, 10);
+    if (*commfd_str == '\0' || *end != '\0' || cfd < 0 || cfd > INT_MAX)
+        die("invalid _FUSE_COMMFD: %s", commfd_str);
     struct stat st;
-    if (fstat(cfd, &st) == -1) {
-        fprintf(stderr, "%s: fstat of comm fd %d failed: %s\n", progname, cfd,
-                strerror(errno));
-        return EXIT_FAILURE;
-    }
+    if (fstat((int)cfd, &st) == -1)
+        die("fstat of comm fd %ld failed: %s", cfd, strerror(errno));
+    if (!S_ISSOCK(st.st_mode))
+        die("file descriptor %ld is not a socket", cfd);
 
-    if (!S_ISSOCK(st.st_mode)) {
-        fprintf(stderr, "%s: file descriptor %d is not a socket\n", progname,
-                cfd);
-        return EXIT_FAILURE;
-    }
-    if (!setup_auto_unmount_only) {
-        if (do_mount(mnt, opts, cfd) < 0)
+    if (!auto_unmount_only) {
+        if (do_mount(mnt, opts, (int)cfd) < 0)
             return EXIT_FAILURE;
         if (!auto_unmount)
             return EXIT_SUCCESS;
     }
-    return wait_and_auto_unmount(cfd, mnt) < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
-}
-
-/* A non-root caller keeps CAP_SYS_ADMIN across exec only via the ambient set.
- */
-static bool caller_is_privileged(void) {
-#ifdef DEFUSED_TEST
-    const char *forced_uid = getenv("DEFUSED_TEST_UID");
-    if (forced_uid != NULL)
-        return strcmp(forced_uid, "0") == 0;
-#endif
-    return getuid() == 0 || geteuid() == 0 ||
-           prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_SYS_ADMIN, 0, 0) ==
-               0;
-}
-
-static int do_mount(const char *mnt, const char *opts, int cfd) {
-    union defused_req u = {0};
-    int ret = parse_mount_opts(opts, &u.mount);
-    if (ret < 0)
-        return ret;
-
-    /* Resolve the mountpoint to a file descriptor.
-     * This file descriptor is sent to the service to perform the mount. */
-    _cleanup_close_ int mnt_fd = open(mnt, O_PATH | O_NOFOLLOW | O_CLOEXEC);
-    if (mnt_fd == -1) {
-        ret = -errno;
-        fprintf(stderr, "%s: failed to access mountpoint %s: %s\n", progname,
-                mnt, strerror(errno));
-        return ret;
-    }
-
-    const char *dev_path = getenv("DEFUSED_FUSE_DEVICE");
-    if (!dev_path || !*dev_path)
-        dev_path = "/dev/fuse";
-    _cleanup_close_ int fuse_fd = open(dev_path, O_RDWR | O_CLOEXEC);
-    if (fuse_fd == -1) {
-        ret = -errno;
-        fprintf(stderr, "%s: failed to open %s: %s\n", progname, dev_path,
-                strerror(errno));
-        return ret;
-    }
-
-    int fds[] = {fuse_fd, mnt_fd};
-    ret = transact(DEFUSED_OP_MOUNT, &u, fds, 2, mnt);
-    if (ret < 0)
-        return ret;
-
-    ret = send_fd(cfd, fuse_fd);
-    if (ret < 0) {
-        /* The library will never get the fd, so don't leave the filesystem
-         * mounted -- same cleanup fusermount3 does, via the service. */
-        quiet = true;
-        (void)do_unmount(mnt, true);
-        return ret;
-    }
-
-    return 0;
-}
-
-static int do_unmount(const char *mnt, bool lazy) {
-    if (!strcmp(mnt, "/")) {
-        fprintf(stderr, "%s: refusing to unmount /\n", progname);
-        return -EINVAL;
-    }
-
-    /* dirname()/basename() may modify their argument in place and may
-     * return a pointer into it, so each gets its own copy to work on. */
-    _cleanup_free_ char *dir_copy = strdup(mnt);
-    _cleanup_free_ char *base_copy = strdup(mnt);
-    if (!dir_copy || !base_copy) {
-        fprintf(stderr, "%s: failed to allocate memory\n", progname);
-        return -ENOMEM;
-    }
-    const char *parent = dirname(dir_copy);
-    const char *name = basename(base_copy);
-    if (strlen(name) >= DEFUSED_MAX_FILENAME) {
-        fprintf(stderr, "%s: mountpoint name too long: %s\n", progname, name);
-        return -ENAMETOOLONG;
-    }
-
-    /* Open the parent directory, not the FUSE mount directory itself.
-     * This is to make sure the umount2() call doesn't fail due to a held
-     * file descriptor. */
-    _cleanup_close_ int parent_fd =
-        open(parent, O_PATH | O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC);
-    if (parent_fd == -1) {
-        int ret = -errno;
-        if (!quiet)
-            fprintf(stderr, "%s: failed to access %s: %s\n", progname, parent,
-                    strerror(errno));
-        return ret;
-    }
-
-    union defused_req u = {.umount = {.lazy = lazy}};
-    (void)strlcpy(u.umount.name, name, sizeof(u.umount.name));
-
-    int fds[] = {parent_fd};
-    return transact(DEFUSED_OP_UNMOUNT, &u, fds, 1, mnt);
-}
-
-/*
- * Detaches from the caller's session in place (no fork: the caller already
- * has the FUSE fd from do_mount()'s send_fd() and isn't waiting on this
- * process to exit), then blocks until the fuse server exits -- seen via EOF
- * on the communication socket -- and lazily unmounts the filesystem.
- */
-static int wait_and_auto_unmount(int cfd, const char *mnt) {
-    int ret = close_inherited_fds(cfd);
-    if (ret < 0)
-        return ret;
-
-    (void)setsid();
-    if (chdir("/") == -1)
-        return -errno;
-
-    sigset_t sigs;
-    sigfillset(&sigs);
-    sigprocmask(SIG_BLOCK, &sigs, NULL);
-
-    for (;;) {
-        char buf[16];
-        ssize_t n = recv(cfd, buf, sizeof(buf), 0);
-        if (n == 0)
-            break;
-        if (n < 0 && errno != EINTR)
-            break;
-    }
-
-    quiet = true;
-    return do_unmount(mnt, true);
-}
-
-static int connect_service(sd_varlink **ret) {
-    _cleanup_(sd_varlink_close_unrefp) sd_varlink *link = NULL;
-    int r;
-
-    if (privileged) {
-        char *argv[] = {(char *)"defused", (char *)"--child", NULL};
-        r = sd_varlink_connect_exec(&link, DEFUSED_PATH, argv);
-        if (r < 0) {
-            fprintf(stderr, "%s: cannot spawn %s: %s\n", progname, DEFUSED_PATH,
-                    strerror(-r));
-            return r;
-        }
-    } else {
-        const char *path = getenv("DEFUSED_SOCKET");
-        if (path == NULL || *path == '\0')
-            path = DEFUSED_SOCKET_PATH;
-
-        r = sd_varlink_connect_address(&link, path);
-        if (r < 0) {
-            fprintf(stderr,
-                    "%s: cannot connect to the defused service at %s: %s\n",
-                    progname, path, strerror(-r));
-            return r;
-        }
-    }
-    r = sd_varlink_set_allow_fd_passing_input(link, true);
-    if (r < 0)
-        return r;
-    r = sd_varlink_set_allow_fd_passing_output(link, true);
-    if (r < 0)
-        return r;
-    *ret = TAKE_PTR(link);
-    return 0;
-}
-
-/* One request/response with the service. Returns 0, -EPERM if the call came
- * back as a Varlink error (also printed via print_service_error(), unless
- * quiet), or whatever negative errno the RPC itself failed with. */
-static int transact(uint32_t op, const union defused_req *req, const int *fds,
-                    size_t fd_count, const char *mnt) {
-    if (fd_count > 2)
-        return -EINVAL;
-
-    _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *link = NULL;
-    int ret = connect_service(&link);
-    if (ret < 0)
-        return ret;
-
-    for (size_t i = 0; i < fd_count; i++) {
-        ret = sd_varlink_push_dup_fd(link, fds[i]);
-        if (ret < 0)
-            return ret;
-    }
-
-    /* Borrowed from the link, valid until its next call; not ours to unref. */
-    sd_json_variant *reply = NULL;
-    const char *error_id = NULL;
-    if (op == DEFUSED_OP_MOUNT)
-        ret = sd_varlink_callbo(
-            link, DEFUSED_VARLINK_METHOD_MOUNT, &reply, &error_id,
-            SD_JSON_BUILD_PAIR_UNSIGNED("fuseFileDescriptor", 0),
-            SD_JSON_BUILD_PAIR_UNSIGNED("mountpointFileDescriptor", 1),
-            SD_JSON_BUILD_PAIR_UNSIGNED("mountFlags", req->mount.mount_flags),
-            SD_JSON_BUILD_PAIR_UNSIGNED("maxRead", req->mount.max_read),
-            SD_JSON_BUILD_PAIR_UNSIGNED("blockSize", req->mount.blksize),
-            SD_JSON_BUILD_PAIR_STRING("fsName", req->mount.fsname),
-            SD_JSON_BUILD_PAIR_STRING("subtype", req->mount.subtype));
-    else if (op == DEFUSED_OP_UNMOUNT)
-        ret = sd_varlink_callbo(
-            link, DEFUSED_VARLINK_METHOD_UNMOUNT, &reply, &error_id,
-            SD_JSON_BUILD_PAIR_UNSIGNED("parentFileDescriptor", 0),
-            SD_JSON_BUILD_PAIR_STRING("name", req->umount.name),
-            SD_JSON_BUILD_PAIR_BOOLEAN("lazy", req->umount.lazy != 0));
-    else
-        ret = -EINVAL;
-    if (ret < 0) {
-        if (!quiet)
-            fprintf(stderr, "%s: %s request to %s failed: %s\n", progname,
-                    op == DEFUSED_OP_MOUNT ? "mount" : "unmount",
-                    privileged ? DEFUSED_PATH : "the service", strerror(-ret));
-        return ret;
-    }
-
-    if (error_id != NULL) {
-        struct defused_error err;
-        ret = defused_error_from_reply(error_id, reply, &err);
-        if (ret < 0)
-            return ret;
-        print_service_error(op, mnt, &err);
-        return -EPERM;
-    }
-
-    return 0;
-}
-
-static void print_service_error(uint32_t op, const char *mnt,
-                                const struct defused_error *err) {
-    if (quiet)
-        return;
-    const char *what = op == DEFUSED_OP_MOUNT ? "mount" : "unmount";
-    const char *reason = err->sys_errno ? strerror(err->sys_errno)
-                                        : "no reason given by the service";
-
-    if (!strcmp(err->id, DEFUSED_VARLINK_ERROR_MALFORMED))
-        fprintf(stderr, "%s: %s request rejected by the defused service: %s\n",
-                progname, what, reason);
-    else if (!strcmp(err->id, DEFUSED_VARLINK_ERROR_BAD_OPTION))
-        fprintf(stderr, "%s: mount options rejected by the defused service\n",
-                progname);
-    else if (!strcmp(err->id, DEFUSED_VARLINK_ERROR_NOT_ALLOWED))
-        fprintf(stderr,
-                op == DEFUSED_OP_MOUNT
-                    ? "%s: mount of %s not allowed by the defused service\n"
-                    : "%s: not allowed to unmount %s: not mounted by you\n",
-                progname, mnt);
-    else if (!strcmp(err->id, DEFUSED_VARLINK_ERROR_NOT_A_FUSE_MOUNT))
-        fprintf(stderr, "%s: %s is not a FUSE mount\n", progname, mnt);
-    else if (!strcmp(err->id, DEFUSED_VARLINK_ERROR_MOUNT_FAILED) ||
-             !strcmp(err->id, DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED))
-        fprintf(stderr, "%s: failed to %s %s: %s\n", progname, what, mnt,
-                reason);
-    else
-        /* A Varlink-level error, e.g. one of libsystemd's own. */
-        fprintf(stderr, "%s: %s request failed: %s\n", progname, what, err->id);
-}
-
-static void die(const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    fprintf(stderr, "%s: ", progname);
-    vfprintf(stderr, fmt, args);
-    fprintf(stderr, "\n");
-    fflush(stderr);
-    va_end(args);
-    exit(1);
-}
-
-static void usage(void) {
-    printf("%s: [options] mountpoint\n"
-           "Options:\n"
-           " -h		    print help\n"
-           " -V		    print version\n"
-           " -o opt[,opt...]    mount options\n"
-           " -u		    unmount\n"
-           " -q		    quiet\n"
-           " -z		    lazy unmount\n",
-           progname);
-    exit(1);
-}
-
-/*
- * Parses a fusermount3 -o string.
- * See prepare_mount() in libfuse's util/fusermount.c
- *
- * - fsname=/subtype= honor backslash escapes
- * - auto_unmount sets the global configuration variable
- * - the legacy/internal options are dropped silently; large_read is one of
- *   them, since libfuse's own helper ignores it on anything past Linux 2.4
- * - unsafe flag options (suid, dev) and blkdev are privileged: otherwise
- *   they are warned about and ignored, blkdev is an error
- * - anything unrecognized is a hard error.
- */
-static int parse_mount_opts(const char *opts, struct defused_mount_req *req) {
-    uint32_t mount_flags = 0;
-
-    for (const char *s = opts; *s;) {
-        int escape_ok = begins_with(s, "fsname=") || begins_with(s, "subtype=");
-        unsigned len;
-        for (len = 0; s[len]; len++) {
-            if (escape_ok && s[len] == '\\' && s[len + 1])
-                len++;
-            else if (s[len] == ',')
-                break;
-        }
-
-        if (begins_with(s, "fsname=")) {
-            int ret = copy_name(req->fsname, sizeof(req->fsname), "fsname",
-                                s + 7, len - 7, privileged);
-            if (ret < 0)
-                return ret;
-        } else if (begins_with(s, "subtype=")) {
-            int ret = copy_name(req->subtype, sizeof(req->subtype), "subtype",
-                                s + 8, len - 8, false);
-            if (ret < 0)
-                return ret;
-        } else if (opt_eq(s, len, "blkdev")) {
-            if (!privileged) {
-                fprintf(stderr, "%s: option blkdev is privileged\n", progname);
-                return -EPERM;
-            }
-            mount_flags |= DEFUSED_MOUNT_BLKDEV;
-        } else if (opt_eq(s, len, "auto_unmount")) {
-            auto_unmount = true;
-        } else if (opt_eq(s, len, "default_permissions")) {
-            mount_flags |= DEFUSED_FUSE_DEFAULT_PERMISSIONS;
-        } else if (opt_eq(s, len, "allow_other")) {
-            mount_flags |= DEFUSED_FUSE_ALLOW_OTHER;
-        } else if (begins_with(s, "max_read=")) {
-            int ret = parse_u32(s, len, "max_read=", &req->max_read);
-            if (ret < 0)
-                return ret;
-        } else if (begins_with(s, "blksize=")) {
-            int ret = parse_u32(s, len, "blksize=", &req->blksize);
-            if (ret < 0)
-                return ret;
-        } else if (opt_eq(s, len, "nonempty") || opt_eq(s, len, "large_read") ||
-                   begins_with(s, "fd=") || begins_with(s, "rootmode=") ||
-                   begins_with(s, "user_id=") || begins_with(s, "group_id=") ||
-                   begins_with(s, "x-")) {
-            /* dropped silently */
-        } else {
-            const struct flag_opt *fo;
-            for (fo = flag_opts; fo->opt; fo++)
-                if (opt_eq(s, len, fo->opt))
-                    break;
-            if (!fo->opt) {
-                fprintf(stderr, "%s: unknown option '%.*s'\n", progname,
-                        (int)len, s);
-                return -EINVAL;
-            }
-            if (!fo->safe && !privileged)
-                fprintf(stderr, "%s: unsafe option %s ignored\n", progname,
-                        fo->opt);
-            else if (fo->on)
-                mount_flags |= fo->flag;
-            else
-                mount_flags &= ~fo->flag;
-        }
-
-        s += len;
-        if (*s)
-            s++;
-    }
-
-    req->mount_flags = mount_flags;
-    return 0;
-}
-
-/* Copies an fsname=/subtype= value, resolving backslash escapes, and
- * checking character/length rules.
- * Escaped commas are valid here, matching libfuse's fuse_opt parser. */
-static int copy_name(char *dst, size_t dstsz, const char *what, const char *s,
-                     unsigned len, bool allow_slash) {
-    size_t d = 0;
-    for (unsigned i = 0; i < len; i++) {
-        char ch = s[i];
-        if (ch == '\\' && i + 1 < len)
-            ch = s[++i];
-        if (ch == '/' && !allow_slash) {
-            fprintf(stderr, "%s: invalid character '%c' in %s\n", progname, ch,
-                    what);
-            return -EINVAL;
-        }
-        if (d + 1 >= dstsz) {
-            fprintf(stderr, "%s: %s too long (max %zu characters)\n", progname,
-                    what, dstsz - 1);
-            return -ENAMETOOLONG;
-        }
-        dst[d++] = ch;
-    }
-    dst[d] = '\0';
-    return 0;
-}
-
-static int parse_u32(const char *s, unsigned len, const char *pfx,
-                     uint32_t *out) {
-    unsigned plen = (unsigned)strlen(pfx);
-    char buf[16];
-    if (len <= plen || len - plen >= sizeof(buf))
-        goto bad;
-    memcpy(buf, s + plen, len - plen);
-    buf[len - plen] = '\0';
-
-    long v;
-    if (libfuse_strtol(buf, &v) < 0 || v < 0 || v > UINT32_MAX)
-        goto bad;
-    *out = (uint32_t)v;
-    return 0;
-
-bad:
-    fprintf(stderr, "%s: invalid value for '%s' option\n", progname, pfx);
-    return -EINVAL;
+    return wait_and_auto_unmount((int)cfd, mnt) < 0 ? EXIT_FAILURE
+                                                    : EXIT_SUCCESS;
 }

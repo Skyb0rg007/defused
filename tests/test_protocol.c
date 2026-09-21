@@ -101,17 +101,11 @@ static int send_mount_req(int sock_fd, const struct defused_mount_req *req,
                           int dev_fd, int mnt_fd, struct defused_error *err) {
     _cleanup_close_ int sock = sock_fd;
     _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *link = NULL;
-    /* Borrowed from the link, valid until its next call; not ours to unref. */
-    sd_json_variant *reply = NULL;
-    const char *error_id = NULL;
     int ret = sd_varlink_connect_fd(&link, sock);
     if (ret < 0)
         return ret;
     TAKE_FD(sock);
 
-    ret = sd_varlink_set_allow_fd_passing_input(link, true);
-    if (ret < 0)
-        return ret;
     ret = sd_varlink_set_allow_fd_passing_output(link, true);
     if (ret < 0)
         return ret;
@@ -122,18 +116,10 @@ static int send_mount_req(int sock_fd, const struct defused_mount_req *req,
     if (ret < 0)
         return ret;
 
-    ret = sd_varlink_callbo(
-        link, DEFUSED_VARLINK_METHOD_MOUNT, &reply, &error_id,
-        SD_JSON_BUILD_PAIR_UNSIGNED("fuseFileDescriptor", 0),
-        SD_JSON_BUILD_PAIR_UNSIGNED("mountpointFileDescriptor", 1),
-        SD_JSON_BUILD_PAIR_UNSIGNED("mountFlags", req->mount_flags),
-        SD_JSON_BUILD_PAIR_UNSIGNED("maxRead", req->max_read),
-        SD_JSON_BUILD_PAIR_UNSIGNED("blockSize", req->blksize),
-        SD_JSON_BUILD_PAIR_STRING("fsName", req->fsname),
-        SD_JSON_BUILD_PAIR_STRING("subtype", req->subtype));
-    if (ret < 0)
-        return ret;
-    return defused_error_from_reply(error_id, reply, err);
+    struct defused_mount_req indexed = *req;
+    indexed.fuse_fd = 0;
+    indexed.mnt_fd = 1;
+    return defused_call_mount(link, &indexed, err);
 }
 
 /* Runs one mount request against a fresh defused instance and reports the
@@ -275,7 +261,7 @@ static int test_policy(const char *defused_path) {
     const char *const wrong_group[] = {groups_arg, NULL};
     struct defused_mount_req plain = {};
     int ret = expect_policy_reply(defused_path, wrong_group, &plain, dir,
-                                  DEFUSED_VARLINK_ERROR_NOT_ALLOWED,
+                                  DEFUSED_ERROR_NOT_ALLOWED,
                                   "caller outside --allow-groups");
     if (ret < 0)
         return ret;
@@ -284,14 +270,14 @@ static int test_policy(const char *defused_path) {
         .mount_flags = DEFUSED_FUSE_ALLOW_OTHER,
     };
     ret = expect_policy_reply(defused_path, NULL, &allow_other, dir,
-                              DEFUSED_VARLINK_ERROR_NOT_ALLOWED,
+                              DEFUSED_ERROR_NOT_ALLOWED,
                               "allow_other without --allow-other");
     if (ret < 0)
         return ret;
 
     const char *const with_allow_other[] = {"--allow-other", NULL};
     return expect_policy_reply(defused_path, with_allow_other, &allow_other,
-                               dir, DEFUSED_VARLINK_ERROR_MOUNT_FAILED,
+                               dir, DEFUSED_ERROR_MOUNT_FAILED,
                                "allow_other with --allow-other");
 }
 
@@ -454,11 +440,11 @@ static int test_daemon_mode(const char *defused_path) {
         .mount_flags = 1u << 31, /* never in DEFUSED_MOUNT_FLAGS_MASK */
     };
     ret = run_daemon_mount_req(sock_path, &bad_opt, ".",
-                               DEFUSED_VARLINK_ERROR_BAD_OPTION);
+                               DEFUSED_ERROR_BAD_OPTION);
     if (ret < 0)
         return ret;
     return run_daemon_mount_req(sock_path, &bad_opt, ".",
-                                DEFUSED_VARLINK_ERROR_BAD_OPTION);
+                                DEFUSED_ERROR_BAD_OPTION);
 }
 
 /* --daemon does not create the socket's parent directory -- it just binds
@@ -504,7 +490,7 @@ static int test_daemon_missing_socket_dir(const char *defused_path) {
     return 0;
 }
 
-/* Must match DEFUSED_DAEMON_MAX_CONNECTIONS in src/defused.c: the number of
+/* Must match DAEMON_MAX_CONNECTIONS in src/defused.c: the number of
  * concurrent connections test_daemon_connection_cap() needs to open to pin
  * defused_run_fork_daemon()'s live_children count at the cap. */
 #define TEST_DAEMON_MAX_CONNECTIONS 64
@@ -553,7 +539,7 @@ static int open_daemon_connections(const char *sock_path,
     return 0;
 }
 
-/* Exercises the DEFUSED_DAEMON_MAX_CONNECTIONS cap in
+/* Exercises the DAEMON_MAX_CONNECTIONS cap in
  * defused_run_fork_daemon(): opens exactly the cap's worth of connections and
  * leaves them open without sending a request, so live_children sits at the cap.
  * A further connection is then accepted by the kernel (connect() succeeds
@@ -643,7 +629,7 @@ int main(int argc, char *argv[]) {
         .mount_flags = 1u << 31, /* never in DEFUSED_MOUNT_FLAGS_MASK */
     };
     if (run_mount_req_expect(argv[1], all_policy_args, &bad_opt, ".",
-                             DEFUSED_VARLINK_ERROR_BAD_OPTION) != 0)
+                             DEFUSED_ERROR_BAD_OPTION) != 0)
         return 1;
 
     /* Only `defused --child` accepts these, never the service. */
@@ -651,16 +637,16 @@ int main(int argc, char *argv[]) {
         .mount_flags = DEFUSED_MOUNT_ALLOW_SUID,
     };
     if (run_mount_req_expect(argv[1], NULL, &privileged_opt, ".",
-                             DEFUSED_VARLINK_ERROR_BAD_OPTION) != 0)
+                             DEFUSED_ERROR_BAD_OPTION) != 0)
         return 1;
     privileged_opt.mount_flags = DEFUSED_MOUNT_ALLOW_DEV;
     if (run_mount_req_expect(argv[1], NULL, &privileged_opt, ".",
-                             DEFUSED_VARLINK_ERROR_BAD_OPTION) != 0)
+                             DEFUSED_ERROR_BAD_OPTION) != 0)
         return 1;
     privileged_opt.mount_flags = DEFUSED_MOUNT_BLKDEV;
-    strcpy(privileged_opt.fsname, "dev");
+    privileged_opt.fsname = "dev";
     if (run_mount_req_expect(argv[1], NULL, &privileged_opt, ".",
-                             DEFUSED_VARLINK_ERROR_BAD_OPTION) != 0)
+                             DEFUSED_ERROR_BAD_OPTION) != 0)
         return 1;
 
     if (test_bad_args(argv[1]) != 0)
@@ -675,7 +661,7 @@ int main(int argc, char *argv[]) {
         } else {
             struct defused_mount_req not_owned = {};
             if (run_mount_req_expect(argv[1], NULL, &not_owned, unowned,
-                                     DEFUSED_VARLINK_ERROR_NOT_ALLOWED) != 0)
+                                     DEFUSED_ERROR_NOT_ALLOWED) != 0)
                 return 1;
         }
 

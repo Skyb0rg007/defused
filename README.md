@@ -159,9 +159,8 @@ See [contributing.md](./doc/contributing.md).
 
 ## Licensing
 
-This project copies a some helpers from libfuse in [util.h](./src/util.h),
-which are either GPL-2.0-only or LGPL-2.1-only
-(marked via SPDX snippets in [util.c](./src/util.c)).
+The mountpoint filesystem allowlist in [defused.c](./src/defused.c) is
+copied from libfuse and is GPL-2.0-only (marked via an SPDX snippet).
 All of my code is licensed under GPL-2.0-or-later, but the resulting binary
 will be GPL-2.0-only.
 

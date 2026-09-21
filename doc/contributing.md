@@ -67,8 +67,7 @@ is released by a `_cleanup_` attribute on the variable holding it, not by a
 `DEFINE_TRIVIAL_CLEANUP_FUNC()` for other release functions; libsystemd's own
 `*_unrefp` helpers work with `_cleanup_()` directly. Hand a resource off with
 `TAKE_FD()`/`TAKE_PTR()`, close one early with `fd = safe_close(fd);`, and
-initialize unset fds to `-EBADF`. `src/util.c` is copied from libfuse and
-keeps libfuse's style instead.
+initialize unset fds to `-EBADF`.
 
 ## Formatting and licensing
 

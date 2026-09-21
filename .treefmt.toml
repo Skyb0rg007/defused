@@ -8,7 +8,6 @@
 command = "clang-format"
 options = ["-i"]
 includes = [ "*.c", "*.h" ]
-excludes = [ "src/util.c" ]
 
 [formatter.nixfmt]
 command = "nixfmt"

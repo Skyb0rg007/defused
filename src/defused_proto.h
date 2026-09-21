@@ -3,167 +3,96 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * Varlink protocol for setting up FUSE mounts.
- *
- * The protocol consists of a single request/response over a local Unix stream
- * socket. Framing, JSON parsing, and fd association are delegated to
- * libsystemd's sd-varlink implementation.
- * The default socket path is /run/defused/defused.sock, but can be overridden
- * with the DEFUSED_SOCKET environment variable.
- *
- * The server component (defused.service) will perform the validation, then
- * join the connecting process's mount namespace before performing the
- * mount or umount operations.
+ * The Varlink protocol between fusermount3 and the defused service: one
+ * request/response over an AF_UNIX stream socket, framed and parsed by
+ * libsystemd's sd-varlink. See doc/protocol.md.
  */
 
 #ifndef DEFUSED_PROTO_H
 #define DEFUSED_PROTO_H
 
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <systemd/sd-json.h>
-#include <systemd/sd-varlink-idl.h>
+#include <systemd/sd-varlink.h>
 
 #define DEFUSED_SOCKET_PATH "/run/defused/defused.sock"
 
-#define DEFUSED_VARLINK_INTERFACE "website.soss.defused"
-#define DEFUSED_VARLINK_METHOD_MOUNT "website.soss.defused.Mount"
-#define DEFUSED_VARLINK_METHOD_UNMOUNT "website.soss.defused.Unmount"
+#define DEFUSED_INTERFACE "website.soss.defused"
+#define DEFUSED_METHOD_MOUNT DEFUSED_INTERFACE ".Mount"
+#define DEFUSED_METHOD_UNMOUNT DEFUSED_INTERFACE ".Unmount"
 
-/* The operation to perform */
+/* A failed request is answered with one of these; a successful one gets an
+ * empty reply. MalformedRequest, MountFailed and UnmountFailed carry an
+ * "errno" field. */
+#define DEFUSED_ERROR_MALFORMED DEFUSED_INTERFACE ".MalformedRequest"
+#define DEFUSED_ERROR_BAD_OPTION DEFUSED_INTERFACE ".BadMountOption"
+#define DEFUSED_ERROR_NOT_ALLOWED DEFUSED_INTERFACE ".NotAllowed"
+#define DEFUSED_ERROR_NOT_A_FUSE_MOUNT DEFUSED_INTERFACE ".NotAFuseMount"
+#define DEFUSED_ERROR_MOUNT_FAILED DEFUSED_INTERFACE ".MountFailed"
+#define DEFUSED_ERROR_UNMOUNT_FAILED DEFUSED_INTERFACE ".UnmountFailed"
+
+#define DEFUSED_MAX_NAME 32      /* subtype */
+#define DEFUSED_MAX_FSNAME 4096  /* fsname (a device path for blkdev) */
+#define DEFUSED_MAX_FILENAME 255 /* mountpoint basename */
+
 enum defused_op {
     DEFUSED_OP_MOUNT = 1,
     DEFUSED_OP_UNMOUNT = 2,
 };
 
-/* The Varlink errors a failed request is reported as; a successful one gets
- * an empty reply. Defined in defused-varlink.c. */
-#define DEFUSED_VARLINK_ERROR_MALFORMED                                        \
-    DEFUSED_VARLINK_INTERFACE ".MalformedRequest"
-#define DEFUSED_VARLINK_ERROR_BAD_OPTION                                       \
-    DEFUSED_VARLINK_INTERFACE ".BadMountOption"
-#define DEFUSED_VARLINK_ERROR_NOT_ALLOWED                                      \
-    DEFUSED_VARLINK_INTERFACE ".NotAllowed"
-#define DEFUSED_VARLINK_ERROR_NOT_A_FUSE_MOUNT                                 \
-    DEFUSED_VARLINK_INTERFACE ".NotAFuseMount"
-#define DEFUSED_VARLINK_ERROR_MOUNT_FAILED                                     \
-    DEFUSED_VARLINK_INTERFACE ".MountFailed"
-#define DEFUSED_VARLINK_ERROR_UNMOUNT_FAILED                                   \
-    DEFUSED_VARLINK_INTERFACE ".UnmountFailed"
-
-/* Max length of an error id in struct defused_error */
-#define DEFUSED_MAX_ERROR_ID 64
-
-/* Max length of the log-only diagnostic in struct defused_error */
-#define DEFUSED_MAX_ERROR_DETAIL 160
-
-/* Max length of subtype */
-#define DEFUSED_MAX_NAME 32
-
-/* Max length of fsname (a device path for blkdev) */
-#define DEFUSED_MAX_FSNAME 4096
-
-/* Mountpoint basename */
-#define DEFUSED_MAX_FILENAME 255
-
-/* Options that can be specified when creating a FUSE mount */
+/* Mount.mountFlags bits. */
 enum defused_mount_flag {
-    /* Create a read-only mount */
     DEFUSED_MOUNT_RDONLY = 1u << 0,
-    /* Allow device files (privileged) */
-    DEFUSED_MOUNT_ALLOW_DEV = 1u << 1,
-    /* Strip the execute bit from files */
+    DEFUSED_MOUNT_ALLOW_DEV = 1u << 1, /* privileged */
     DEFUSED_MOUNT_NOEXEC = 1u << 2,
-    /* Don't track file access time */
     DEFUSED_MOUNT_NOATIME = 1u << 3,
-    /* Don't track directory access time */
     DEFUSED_MOUNT_NODIRATIME = 1u << 4,
-    /* Block access of files through symlinks on the filesystem  */
     DEFUSED_MOUNT_NOSYMFOLLOW = 1u << 5,
-    /* Force synchronous I/O */
     DEFUSED_MOUNT_SYNCHRONOUS = 1u << 6,
-    /* Force synchronous I/O for directory modifications */
     DEFUSED_MOUNT_DIRSYNC = 1u << 7,
-    /* Allow any user on the system to access the filesystem */
     DEFUSED_FUSE_ALLOW_OTHER = 1u << 8,
-    /* Have Linux VFS perform Unix permission checks */
     DEFUSED_FUSE_DEFAULT_PERMISSIONS = 1u << 9,
-    /* Honor set-user-ID bits (privileged) */
-    DEFUSED_MOUNT_ALLOW_SUID = 1u << 10,
-    /* Mount fuseblk on the block device named by fsname (privileged) */
-    DEFUSED_MOUNT_BLKDEV = 1u << 11,
+    DEFUSED_MOUNT_ALLOW_SUID = 1u << 10, /* privileged */
+    DEFUSED_MOUNT_BLKDEV = 1u << 11,     /* privileged: fuseblk on fsname */
 };
 #define DEFUSED_MOUNT_PRIVILEGED_FLAGS                                         \
     (DEFUSED_MOUNT_ALLOW_SUID | DEFUSED_MOUNT_ALLOW_DEV | DEFUSED_MOUNT_BLKDEV)
-#define DEFUSED_MOUNT_FLAGS_MASK                                               \
-    (DEFUSED_MOUNT_RDONLY | DEFUSED_MOUNT_NOEXEC | DEFUSED_MOUNT_NOATIME |     \
-     DEFUSED_MOUNT_NODIRATIME | DEFUSED_MOUNT_NOSYMFOLLOW |                    \
-     DEFUSED_MOUNT_SYNCHRONOUS | DEFUSED_MOUNT_DIRSYNC |                       \
-     DEFUSED_FUSE_ALLOW_OTHER | DEFUSED_FUSE_DEFAULT_PERMISSIONS |             \
-     DEFUSED_MOUNT_PRIVILEGED_FLAGS)
+#define DEFUSED_MOUNT_FLAGS_MASK ((1u << 12) - 1)
 
-/*
- * Request a FUSE mount. The Varlink call carries two file descriptors,
- * referenced from the JSON payload by fd index:
- *
- *  1. A file descriptor opened from /dev/fuse
- *  2. A file descriptor opened to the destination mountpoint directory or
- *     regular file
- *
- * The service will then attempt to create the mountpoint with the given
- * options at the location specified by the second file descriptor.
- */
+/* The Mount call. It carries two fds: /dev/fuse, and the mountpoint (a
+ * directory or regular file); fuse_fd and mnt_fd are their indices. */
 struct defused_mount_req {
-    /* enum defused_mount_flag bits */
+    uint32_t fuse_fd, mnt_fd;
     uint32_t mount_flags;
-    /* maximum read size, 0 for unset */
-    uint32_t max_read;
-    /* maximum block size, 0 for unset */
-    uint32_t blksize;
-    char fsname[DEFUSED_MAX_FSNAME];
-    char subtype[DEFUSED_MAX_NAME];
+    uint32_t max_read, blksize; /* 0 for unset */
+    const char *fsname, *subtype;
 };
 
-/*
- * Request a FUSE unmount. The Varlink call carries one file descriptor for the
- * *parent* directory of the mount to tear down, referenced from the JSON
- * payload by fd index.
- *
- * The service will unmount the FUSE filesystem mounted with the given name
- * in the directory passed via file descriptor.
- */
+/* The Unmount call. It carries one fd, the mountpoint's *parent* directory;
+ * name is the mountpoint's basename within it. */
 struct defused_umount_req {
-    /* set nonzero to perform a lazy unmount (MNT_DETACH) */
-    uint32_t lazy;
-    /* basename of the mountpoint */
-    char name[DEFUSED_MAX_FILENAME];
+    uint32_t parent_fd;
+    const char *name;
+    bool lazy;
 };
 
-union defused_req {
-    struct defused_mount_req mount;
-    struct defused_umount_req umount;
-};
-
-/* Why an operation failed; an empty id means it did not. sys_errno is the
- * error's "errno" field, 0 for the errors that don't carry one.
- *
- * detail names the exact check or syscall that failed. It only ever reaches
- * the service's log, never the wire, so it may say things the client is
- * deliberately not told: several causes share one error id, and some errors
- * carry no errno. */
+/* Why a request failed; an empty id means it did not. detail is for the
+ * service's log only and never goes on the wire. */
 struct defused_error {
-    char id[DEFUSED_MAX_ERROR_ID];
-    char detail[DEFUSED_MAX_ERROR_DETAIL];
-    int32_t sys_errno;
+    char id[64];
+    char detail[160];
+    int32_t sys_errno; /* the error's "errno" field, 0 if it has none */
 };
 
-/* The setters return -sys_errno so a caller can `return
- * defused_error_setf(...)`. */
-static inline int defused_error_set_detail(struct defused_error *err,
-                                           const char *id, int sys_errno,
-                                           const char *detail) {
+/* Both return -sys_errno so a caller can `return defused_error_set(...)`.
+ * Only the plain one is usable in the sandboxed child, which may not call
+ * vsnprintf(); a NULL id or detail means "". */
+static inline int defused_error_set(struct defused_error *err, const char *id,
+                                    int sys_errno, const char *detail) {
     strncpy(err->id, id ? id : "", sizeof(err->id) - 1);
     err->id[sizeof(err->id) - 1] = '\0';
     strncpy(err->detail, detail ? detail : "", sizeof(err->detail) - 1);
@@ -172,18 +101,10 @@ static inline int defused_error_set_detail(struct defused_error *err,
     return -sys_errno;
 }
 
-static inline int defused_error_set(struct defused_error *err, const char *id,
-                                    int sys_errno) {
-    return defused_error_set_detail(err, id, sys_errno, NULL);
-}
-
-/* vsnprintf() is more than the sandboxed child's seccomp filter allows, and
- * it may clobber errno: capture errno before calling. */
 __attribute__((__format__(__printf__, 4, 5))) static inline int
 defused_error_setf(struct defused_error *err, const char *id, int sys_errno,
                    const char *fmt, ...) {
-    defused_error_set(err, id, sys_errno);
-
+    defused_error_set(err, id, sys_errno, NULL);
     va_list ap;
     va_start(ap, fmt);
     (void)vsnprintf(err->detail, sizeof(err->detail), fmt, ap);
@@ -191,11 +112,16 @@ defused_error_setf(struct defused_error *err, const char *id, int sys_errno,
     return -sys_errno;
 }
 
-/* Fills in *err from an sd_varlink_call() result; a NULL error_id is
- * success. */
-int defused_error_from_reply(const char *error_id, sd_json_variant *parameters,
-                             struct defused_error *err);
-
+/* Defined in defused-varlink.c. */
 extern const sd_varlink_interface vl_interface_website_soss_defused;
+extern const sd_json_dispatch_field defused_mount_fields[];
+extern const sd_json_dispatch_field defused_umount_fields[];
+
+/* Client side: one call, with its outcome in *err. Returns a negative errno
+ * only if the RPC itself failed. A NULL fsname or subtype is sent as "". */
+int defused_call_mount(sd_varlink *link, const struct defused_mount_req *req,
+                       struct defused_error *err);
+int defused_call_umount(sd_varlink *link, const struct defused_umount_req *req,
+                        struct defused_error *err);
 
 #endif /* DEFUSED_PROTO_H */

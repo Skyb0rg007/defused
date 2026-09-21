@@ -191,28 +191,28 @@ static void test_fdinfo_pid(void) {
 static void test_fdinfo_parser(void) {
     long id = -1;
     const char *info = "pos:\t0\nflags:\t012100000\nmnt_id:\t31\nino:\t4242\n";
-    CHECK(defused_test_fdinfo_mnt_id(info, strlen(info), &id) == 0);
+    CHECK(defused_test_fdinfo_mnt_id(info, &id) == 0);
     CHECK(id == 31);
 
     id = -1;
     info = "pos:\t0\nflags:\t0\nmnt_id:\t7";
-    CHECK(defused_test_fdinfo_mnt_id(info, strlen(info), &id) == 0);
+    CHECK(defused_test_fdinfo_mnt_id(info, &id) == 0);
     CHECK(id == 7);
 
     info = "pos:\t0\nflags:\t0\nino:\t31\n";
-    CHECK(defused_test_fdinfo_mnt_id(info, strlen(info), &id) == -ENODATA);
+    CHECK(defused_test_fdinfo_mnt_id(info, &id) == -ENODATA);
 
     info = "pos:\t0\nxmnt_id:\t31\n";
-    CHECK(defused_test_fdinfo_mnt_id(info, strlen(info), &id) == -ENODATA);
+    CHECK(defused_test_fdinfo_mnt_id(info, &id) == -ENODATA);
 
     info = "mnt_id:\t\n";
-    CHECK(defused_test_fdinfo_mnt_id(info, strlen(info), &id) == -EINVAL);
+    CHECK(defused_test_fdinfo_mnt_id(info, &id) == -EINVAL);
 
     info = "mnt_id:\t3x\n";
-    CHECK(defused_test_fdinfo_mnt_id(info, strlen(info), &id) == -EINVAL);
+    CHECK(defused_test_fdinfo_mnt_id(info, &id) == -EINVAL);
 
     info = "mnt_id:\t99999999999999999999999\n";
-    CHECK(defused_test_fdinfo_mnt_id(info, strlen(info), &id) == -EOVERFLOW);
+    CHECK(defused_test_fdinfo_mnt_id(info, &id) == -EOVERFLOW);
 }
 
 int main(void) {
