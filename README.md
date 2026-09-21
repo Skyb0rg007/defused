@@ -51,11 +51,8 @@ passing API. Debian 13 (systemd 257) and Ubuntu 24.04 (255) are too old.
 This project provides the following:
 
 - A system service that listens on `/run/defused/defused.sock`.
-- A replacement `fusermount3` binary to communicate with the service.
-  The same binary is also installed as `fusermount`, libfuse2's helper:
-  the two speak the same protocol, and libfuse2's command line is a subset
-  of libfuse3's. Which name it was invoked under only changes the `-V`
-  banner.
+- A replacement `fusermount3` and `fusermount` binary to communicate with
+  the service.
 
 The system service is written to use systemd socket activation with
 `Accept=yes`.

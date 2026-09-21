@@ -62,8 +62,6 @@ fusermount3_exe = executable(
   install : true,
 )
 
-# libfuse2's fusermount speaks the same helper protocol, so the same binary
-# serves both; it reports its own name from argv[0].
 install_symlink(
   'fusermount',
   install_dir : get_option('bindir'),
