@@ -300,7 +300,7 @@ int defused_is_fuse_mount(uint64_t mnt_ns_id, uint64_t mnt_id, bool *out_blkdev,
 }
 
 /* By id, not by fd: an fd of 0 in mnt_id_req silently means "my own". */
-static int peer_mnt_ns_id(int pidfd, uint64_t *out_id) {
+int defused_peer_mnt_ns_id(int pidfd, uint64_t *out_id) {
     pid_t pid = pidfd_to_pid(pidfd);
     if (pid < 0)
         return (int)pid;
@@ -320,7 +320,7 @@ static int peer_mnt_ns_id(int pidfd, uint64_t *out_id) {
  * the fork nor setns(). */
 static int peer_fuse_mount_owner(int pidfd, uint64_t mnt_id, uid_t *out_uid) {
     uint64_t ns_id;
-    int ret = peer_mnt_ns_id(pidfd, &ns_id);
+    int ret = defused_peer_mnt_ns_id(pidfd, &ns_id);
     if (ret < 0)
         return ret;
     ret = defused_is_fuse_mount(ns_id, mnt_id, NULL, out_uid);

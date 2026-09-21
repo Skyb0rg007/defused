@@ -263,7 +263,7 @@ request from an unprivileged caller, and logs the reason for every denial:
 
 | Option | Meaning | Default |
 | --- | --- | --- |
-| `--max-mounts=N` | Refuse a mount once N FUSE filesystems are mounted | 100 |
+| `--max-mounts=N` | Refuse a mount once N FUSE filesystems are mounted in the caller's mount namespace | 100 |
 | `--allow-groups=GROUP[,GROUP...]` | Only members of these groups (names or gids, supplementary groups included via `SO_PEERGROUPS`) may mount and unmount | any user |
 | `--allow-other` | Let callers set the `allow_other` mount option | refused |
 
