@@ -176,6 +176,10 @@ in
       socketConfig = {
         Accept = true;
         ListenStream = "/run/defused/defused.sock";
+        # defused checks the name with sd_varlink_invocation(3).
+        FileDescriptorName = "varlink";
+        # Matches defused-activate; per source uid here.
+        MaxConnectionsPerSource = 16;
         RuntimeDirectory = "defused";
       }
       # XAttrEntryPoint= is new in systemd 262; older versions warn "Unknown key".

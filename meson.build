@@ -43,6 +43,17 @@ defused_exe = executable(
   install : true,
 )
 
+# Needs libsystemd's headers for defused_proto.h, but none of its code.
+activate_exe = executable(
+  'defused-activate',
+  'src/defused-activate.c',
+  dependencies : [
+    systemd_dep.partial_dependency(compile_args : true, includes : true),
+  ],
+  install_dir : defused_install_dir,
+  install : true,
+)
+
 fusermount3_exe = executable(
   'fusermount3',
   'src/fusermount3.c',
@@ -108,12 +119,13 @@ test_fusermount3_exe = executable(
   dependencies : [systemd_dep],
 )
 
+# test-protocol also drives defused-activate, so it takes a second path.
 foreach name, driven : {
-  'protocol': defused_exe,
-  'client': test_fusermount3_exe,
-  'mountns': defused_exe,
+  'protocol': [defused_exe, activate_exe],
+  'client': [test_fusermount3_exe],
+  'mountns': [defused_exe],
 }
-  test(name, varlink_tests[name], args : [driven], timeout : test_timeout)
+  test(name, varlink_tests[name], args : driven, timeout : test_timeout)
 endforeach
 
 test_sandbox_exe = executable(

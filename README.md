@@ -59,9 +59,9 @@ This project provides the following:
 
 The system service is written to use systemd socket activation with
 `Accept=yes`.
-For testing or on systems without systemd, `defused --daemon` can be used
-to create the Varlink socket and fork off child processes to handle
-accepted connections.
+For testing or on systems without systemd, `defused-activate` creates the
+Varlink socket and spawns a `defused` per accepted connection, handing the
+connection over the same way `Accept=yes` does.
 
 ## Mount policy
 

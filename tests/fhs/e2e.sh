@@ -7,7 +7,7 @@
 #
 # Run as root, after `meson install --prefix=/usr` and with the service
 # listening on /run/defused/defused.sock -- from the systemd socket unit or
-# from `defused --daemon`, this script does not care which. Mounts go through
+# from defused-activate, this script does not care which. Mounts go through
 # fuse-overlayfs, so the installed fusermount3 is driven by a real libfuse
 # client rather than by defused's own tests. Needs fuse-overlayfs, python3,
 # runuser and setpriv (util-linux).

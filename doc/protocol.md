@@ -26,19 +26,25 @@ It must be started as root.
 
 - **Socket path**: `/run/defused/defused.sock` (`DEFUSED_SOCKET_PATH`).
 - **Socket type**: `SOCK_STREAM`.
-- **Server-side activation**: the service socket unit uses `Accept=yes`,
-  and `defused` receives the already-`accept()`-ed connection through the
-  standard systemd `$LISTEN_PID`/`$LISTEN_FDS` protocol (`sd_listen_fds(3)`).
-  The socket is created by systemd at its default `SocketMode=`, 0666.
-- **`--daemon` activation**: for systems without systemd as service
-  manager, `defused --daemon` creates and binds the Varlink socket itself
-  (still at `DEFUSED_SOCKET_PATH` by default, also mode 0666), then forks
-  a child per accepted connection to run the same one-call-per-connection
-  handling as the `Accept=yes` path.
+- **Server-side activation**: the socket unit uses `Accept=yes` and
+  `FileDescriptorName=varlink`, so `defused` receives the
+  already-`accept()`-ed connection as the one `$LISTEN_FDS` fd and checks
+  for it with `sd_varlink_invocation(3)`, like systemd's own `Accept=yes`
+  Varlink services. The socket is created by systemd at its default
+  `SocketMode=`, 0666, with `MaxConnections=64` (the default) and
+  `MaxConnectionsPerSource=16`.
+- **`defused-activate`**: for systems without systemd as service manager.
+  It binds the Varlink socket itself (`DEFUSED_SOCKET_PATH` by default,
+  also mode 0666) and spawns one `defused` per accepted connection with
+  the same handoff and the same two connection limits.
+  `systemd-socket-activate(1)` is not usable in its place: it binds
+  `AF_UNIX` sockets 0644 with no way to change that, it does not tag the
+  socket for discovery, and it takes over a socket another process is
+  still serving.
 - **Discovery**: the socket inode is tagged with the extended attribute
   `user.varlink=entrypoint` as recommended by the [Varlink UAPI Spec][].
   This only works on Linux 7.0 and above.
-- **`--child`**: the same, but spawned by `fusermount3` via
+- **`--child`**: the same handoff, but spawned by `fusermount3` via
   `sd_varlink_connect_exec(3)`; see [Privileged callers](#privileged-callers).
 
 The service handles one Varlink method call and exits when the connection goes

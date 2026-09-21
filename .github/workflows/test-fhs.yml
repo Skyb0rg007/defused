@@ -8,8 +8,8 @@
 # systemd unit mismatch in #47 went unnoticed. Manually triggered; runs
 # locally with `act -W .github/workflows/test-fhs.yml` from the dev shell.
 #
-# Inside a container there is no systemd as PID 1, so the service runs as
-# `defused --daemon` and the units are only checked with systemd-analyze
+# Inside a container there is no systemd as PID 1, so the service runs under
+# defused-activate and the units are only checked with systemd-analyze
 # verify.
 
 name: test-fhs
@@ -59,10 +59,11 @@ jobs:
           systemd-analyze verify /usr/lib/systemd/system/defused.socket
           systemd-analyze verify /usr/lib/systemd/system/defused@.service
           apparmor_parser --skip-kernel-load --skip-cache /etc/apparmor.d/defused
-      - name: Start defused --daemon
+      - name: Start defused-activate
         run: |
           mkdir -p /run/defused
-          setsid /usr/lib/defused/defused --daemon >/run/defused/daemon.log 2>&1 &
+          setsid /usr/lib/defused/defused-activate /usr/lib/defused/defused \
+            >/run/defused/daemon.log 2>&1 &
           for _ in $(seq 50); do
             test -S /run/defused/defused.sock && break
             sleep 0.1
@@ -72,10 +73,10 @@ jobs:
         run: tests/fhs/e2e.sh
       # Once more with the policy restricted to the test user's group.
       # e2e.sh created that user above.
-      - name: Restart defused --daemon with a restricted policy
+      - name: Restart defused-activate with a restricted policy
         run: |
-          pkill -f '^/usr/lib/defused/defused --daemon' || true
-          setsid /usr/lib/defused/defused --daemon \
+          pkill -f '^/usr/lib/defused/defused-activate' || true
+          setsid /usr/lib/defused/defused-activate /usr/lib/defused/defused \
             --allow-groups=defused-test --max-mounts=10 \
             >>/run/defused/daemon.log 2>&1 &
           for _ in $(seq 50); do

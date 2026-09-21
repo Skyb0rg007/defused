@@ -9,6 +9,10 @@ Documentation=https://github.com/Skyb0rg007/defused
 [Socket]
 Accept=yes
 ListenStream=/run/defused/defused.sock
+# defused checks the name with sd_varlink_invocation(3).
+FileDescriptorName=varlink
+# Matches defused-activate; per source uid for AF_UNIX.
+MaxConnectionsPerSource=16
 RuntimeDirectory=defused
 XAttrEntryPoint=user.varlink=entrypoint
 

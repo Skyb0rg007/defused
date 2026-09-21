@@ -12,11 +12,11 @@ in
 common.mkTest {
   name = "daemon";
 
-  # Deliberately not common.baseNode: the whole point of --daemon is running
-  # without systemd Accept=yes socket activation, so the unit here is a plain,
-  # always-running service that execs `defused --daemon` directly.
-  # RuntimeDirectory= is still required: --daemon does not create /run/defused
-  # itself, it just binds a socket inside a directory that must already exist.
+  # Deliberately not common.baseNode: the whole point of defused-activate is
+  # running without systemd's own Accept=yes socket activation, so the unit
+  # here is a plain, always-running service that execs it directly.
+  # RuntimeDirectory= is still required: defused-activate does not create
+  # /run/defused, it binds inside a directory that must already exist.
   nodes.machine =
     { ... }:
     {
@@ -29,11 +29,13 @@ common.mkTest {
       ];
 
       systemd.services.defused = {
-        description = "defused FUSE mount service (fork-daemon mode)";
+        description = "defused FUSE mount service (defused-activate)";
         wantedBy = [ "multi-user.target" ];
 
         serviceConfig = {
-          ExecStart = "${package}/lib/defused/defused --daemon";
+          ExecStart =
+            "${package}/lib/defused/defused-activate "
+            + "${package}/lib/defused/defused";
           RuntimeDirectory = "defused";
         };
       };
@@ -49,19 +51,19 @@ common.mkTest {
     machine.wait_for_unit("defused.service")
     machine.wait_for_file("/run/defused/defused.sock")
 
-    # No socket unit is involved in --daemon mode.
+    # No socket unit is involved here.
     machine.fail("systemctl status defused.socket")
 
     machine.succeed(
         "grep '^ExecStart=' /etc/systemd/system/defused.service | "
-        "grep -F '${package}/lib/defused/defused --daemon'"
+        "grep -F '${package}/lib/defused/defused-activate'"
     )
 
-    # --daemon binds the socket 0666 itself, unlike systemd's Accept=yes
-    # (mode 0644) -- see issue #3. wait_until_succeeds rather than succeed:
-    # bind() and chmod() are separate syscalls in create_listening_socket(),
-    # so wait_for_file above can observe the socket a moment before its mode
-    # is updated.
+    # defused-activate binds the socket 0666 itself, unlike
+    # systemd-socket-activate (which hardcodes 0644) -- see issue #3.
+    # wait_until_succeeds rather than succeed: bind() and chmod() are
+    # separate syscalls in listen_socket(), so wait_for_file above can
+    # observe the socket a moment before its mode is updated.
     machine.wait_until_succeeds(
         "stat -c '%a' /run/defused/defused.sock | grep -qx 666"
     )
@@ -77,7 +79,7 @@ common.mkTest {
         ''
       else
         ''
-          # setxattr() failed with EPERM; the daemon must have carried on.
+          # setxattr() failed with EPERM; it must have carried on.
           machine.fail("getfattr -n user.varlink /run/defused/defused.sock")
         ''
     }

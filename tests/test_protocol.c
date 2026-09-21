@@ -45,8 +45,8 @@ static void sigterm_waitp(pid_t *pid) {
     }
 }
 
-/* A scratch directory for a --daemon instance, plus the socket path it is
- * told to bind inside it. Both are removed when it goes out of scope. */
+/* A scratch directory for a defused-activate instance, plus the socket
+ * path it binds inside it. Both are removed when it goes out of scope. */
 struct daemon_scratch {
     char dir[sizeof("/tmp/defused-daemon-XXXXXX")];
     char sock_path[sizeof("/tmp/defused-daemon-XXXXXX/defused.sock")];
@@ -106,6 +106,7 @@ static int spawn_defused(const char *defused_path,
         snprintf(pidbuf, sizeof(pidbuf), "%d", (int)getpid());
         setenv("LISTEN_PID", pidbuf, 1);
         setenv("LISTEN_FDS", "1", 1);
+        setenv("LISTEN_FDNAMES", "varlink", 1);
         const char *argv[8] = {"defused"};
         size_t argc = 1;
         for (size_t i = 0; extra_args != NULL && extra_args[i] != NULL &&
@@ -329,7 +330,7 @@ static int test_bad_args(const char *defused_path) {
         {"--max-mounts=ten", NULL},
         {"--allow-groups=defused-no-such-group", NULL},
         {"--allow-other=yes", NULL},
-        {"--daemon", "--child", NULL},
+        {"--daemon", NULL},
         {"stray-argument", NULL},
     };
     for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
@@ -340,15 +341,18 @@ static int test_bad_args(const char *defused_path) {
     return 0;
 }
 
-/* Spawns `defused --daemon`, pointed at sock_path via $DEFUSED_SOCKET
- * instead of the real /run/defused/defused.sock, mirroring how
- * nixos/tests/daemon.nix exercises the same knob for non-systemd setups. */
-static int spawn_defused_daemon(const char *defused_path, const char *sock_path,
+/* Spawns defused-activate on sock_path instead of the real
+ * /run/defused/defused.sock, mirroring how nixos/tests/daemon.nix runs it
+ * for non-systemd setups. */
+static int spawn_defused_daemon(const char *activate_path,
+                                const char *defused_path, const char *sock_path,
                                 pid_t *out_pid) {
+    char socket_arg[512];
+    snprintf(socket_arg, sizeof(socket_arg), "--socket=%s", sock_path);
     pid_t pid = fork();
     if (pid == 0) {
-        setenv("DEFUSED_SOCKET", sock_path, 1);
-        execl(defused_path, "defused", "--daemon", NULL);
+        execl(activate_path, "defused-activate", socket_arg, defused_path,
+              (char *)NULL);
         perror("exec");
         _exit(127);
     }
@@ -382,7 +386,7 @@ static int connect_daemon_socket(const char *sock_path) {
     return -ETIMEDOUT;
 }
 
-/* Runs one mount request through an already-running --daemon instance,
+/* Runs one mount request through an already-running defused-activate,
  * failing unless the reply is exactly expect_id. */
 static int run_daemon_mount_req(const char *sock_path,
                                 const struct defused_mount_req *req,
@@ -416,7 +420,7 @@ static const struct defused_mount_req bad_opt = {
     .mount_flags = 1u << 31, /* never in DEFUSED_MOUNT_FLAGS_MASK */
 };
 
-/* Exercises --daemon end to end: spawn the daemon against a scratch socket
+/* Exercises defused-activate end to end: spawn it against a scratch socket
  * path, connect to it like a real client would, and confirm a real Varlink
  * mount request round-trips through the forked-child connection handler.
  *
@@ -426,14 +430,16 @@ static const struct defused_mount_req bad_opt = {
  * it's really forking per connection, not a one-shot handler), and issuing
  * them without a pause also exercises defused_run_fork_daemon()'s live_children
  * cap under light concurrency without tripping it. */
-static int test_daemon_mode(const char *defused_path) {
+static int test_daemon_mode(const char *activate_path,
+                            const char *defused_path) {
     _cleanup_(daemon_scratch_done) struct daemon_scratch scratch = {};
     int ret = daemon_scratch_create(&scratch);
     if (ret < 0)
         return ret;
 
     _cleanup_(sigterm_waitp) pid_t pid = 0;
-    ret = spawn_defused_daemon(defused_path, scratch.sock_path, &pid);
+    ret = spawn_defused_daemon(activate_path, defused_path, scratch.sock_path,
+                               &pid);
     if (ret < 0)
         return ret;
 
@@ -445,12 +451,13 @@ static int test_daemon_mode(const char *defused_path) {
                                 DEFUSED_ERROR_BAD_OPTION);
 }
 
-/* --daemon does not create the socket's parent directory -- it just binds
- * inside a directory that must already exist (e.g. via systemd's
- * RuntimeDirectory=, see packaging/nixos/tests/daemon.nix). Confirms it
- * fails fast with a nonzero exit rather than creating the directory or
- * hanging. */
-static int test_daemon_missing_socket_dir(const char *defused_path) {
+/* defused-activate does not create the socket's parent directory -- it
+ * just binds inside a directory that must already exist (e.g. via
+ * systemd's RuntimeDirectory=, see packaging/nixos/tests/daemon.nix).
+ * Confirms it fails fast with a nonzero exit rather than creating the
+ * directory or hanging. */
+static int test_daemon_missing_socket_dir(const char *activate_path,
+                                          const char *defused_path) {
     _cleanup_(daemon_scratch_done) struct daemon_scratch scratch = {};
     int ret = daemon_scratch_create(&scratch);
     if (ret < 0)
@@ -463,7 +470,7 @@ static int test_daemon_missing_socket_dir(const char *defused_path) {
     snprintf(sock_path, sizeof(sock_path), "%s/defused.sock", missing_dir);
 
     pid_t pid;
-    ret = spawn_defused_daemon(defused_path, sock_path, &pid);
+    ret = spawn_defused_daemon(activate_path, defused_path, sock_path, &pid);
     if (ret < 0)
         return ret;
 
@@ -475,23 +482,23 @@ static int test_daemon_missing_socket_dir(const char *defused_path) {
     }
     if (!WIFEXITED(status) || WEXITSTATUS(status) == 0) {
         fprintf(stderr,
-                "FAIL: expected --daemon to exit nonzero with a missing "
-                "socket directory (status 0x%x)\n",
+                "FAIL: expected defused-activate to exit nonzero with a "
+                "missing socket directory (status 0x%x)\n",
                 status);
         return -EINVAL;
     }
     if (access(missing_dir, F_OK) == 0 || errno != ENOENT) {
-        fprintf(stderr, "FAIL: --daemon should not have created the socket "
-                        "directory\n");
+        fprintf(stderr, "FAIL: defused-activate should not have created the "
+                        "socket directory\n");
         return -EINVAL;
     }
     return 0;
 }
 
-/* Must match DAEMON_MAX_CONNECTIONS in src/defused.c: the number of
- * concurrent connections test_daemon_connection_cap() needs to open to pin
- * defused_run_fork_daemon()'s live_children count at the cap. */
-#define TEST_DAEMON_MAX_CONNECTIONS 64
+/* Must match MAX_CONNECTIONS_PER_UID in src/defused-activate.c. Every
+ * connection here comes from this test's own uid, so the per-uid cap binds
+ * long before MAX_CONNECTIONS does. */
+#define TEST_DAEMON_MAX_CONNECTIONS 16
 
 /* The connections test_daemon_connection_cap() holds open, closed together
  * when the batch goes out of scope. */
@@ -515,8 +522,8 @@ static void unix_addr(struct sockaddr_un *sa, const char *sock_path) {
 }
 
 /* Opens a connection to sock_path into every slot, leaving each one open
- * without sending a request, so every forked child stays alive blocked on
- * read and live_children holds at the cap. The first connection goes through
+ * without sending a request, so every spawned defused stays alive blocked
+ * on read and the per-uid count holds at the cap. The first goes through
  * connect_daemon_socket() to ride out the daemon's startup race; the rest
  * connect directly since the daemon is known to be up by then. On failure,
  * whatever was already opened is left for the caller's cleanup. */
@@ -542,22 +549,23 @@ static int open_daemon_connections(const char *sock_path,
     return 0;
 }
 
-/* Exercises the DAEMON_MAX_CONNECTIONS cap in
- * defused_run_fork_daemon(): opens exactly the cap's worth of connections and
- * leaves them open without sending a request, so live_children sits at the cap.
- * A further connection is then accepted by the kernel (connect() succeeds
- * immediately, since that only requires room in the listen backlog) but should
- * be closed by the daemon rather than handed to a forked child, so the client
- * sees EOF without ever getting a response. Also checks the connections under
- * the cap are untouched by the overflow. */
-static int test_daemon_connection_cap(const char *defused_path) {
+/* Exercises defused-activate's per-uid cap: opens exactly the cap's worth
+ * of connections and leaves them open without sending a request. A further
+ * connection is then accepted by the kernel (connect() succeeds
+ * immediately, since that only requires room in the listen backlog) but
+ * should be closed rather than handed to a child, so the client sees EOF
+ * without ever getting a response. Also checks the connections under the
+ * cap are untouched by the overflow. */
+static int test_daemon_connection_cap(const char *activate_path,
+                                      const char *defused_path) {
     _cleanup_(daemon_scratch_done) struct daemon_scratch scratch = {};
     int ret = daemon_scratch_create(&scratch);
     if (ret < 0)
         return ret;
 
     _cleanup_(sigterm_waitp) pid_t pid = 0;
-    ret = spawn_defused_daemon(defused_path, scratch.sock_path, &pid);
+    ret = spawn_defused_daemon(activate_path, defused_path, scratch.sock_path,
+                               &pid);
     if (ret < 0)
         return ret;
 
@@ -610,11 +618,14 @@ static int test_daemon_connection_cap(const char *defused_path) {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s /path/to/defused\n", argv[0]);
+    if (argc != 3) {
+        fprintf(stderr,
+                "usage: %s /path/to/defused /path/to/defused-activate\n",
+                argv[0]);
         return 2;
     }
     const char *defused = argv[1];
+    const char *activate = argv[2];
     test_set_timeout();
 
     /* Refused for its shape; this only checks the options parse. */
@@ -657,13 +668,13 @@ int main(int argc, char *argv[]) {
             return 1;
     }
 
-    if (test_daemon_mode(defused) != 0)
+    if (test_daemon_mode(activate, defused) != 0)
         return 1;
 
-    if (test_daemon_missing_socket_dir(defused) != 0)
+    if (test_daemon_missing_socket_dir(activate, defused) != 0)
         return 1;
 
-    if (test_daemon_connection_cap(defused) != 0)
+    if (test_daemon_connection_cap(activate, defused) != 0)
         return 1;
 
     return 0;

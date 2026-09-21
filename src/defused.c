@@ -6,11 +6,10 @@
  * The defused system service that mounts/unmounts FUSE filesystems on
  * behalf of unprivileged users.
  *
- * By default it handles the one connection systemd's Accept=yes socket
- * activation hands it, then exits. With --daemon it listens itself and
- * forks a child per connection; with --child (spawned by fusermount3 for a
- * privileged caller) policy is skipped and the mount/unmount is done
- * in-process.
+ * It handles the one connection socket activation hands it, then exits.
+ * With --child (spawned by fusermount3 for a privileged caller) policy is
+ * skipped. Without systemd as the service manager, defused-activate binds
+ * the socket and spawns one of these per connection.
  */
 #define _GNU_SOURCE
 #include "common.h"
@@ -22,7 +21,6 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <grp.h>
-#include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -33,11 +31,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
-#include <sys/un.h>
 #include <sys/vfs.h>
-#include <sys/wait.h>
-#include <sys/xattr.h>
-#include <systemd/sd-daemon.h>
 #include <systemd/sd-event.h>
 #include <unistd.h>
 
@@ -50,10 +44,8 @@
 #include <linux/mount.h>
 
 #define DEFAULT_MAX_MOUNTS 100
-/* A backstop for --daemon, like systemd's MaxConnections=. */
-#define DAEMON_MAX_CONNECTIONS 64
 
-static bool cfg_daemon, cfg_child, cfg_allow_other;
+static bool cfg_child, cfg_allow_other;
 static long cfg_max_mounts = DEFAULT_MAX_MOUNTS;
 static gid_t cfg_allow_groups[32];
 static size_t cfg_n_allow_groups;
@@ -657,11 +649,9 @@ static int varlink_unmount(sd_varlink *link, sd_json_variant *parameters,
 
 /*** Connections ***/
 
-/* Serves one already-connected Varlink socket to completion (one
- * mount/unmount request). Takes ownership of sock_fd; returns an exit
- * status. */
-static int handle_connection(int sock_fd) {
-    _cleanup_close_ int sock = sock_fd;
+/* Serves the connection handed to us to completion (one mount/unmount
+ * request) and returns an exit status. */
+static int handle_connection(void) {
     _cleanup_(sd_event_unrefp) sd_event *event = NULL;
     _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *server = NULL;
     int ret;
@@ -675,13 +665,16 @@ static int handle_connection(int sock_fd) {
              server, DEFUSED_METHOD_MOUNT, varlink_mount,
              DEFUSED_METHOD_UNMOUNT, varlink_unmount)) < 0 ||
         (ret = sd_varlink_server_set_exit_on_idle(server, true)) < 0 ||
-        (ret = sd_varlink_server_attach_event(server, event, 0)) < 0 ||
-        /* The server owns the fd once added; on failure it is still ours. */
-        (ret = sd_varlink_server_add_connection(server, sock, NULL)) < 0) {
+        (ret = sd_varlink_server_attach_event(server, event, 0)) < 0) {
         log_error(ret, "Varlink server setup failed");
         return EXIT_FAILURE;
     }
-    TAKE_FD(sock);
+    /* Adopts the fd named "varlink", which main() has already checked for. */
+    ret = sd_varlink_server_listen_auto(server);
+    if (ret <= 0) {
+        log_error(ret == 0 ? -ENOENT : ret, "adopting the passed socket");
+        return EXIT_FAILURE;
+    }
     ret = sd_event_loop(event);
     if (ret < 0) {
         log_error(ret, "Varlink server failed");
@@ -690,111 +683,19 @@ static int handle_connection(int sock_fd) {
     return EXIT_SUCCESS;
 }
 
-static volatile sig_atomic_t live_children;
-
-static void sigchld_handler(int sig) {
-    (void)sig;
-    int saved_errno = errno;
-    while (waitpid(-1, NULL, WNOHANG) > 0)
-        live_children--;
-    errno = saved_errno;
-}
-
-/* Mode 0666, so non-root callers can reach it. A stale socket (nothing
- * accepting) is replaced. */
-static int listen_socket(const char *path) {
-    struct sockaddr_un sa = {.sun_family = AF_UNIX};
-    if (strlen(path) >= sizeof(sa.sun_path))
-        return log_error(-ENAMETOOLONG, "socket path %s", path);
-    strcpy(sa.sun_path, path);
-    _cleanup_close_ int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (fd == -1)
-        return log_error(-errno, "socket");
-    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) == -1) {
-        if (errno != EADDRINUSE)
-            return log_error(-errno, "bind(%s)", path);
-        _cleanup_close_ int probe =
-            socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-        if (probe == -1 ||
-            connect(probe, (struct sockaddr *)&sa, sizeof(sa)) == 0 ||
-            errno != ECONNREFUSED)
-            return log_error(-EADDRINUSE, "socket %s", path);
-        if (unlink(path) == -1 ||
-            bind(fd, (struct sockaddr *)&sa, sizeof(sa)) == -1)
-            return log_error(-errno, "replacing the stale socket %s", path);
-    }
-    /* Like systemd's XAttrEntryPoint=; kernels before 7.0 refuse it. */
-    (void)setxattr(path, "user.varlink", "entrypoint", 10, 0);
-    if (chmod(path, 0666) == -1 || listen(fd, SOMAXCONN) == -1) {
-        int ret = log_error(-errno, "chmod()/listen() on %s", path);
-        unlink(path);
-        return ret;
-    }
-    fprintf(stderr, "defused: listening on %s\n", path);
-    return TAKE_FD(fd);
-}
-
-/* --daemon: returns only on a fatal error. */
-static int run_daemon(void) {
-    const char *path = getenv("DEFUSED_SOCKET");
-    if (path == NULL || *path == '\0')
-        path = DEFUSED_SOCKET_PATH;
-    _cleanup_close_ int listen_fd = listen_socket(path);
-    if (listen_fd < 0)
-        return listen_fd;
-
-    /* SA_RESTART: accept4() only sees EINTR from other signals. */
-    struct sigaction sa = {.sa_handler = sigchld_handler,
-                           .sa_flags = SA_RESTART};
-    sigemptyset(&sa.sa_mask);
-    if (sigaction(SIGCHLD, &sa, NULL) == -1)
-        return log_error(-errno, "sigaction(SIGCHLD)");
-
-    for (;;) {
-        _cleanup_close_ int conn = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
-        if (conn == -1) {
-            if (errno == EINTR)
-                continue;
-            log_error(-errno, "accept4");
-            if (errno == EMFILE || errno == ENFILE || errno == ECONNABORTED)
-                continue; /* transient */
-            return -errno;
-        }
-        /* Past the cap: closed, so the client fails fast. */
-        if (live_children >= DAEMON_MAX_CONNECTIONS) {
-            fprintf(stderr,
-                    "defused: refusing connection: %d already being handled "
-                    "(max %d)\n",
-                    (int)live_children, DAEMON_MAX_CONNECTIONS);
-            continue;
-        }
-        pid_t pid = fork();
-        if (pid == -1) {
-            log_error(-errno, "fork");
-            continue;
-        }
-        if (pid == 0) {
-            listen_fd = safe_close(listen_fd);
-            /* This child waits for a sandbox child of its own. */
-            signal(SIGCHLD, SIG_DFL);
-            _exit(handle_connection(TAKE_FD(conn)));
-        }
-        live_children++;
-    }
-}
-
 /*** Command line ***/
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "usage: %s [--daemon | --child] [POLICY OPTION...]\n"
+            "usage: %s [--child] [POLICY OPTION...]\n"
             "\n"
-            "Handles one mount/unmount request on the socket-activation fd;\n"
-            "meant to be spawned by systemd, one process per connection.\n"
+            "Handles one mount/unmount request on the connected socket\n"
+            "passed in as the single $LISTEN_FDS fd named \"varlink\", then\n"
+            "exits; meant to be spawned by systemd socket activation with\n"
+            "Accept=yes and FileDescriptorName=varlink, one process per\n"
+            "connection. Without systemd, defused-activate does the same\n"
+            "handoff.\n"
             "\n"
-            "  --daemon  listen on $DEFUSED_SOCKET (default %s)\n"
-            "            and fork a child per connection, for non-systemd\n"
-            "            setups\n"
             "  --child   handle the request with this process's own\n"
             "            privileges and no policy; spawned by fusermount3\n"
             "            for root and CAP_SYS_ADMIN callers\n"
@@ -805,7 +706,7 @@ static void usage(const char *prog) {
             "  --allow-groups=GROUP,...  only members of these groups (names\n"
             "                            or gids) may mount and unmount\n"
             "  --allow-other             let callers set allow_other\n",
-            prog, DEFUSED_SOCKET_PATH, DEFAULT_MAX_MOUNTS);
+            prog, DEFAULT_MAX_MOUNTS);
 }
 
 /* Empty is allowed, so a unit file can pass an unset variable. */
@@ -846,15 +747,8 @@ static int parse_allow_groups(const char *arg) {
 }
 
 static int parse_args(int argc, char *argv[]) {
-    enum {
-        OPT_DAEMON = 256,
-        OPT_CHILD,
-        OPT_MAX_MOUNTS,
-        OPT_ALLOW_GROUPS,
-        OPT_ALLOW_OTHER
-    };
+    enum { OPT_CHILD = 256, OPT_MAX_MOUNTS, OPT_ALLOW_GROUPS, OPT_ALLOW_OTHER };
     static const struct option opts[] = {
-        {"daemon", no_argument, NULL, OPT_DAEMON},
         {"child", no_argument, NULL, OPT_CHILD},
         {"max-mounts", required_argument, NULL, OPT_MAX_MOUNTS},
         {"allow-groups", required_argument, NULL, OPT_ALLOW_GROUPS},
@@ -864,9 +758,6 @@ static int parse_args(int argc, char *argv[]) {
     };
     for (int c; (c = getopt_long(argc, argv, "h", opts, NULL)) != -1;) {
         switch (c) {
-        case OPT_DAEMON:
-            cfg_daemon = true;
-            break;
         case OPT_CHILD:
             cfg_child = true;
             break;
@@ -895,11 +786,8 @@ static int parse_args(int argc, char *argv[]) {
             return -EINVAL;
         }
     }
-    if (optind < argc || (cfg_daemon && cfg_child)) {
-        fprintf(stderr,
-                optind < argc ? "defused: unexpected argument: %s\n"
-                              : "defused: --daemon and --child are exclusive\n",
-                argv[optind]);
+    if (optind < argc) {
+        fprintf(stderr, "defused: unexpected argument: %s\n", argv[optind]);
         usage(argv[0]);
         return -EINVAL;
     }
@@ -909,16 +797,26 @@ static int parse_args(int argc, char *argv[]) {
 int main(int argc, char *argv[]) {
     if (parse_args(argc, argv) < 0)
         return EXIT_FAILURE;
-    if (cfg_daemon)
-        return run_daemon() < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
-
-    /* systemd's Accept=yes (and sd_varlink_connect_exec()) hand over the
-     * connection as fd 3. */
-    if (sd_listen_fds(1) != 1 ||
-        sd_is_socket_unix(SD_LISTEN_FDS_START, SOCK_STREAM, 0, NULL, 0) <= 0) {
-        fprintf(stderr, "defused: expected exactly one connected AF_UNIX "
-                        "stream socket via $LISTEN_FDS\n");
+    /* listen_auto() would honour it: a world-connectable, policy-free
+     * server. */
+    if (cfg_child && getenv("SYSTEMD_VARLINK_LISTEN") != NULL) {
+        fprintf(stderr, "defused: --child serves only the connection "
+                        "fusermount3 passed in; $SYSTEMD_VARLINK_LISTEN is "
+                        "refused\n");
         return EXIT_FAILURE;
     }
-    return handle_connection(SD_LISTEN_FDS_START);
+
+    /* systemd's Accept=yes, defused-activate and sd_varlink_connect_exec()
+     * all hand the connection over as the one $LISTEN_FDS fd, named
+     * "varlink". */
+    int ret = sd_varlink_invocation(SD_VARLINK_ALLOW_ACCEPT);
+    if (ret <= 0) {
+        fprintf(stderr,
+                "defused: expected exactly one connected socket passed via "
+                "$LISTEN_FDS as \"varlink\" (Accept=yes and "
+                "FileDescriptorName=varlink in the .socket unit)%s%s\n",
+                ret < 0 ? ": " : "", ret < 0 ? strerror(-ret) : "");
+        return EXIT_FAILURE;
+    }
+    return handle_connection();
 }

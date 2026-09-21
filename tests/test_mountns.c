@@ -249,6 +249,7 @@ static int spawn_defused(const char *defused_path, int conn_fd,
         snprintf(pidbuf, sizeof(pidbuf), "%d", (int)getpid());
         setenv("LISTEN_PID", pidbuf, 1);
         setenv("LISTEN_FDS", "1", 1);
+        setenv("LISTEN_FDNAMES", "varlink", 1);
         execl(defused_path, "defused", NULL);
         perror("exec defused");
         _exit(127);
