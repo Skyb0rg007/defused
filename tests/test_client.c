@@ -175,14 +175,15 @@ static int method_mount(sd_varlink *link, sd_json_variant *parameters,
     CHECK(sd_varlink_dispatch(link, parameters, dispatch_table, &p) == 0);
     CHECK(sd_varlink_get_n_fds(link) == 2);
 
-    uint32_t expected_flags =
-        DEFUSED_MOUNT_RDONLY | DEFUSED_MOUNT_NOEXEC | DEFUSED_MOUNT_ALLOW_DEV |
-        DEFUSED_MOUNT_SYNCHRONOUS | DEFUSED_MOUNT_DIRSYNC |
-        DEFUSED_FUSE_DEFAULT_PERMISSIONS;
-    /* suid is ignored for an unprivileged caller and honored for a
+    uint32_t expected_flags = DEFUSED_MOUNT_RDONLY | DEFUSED_MOUNT_NOEXEC |
+                              DEFUSED_MOUNT_SYNCHRONOUS |
+                              DEFUSED_MOUNT_DIRSYNC |
+                              DEFUSED_FUSE_DEFAULT_PERMISSIONS;
+    /* suid and dev are ignored for an unprivileged caller and honored for a
      * privileged one, which also sends blkdev (see privileged_mount_opts). */
     if (strcmp(getenv("DEFUSED_TEST_UID"), "0") == 0)
-        expected_flags |= DEFUSED_MOUNT_ALLOW_SUID | DEFUSED_MOUNT_BLKDEV;
+        expected_flags |= DEFUSED_MOUNT_ALLOW_SUID | DEFUSED_MOUNT_ALLOW_DEV |
+                          DEFUSED_MOUNT_BLKDEV;
     CHECK(p.mount_flags == expected_flags);
     CHECK(p.max_read == 4096);
     CHECK(p.blksize == 0);

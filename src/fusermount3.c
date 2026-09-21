@@ -68,7 +68,7 @@ static const struct flag_opt flag_opts[] = {
     {"ro", DEFUSED_MOUNT_RDONLY, true, true},
     {"suid", DEFUSED_MOUNT_ALLOW_SUID, true, false},
     {"nosuid", DEFUSED_MOUNT_ALLOW_SUID, false, true},
-    {"dev", DEFUSED_MOUNT_ALLOW_DEV, true, true},
+    {"dev", DEFUSED_MOUNT_ALLOW_DEV, true, false},
     {"nodev", DEFUSED_MOUNT_ALLOW_DEV, false, true},
     {"exec", DEFUSED_MOUNT_NOEXEC, false, true},
     {"noexec", DEFUSED_MOUNT_NOEXEC, true, true},
@@ -517,8 +517,8 @@ static void usage(void) {
  * - fsname=/subtype= honor backslash escapes
  * - auto_unmount sets the global configuration variable
  * - the legacy/internal options are dropped silently
- * - unsafe flag options (just suid) and blkdev are privileged: otherwise
- *   suid is warned about and ignored, blkdev is an error
+ * - unsafe flag options (suid, dev) and blkdev are privileged: otherwise
+ *   they are warned about and ignored, blkdev is an error
  * - anything unrecognized is a hard error.
  */
 static int parse_mount_opts(const char *opts, struct defused_mount_req *req) {

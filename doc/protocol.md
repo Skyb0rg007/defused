@@ -71,9 +71,8 @@ array associated with the call. `fusermount3` sends `0` and `1`, respectively.
 
 `mountFlags` is the final option bitmask requested by the client. The empty
 bitmask is the fusermount3-compatible unprivileged default: `nosuid` and
-`nodev` are enforced unless the client explicitly sets
-`DEFUSED_MOUNT_ALLOW_DEV` (or, from a privileged caller,
-`DEFUSED_MOUNT_ALLOW_SUID`).
+`nodev` are enforced unless a privileged caller explicitly sets
+`DEFUSED_MOUNT_ALLOW_SUID` or `DEFUSED_MOUNT_ALLOW_DEV`.
 
 Policy applied before the mount is attempted:
 
@@ -146,13 +145,14 @@ filesystem-type allowlist, polkit, and the unmount `user_id=` check, and calls
 `move_mount()` or `umount2()` directly in the caller's mount namespace.
 Like root's `umount`, it unmounts any mount below the parent directory.
 
-It is also the only path that accepts `DEFUSED_MOUNT_ALLOW_SUID` (`suid`) and
-`DEFUSED_MOUNT_BLKDEV` (`blkdev`: a `fuseblk` mount whose `fsName` is the
-block device path, so it may contain slashes here), as libfuse's `fusermount3`
-does for root.
-The service answers `BadMountOption` to both rather than asking polkit, since
-a rule granting `suid` would let a user's FUSE server hand out setuid-root
-binaries.
+It is also the only path that accepts `DEFUSED_MOUNT_ALLOW_SUID` (`suid`),
+`DEFUSED_MOUNT_ALLOW_DEV` (`dev`) and `DEFUSED_MOUNT_BLKDEV` (`blkdev`: a
+`fuseblk` mount whose `fsName` is the block device path, so it may contain
+slashes here), as libfuse's `fusermount3` does for root: `suid` and `dev` are
+the two options its own table marks unsafe.
+The service answers `BadMountOption` to all three rather than asking polkit,
+since a rule granting `suid` or `dev` would let a user's FUSE server hand out
+setuid-root binaries or device nodes.
 
 ## Errors
 

@@ -33,6 +33,7 @@ pkgs.testers.nixosTest {
     machine.succeed("install -d -o alice -g users /home/alice/default-mnt")
     machine.succeed("install -d -o alice -g users /home/alice/readonly-mnt")
     machine.succeed("install -d -o alice -g users /home/alice/options-mnt")
+    machine.succeed("install -d -o alice -g users /home/alice/unsafe-mnt")
 
     machine.succeed(
         "timeout 45s runuser -u alice -- "
@@ -51,11 +52,20 @@ pkgs.testers.nixosTest {
         "timeout 45s runuser -u alice -- "
         "${pkgs.python3}/bin/python3 ${common.mountHelper} "
         "assert-mount /home/alice/options-mnt "
-        "'noexec,dev,noatime,nodiratime,nosymfollow,"
+        "'noexec,noatime,nodiratime,nosymfollow,"
         "allow_other,default_permissions,fsname=optsfs,subtype=opts,"
         "max_read=4096' "
         "' - fuse.opts optsfs ' noexec noatime nodiratime "
         "nosymfollow allow_other default_permissions"
+    )
+    # suid and dev are the two options libfuse marks unsafe: an unprivileged
+    # caller gets a warning and the flag is dropped, so the mount still has
+    # nosuid and nodev.
+    machine.succeed(
+        "timeout 45s runuser -u alice -- "
+        "${pkgs.python3}/bin/python3 ${common.mountHelper} "
+        "assert-mount /home/alice/unsafe-mnt 'suid,dev' "
+        "' - fuse fuse ' nosuid nodev"
     )
   '';
 }
