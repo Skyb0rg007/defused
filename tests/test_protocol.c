@@ -11,7 +11,7 @@
 #define _GNU_SOURCE
 #include "common.h"
 #include "defused_proto.h"
-#include "test_timeout.h"
+#include "test_util.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -31,18 +31,11 @@
 #include <systemd/sd-varlink.h>
 #include <unistd.h>
 
-/* Scope-exit teardown for the scratch state the daemon tests create: a
- * mkdtemp()'d directory, the socket path a daemon binds inside it, and the
- * daemon process itself. Each is a no-op while NULL/0, so the variable can
- * be declared before the resource exists. */
+/* Scope-exit teardown, each a no-op while the resource is unset so the
+ * variable can be declared before it exists. */
 static void rmdirp(const char **dir) {
     if (*dir)
         rmdir(*dir);
-}
-
-static void unlinkp(const char **path) {
-    if (*path)
-        unlink(*path);
 }
 
 static void sigterm_waitp(pid_t *pid) {
@@ -50,6 +43,42 @@ static void sigterm_waitp(pid_t *pid) {
         kill(*pid, SIGTERM);
         waitpid(*pid, NULL, 0);
     }
+}
+
+/* A scratch directory for a --daemon instance, plus the socket path it is
+ * told to bind inside it. Both are removed when it goes out of scope. */
+struct daemon_scratch {
+    char dir[sizeof("/tmp/defused-daemon-XXXXXX")];
+    char sock_path[sizeof("/tmp/defused-daemon-XXXXXX/defused.sock")];
+};
+
+static void daemon_scratch_done(struct daemon_scratch *s) {
+    if (s->dir[0] != '\0') {
+        unlink(s->sock_path);
+        rmdir(s->dir);
+    }
+}
+
+static int daemon_scratch_create(struct daemon_scratch *s) {
+    strcpy(s->dir, "/tmp/defused-daemon-XXXXXX");
+    if (mkdtemp(s->dir) == NULL) {
+        perror("mkdtemp");
+        s->dir[0] = '\0';
+        return -errno;
+    }
+    snprintf(s->sock_path, sizeof(s->sock_path), "%s/defused.sock", s->dir);
+    return 0;
+}
+
+/* Fails unless the service answered with exactly expect_id; why names the
+ * case in the failure message. */
+static int check_err(const struct defused_error *err, const char *expect_id,
+                     const char *why) {
+    if (strcmp(err->id, expect_id) == 0)
+        return 0;
+    fprintf(stderr, "FAIL: %s: expected %s, got %s\n", why, expect_id,
+            err->id[0] ? err->id : "a successful reply");
+    return -EINVAL;
 }
 
 /* extra_args: NULL-terminated service arguments, or NULL. */
@@ -79,11 +108,10 @@ static int spawn_defused(const char *defused_path,
         setenv("LISTEN_FDS", "1", 1);
         const char *argv[8] = {"defused"};
         size_t argc = 1;
-        while (extra_args != NULL && extra_args[argc - 1] != NULL &&
-               argc < sizeof(argv) / sizeof(argv[0]) - 1) {
-            argv[argc] = extra_args[argc - 1];
-            argc++;
-        }
+        for (size_t i = 0; extra_args != NULL && extra_args[i] != NULL &&
+                           argc < ARRAY_SIZE(argv) - 1;
+             i++)
+            argv[argc++] = extra_args[i];
         argv[argc] = NULL;
         execv(defused_path, (char *const *)argv);
         perror("exec");
@@ -168,21 +196,20 @@ static int run_mount_req(const char *defused_path,
     return 0;
 }
 
-static int run_mount_req_expect(const char *defused_path,
-                                const char *const *extra_args,
-                                const struct defused_mount_req *req,
-                                const char *path, const char *expect_id) {
+/* Runs one mount request and fails unless the reply is exactly expect_id.
+ * dev_path is the fd sent as the FUSE device: /dev/null reaches the option
+ * checks, while the policy gate needs a real /dev/fuse. */
+static int expect_mount_reply(const char *defused_path,
+                              const char *const *extra_args,
+                              const struct defused_mount_req *req,
+                              const char *path, const char *dev_path,
+                              const char *expect_id, const char *why) {
     struct defused_error err;
     int ret =
-        run_mount_req(defused_path, extra_args, req, path, "/dev/null", &err);
+        run_mount_req(defused_path, extra_args, req, path, dev_path, &err);
     if (ret < 0)
         return ret;
-    if (strcmp(err.id, expect_id) != 0) {
-        fprintf(stderr, "FAIL: expected %s, got %s\n", expect_id,
-                err.id[0] ? err.id : "a successful reply");
-        return -EINVAL;
-    }
-    return 0;
+    return check_err(&err, expect_id, why);
 }
 
 /* "/" is not foreign-owned everywhere: inside an unprivileged user
@@ -191,7 +218,7 @@ static const char *find_unowned_dir(void) {
     static const char *const candidates[] = {"/", "/proc", "/sys", "/usr",
                                              "/etc"};
     uid_t self = getuid();
-    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+    for (size_t i = 0; i < ARRAY_SIZE(candidates); i++) {
         struct stat st;
         if (stat(candidates[i], &st) == 0 && S_ISDIR(st.st_mode) &&
             st.st_uid != self)
@@ -220,24 +247,6 @@ static gid_t foreign_gid(void) {
     }
 }
 
-static int expect_policy_reply(const char *defused_path,
-                               const char *const *extra_args,
-                               const struct defused_mount_req *req,
-                               const char *dir, const char *expect_id,
-                               const char *why) {
-    struct defused_error err;
-    int ret =
-        run_mount_req(defused_path, extra_args, req, dir, "/dev/fuse", &err);
-    if (ret < 0)
-        return ret;
-    if (strcmp(err.id, expect_id) != 0) {
-        fprintf(stderr, "FAIL: %s: expected %s, got %s\n", why, expect_id,
-                err.id[0] ? err.id : "a successful reply");
-        return -EINVAL;
-    }
-    return 0;
-}
-
 /* MountFailed: past the gate, the unprivileged mount syscall failed. */
 static int test_policy(const char *defused_path) {
     if (!fuse_device_usable()) {
@@ -259,26 +268,26 @@ static int test_policy(const char *defused_path) {
     snprintf(groups_arg, sizeof(groups_arg), "--allow-groups=%u",
              (unsigned)foreign_gid());
     const char *const wrong_group[] = {groups_arg, NULL};
-    struct defused_mount_req plain = {};
-    int ret = expect_policy_reply(defused_path, wrong_group, &plain, dir,
-                                  DEFUSED_ERROR_NOT_ALLOWED,
-                                  "caller outside --allow-groups");
+    const struct defused_mount_req plain = {};
+    int ret = expect_mount_reply(defused_path, wrong_group, &plain, dir,
+                                 "/dev/fuse", DEFUSED_ERROR_NOT_ALLOWED,
+                                 "caller outside --allow-groups");
     if (ret < 0)
         return ret;
 
-    struct defused_mount_req allow_other = {
+    const struct defused_mount_req allow_other = {
         .mount_flags = DEFUSED_FUSE_ALLOW_OTHER,
     };
-    ret = expect_policy_reply(defused_path, NULL, &allow_other, dir,
-                              DEFUSED_ERROR_NOT_ALLOWED,
-                              "allow_other without --allow-other");
+    ret = expect_mount_reply(defused_path, NULL, &allow_other, dir, "/dev/fuse",
+                             DEFUSED_ERROR_NOT_ALLOWED,
+                             "allow_other without --allow-other");
     if (ret < 0)
         return ret;
 
     const char *const with_allow_other[] = {"--allow-other", NULL};
-    return expect_policy_reply(defused_path, with_allow_other, &allow_other,
-                               dir, DEFUSED_ERROR_MOUNT_FAILED,
-                               "allow_other with --allow-other");
+    return expect_mount_reply(defused_path, with_allow_other, &allow_other, dir,
+                              "/dev/fuse", DEFUSED_ERROR_MOUNT_FAILED,
+                              "allow_other with --allow-other");
 }
 
 /* Rejected args: EXIT_FAILURE before touching the connection, so EOF. */
@@ -323,7 +332,7 @@ static int test_bad_args(const char *defused_path) {
         {"--daemon", "--child", NULL},
         {"stray-argument", NULL},
     };
-    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
         int ret = expect_rejected_args(defused_path, cases[i]);
         if (ret < 0)
             return ret;
@@ -373,10 +382,8 @@ static int connect_daemon_socket(const char *sock_path) {
     return -ETIMEDOUT;
 }
 
-/* Connects to an already-running --daemon instance's socket at sock_path
- * (retrying while it isn't up yet, see connect_daemon_socket()) and runs
- * one mount request through it, failing unless the reply is exactly the
- * Varlink error expect_id. */
+/* Runs one mount request through an already-running --daemon instance,
+ * failing unless the reply is exactly expect_id. */
 static int run_daemon_mount_req(const char *sock_path,
                                 const struct defused_mount_req *req,
                                 const char *path, const char *expect_id) {
@@ -400,19 +407,18 @@ static int run_daemon_mount_req(const char *sock_path,
     int ret = send_mount_req(TAKE_FD(sock), req, dev_fd, mnt_fd, &err);
     if (ret < 0)
         return ret;
-    if (strcmp(err.id, expect_id) != 0) {
-        fprintf(stderr, "FAIL: expected %s, got %s\n", expect_id,
-                err.id[0] ? err.id : "a successful reply");
-        return -EINVAL;
-    }
-    return 0;
+    return check_err(&err, expect_id, "daemon mount request");
 }
+
+/* A mount request the service always refuses for its shape, so it never
+ * reaches the mount(2) that would need root. */
+static const struct defused_mount_req bad_opt = {
+    .mount_flags = 1u << 31, /* never in DEFUSED_MOUNT_FLAGS_MASK */
+};
 
 /* Exercises --daemon end to end: spawn the daemon against a scratch socket
  * path, connect to it like a real client would, and confirm a real Varlink
  * mount request round-trips through the forked-child connection handler.
- * Uses the same bad-mount-flags negative case as run_mount_req_expect()
- * above, since (as there) a real mount() needs root.
  *
  * Drives two requests back-to-back, without waiting for the first child to
  * be reaped before starting the second: a single request wouldn't tell us
@@ -421,29 +427,21 @@ static int run_daemon_mount_req(const char *sock_path,
  * them without a pause also exercises defused_run_fork_daemon()'s live_children
  * cap under light concurrency without tripping it. */
 static int test_daemon_mode(const char *defused_path) {
-    char dir_template[] = "/tmp/defused-daemon-test-XXXXXX";
-    _cleanup_(rmdirp) const char *dir = mkdtemp(dir_template);
-    if (dir == NULL) {
-        perror("mkdtemp");
-        return -errno;
-    }
-    char sock_path_buf[sizeof(dir_template) + 16];
-    snprintf(sock_path_buf, sizeof(sock_path_buf), "%s/defused.sock", dir);
-    _cleanup_(unlinkp) const char *sock_path = sock_path_buf;
-
-    _cleanup_(sigterm_waitp) pid_t pid = 0;
-    int ret = spawn_defused_daemon(defused_path, sock_path, &pid);
+    _cleanup_(daemon_scratch_done) struct daemon_scratch scratch = {};
+    int ret = daemon_scratch_create(&scratch);
     if (ret < 0)
         return ret;
 
-    struct defused_mount_req bad_opt = {
-        .mount_flags = 1u << 31, /* never in DEFUSED_MOUNT_FLAGS_MASK */
-    };
-    ret = run_daemon_mount_req(sock_path, &bad_opt, ".",
+    _cleanup_(sigterm_waitp) pid_t pid = 0;
+    ret = spawn_defused_daemon(defused_path, scratch.sock_path, &pid);
+    if (ret < 0)
+        return ret;
+
+    ret = run_daemon_mount_req(scratch.sock_path, &bad_opt, ".",
                                DEFUSED_ERROR_BAD_OPTION);
     if (ret < 0)
         return ret;
-    return run_daemon_mount_req(sock_path, &bad_opt, ".",
+    return run_daemon_mount_req(scratch.sock_path, &bad_opt, ".",
                                 DEFUSED_ERROR_BAD_OPTION);
 }
 
@@ -453,19 +451,19 @@ static int test_daemon_mode(const char *defused_path) {
  * fails fast with a nonzero exit rather than creating the directory or
  * hanging. */
 static int test_daemon_missing_socket_dir(const char *defused_path) {
-    char dir_template[] = "/tmp/defused-daemon-missing-dir-test-XXXXXX";
-    _cleanup_(rmdirp) const char *dir = mkdtemp(dir_template);
-    if (dir == NULL) {
-        perror("mkdtemp");
-        return -errno;
-    }
-    char missing_dir[sizeof(dir_template) + 16];
-    snprintf(missing_dir, sizeof(missing_dir), "%s/does-not-exist", dir);
-    char sock_path[sizeof(missing_dir) + 16];
+    _cleanup_(daemon_scratch_done) struct daemon_scratch scratch = {};
+    int ret = daemon_scratch_create(&scratch);
+    if (ret < 0)
+        return ret;
+
+    char missing_dir[sizeof(scratch.dir) + sizeof("/does-not-exist")];
+    snprintf(missing_dir, sizeof(missing_dir), "%s/does-not-exist",
+             scratch.dir);
+    char sock_path[sizeof(missing_dir) + sizeof("/defused.sock")];
     snprintf(sock_path, sizeof(sock_path), "%s/defused.sock", missing_dir);
 
     pid_t pid;
-    int ret = spawn_defused_daemon(defused_path, sock_path, &pid);
+    ret = spawn_defused_daemon(defused_path, sock_path, &pid);
     if (ret < 0)
         return ret;
 
@@ -511,6 +509,11 @@ static void connection_slots_done(struct connection_slots *slots) {
         safe_close(slots->fds[i]);
 }
 
+static void unix_addr(struct sockaddr_un *sa, const char *sock_path) {
+    *sa = (struct sockaddr_un){.sun_family = AF_UNIX};
+    (void)strlcpy(sa->sun_path, sock_path, sizeof(sa->sun_path));
+}
+
 /* Opens a connection to sock_path into every slot, leaving each one open
  * without sending a request, so every forked child stays alive blocked on
  * read and live_children holds at the cap. The first connection goes through
@@ -523,8 +526,8 @@ static int open_daemon_connections(const char *sock_path,
     if (slots->fds[0] < 0)
         return slots->fds[0];
 
-    struct sockaddr_un sa = {.sun_family = AF_UNIX};
-    (void)strlcpy(sa.sun_path, sock_path, sizeof(sa.sun_path));
+    struct sockaddr_un sa;
+    unix_addr(&sa, sock_path);
     for (int i = 1; i < TEST_DAEMON_MAX_CONNECTIONS; i++) {
         _cleanup_close_ int sock =
             socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -548,24 +551,19 @@ static int open_daemon_connections(const char *sock_path,
  * sees EOF without ever getting a response. Also checks the connections under
  * the cap are untouched by the overflow. */
 static int test_daemon_connection_cap(const char *defused_path) {
-    char dir_template[] = "/tmp/defused-daemon-cap-test-XXXXXX";
-    _cleanup_(rmdirp) const char *dir = mkdtemp(dir_template);
-    if (dir == NULL) {
-        perror("mkdtemp");
-        return -errno;
-    }
-    char sock_path_buf[sizeof(dir_template) + 16];
-    snprintf(sock_path_buf, sizeof(sock_path_buf), "%s/defused.sock", dir);
-    _cleanup_(unlinkp) const char *sock_path = sock_path_buf;
+    _cleanup_(daemon_scratch_done) struct daemon_scratch scratch = {};
+    int ret = daemon_scratch_create(&scratch);
+    if (ret < 0)
+        return ret;
 
     _cleanup_(sigterm_waitp) pid_t pid = 0;
-    int ret = spawn_defused_daemon(defused_path, sock_path, &pid);
+    ret = spawn_defused_daemon(defused_path, scratch.sock_path, &pid);
     if (ret < 0)
         return ret;
 
     _cleanup_(connection_slots_done) struct connection_slots slots;
     connection_slots_init(&slots);
-    ret = open_daemon_connections(sock_path, &slots);
+    ret = open_daemon_connections(scratch.sock_path, &slots);
     if (ret < 0)
         return ret;
 
@@ -575,18 +573,14 @@ static int test_daemon_connection_cap(const char *defused_path) {
      * legitimately accept it. */
     usleep(200000);
 
-    struct sockaddr_un sa = {.sun_family = AF_UNIX};
-    (void)strlcpy(sa.sun_path, sock_path, sizeof(sa.sun_path));
+    struct sockaddr_un sa;
+    unix_addr(&sa, scratch.sock_path);
     _cleanup_close_ int overflow =
         socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (overflow == -1) {
+    if (overflow == -1 ||
+        connect(overflow, (struct sockaddr *)&sa, sizeof(sa)) == -1) {
         ret = -errno;
-        perror("socket");
-        return ret;
-    }
-    if (connect(overflow, (struct sockaddr *)&sa, sizeof(sa)) == -1) {
-        ret = -errno;
-        perror("connect");
+        perror("overflow connection");
         return ret;
     }
 
@@ -620,36 +614,29 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "usage: %s /path/to/defused\n", argv[0]);
         return 2;
     }
+    const char *defused = argv[1];
     test_set_timeout();
 
     /* Refused for its shape; this only checks the options parse. */
     static const char *const all_policy_args[] = {
         "--max-mounts=5", "--allow-groups=", "--allow-other", NULL};
-    struct defused_mount_req bad_opt = {
-        .mount_flags = 1u << 31, /* never in DEFUSED_MOUNT_FLAGS_MASK */
-    };
-    if (run_mount_req_expect(argv[1], all_policy_args, &bad_opt, ".",
-                             DEFUSED_ERROR_BAD_OPTION) != 0)
+    if (expect_mount_reply(defused, all_policy_args, &bad_opt, ".", "/dev/null",
+                           DEFUSED_ERROR_BAD_OPTION, "all policy options") != 0)
         return 1;
 
     /* Only `defused --child` accepts these, never the service. */
-    struct defused_mount_req privileged_opt = {
-        .mount_flags = DEFUSED_MOUNT_ALLOW_SUID,
+    static const struct defused_mount_req privileged_opts[] = {
+        {.mount_flags = DEFUSED_MOUNT_ALLOW_SUID},
+        {.mount_flags = DEFUSED_MOUNT_ALLOW_DEV},
+        {.mount_flags = DEFUSED_MOUNT_BLKDEV, .fsname = "dev"},
     };
-    if (run_mount_req_expect(argv[1], NULL, &privileged_opt, ".",
-                             DEFUSED_ERROR_BAD_OPTION) != 0)
-        return 1;
-    privileged_opt.mount_flags = DEFUSED_MOUNT_ALLOW_DEV;
-    if (run_mount_req_expect(argv[1], NULL, &privileged_opt, ".",
-                             DEFUSED_ERROR_BAD_OPTION) != 0)
-        return 1;
-    privileged_opt.mount_flags = DEFUSED_MOUNT_BLKDEV;
-    privileged_opt.fsname = "dev";
-    if (run_mount_req_expect(argv[1], NULL, &privileged_opt, ".",
-                             DEFUSED_ERROR_BAD_OPTION) != 0)
-        return 1;
+    for (size_t i = 0; i < ARRAY_SIZE(privileged_opts); i++)
+        if (expect_mount_reply(defused, NULL, &privileged_opts[i], ".",
+                               "/dev/null", DEFUSED_ERROR_BAD_OPTION,
+                               "privileged mount option") != 0)
+            return 1;
 
-    if (test_bad_args(argv[1]) != 0)
+    if (test_bad_args(defused) != 0)
         return 1;
 
     if (getuid() != 0) {
@@ -659,23 +646,24 @@ int main(int argc, char *argv[]) {
                     "SKIP: no directory owned by another user is visible "
                     "here, skipping the mountpoint ownership test\n");
         } else {
-            struct defused_mount_req not_owned = {};
-            if (run_mount_req_expect(argv[1], NULL, &not_owned, unowned,
-                                     DEFUSED_ERROR_NOT_ALLOWED) != 0)
+            static const struct defused_mount_req not_owned = {};
+            if (expect_mount_reply(defused, NULL, &not_owned, unowned,
+                                   "/dev/null", DEFUSED_ERROR_NOT_ALLOWED,
+                                   "mountpoint owned by another user") != 0)
                 return 1;
         }
 
-        if (test_policy(argv[1]) != 0)
+        if (test_policy(defused) != 0)
             return 1;
     }
 
-    if (test_daemon_mode(argv[1]) != 0)
+    if (test_daemon_mode(defused) != 0)
         return 1;
 
-    if (test_daemon_missing_socket_dir(argv[1]) != 0)
+    if (test_daemon_missing_socket_dir(defused) != 0)
         return 1;
 
-    if (test_daemon_connection_cap(argv[1]) != 0)
+    if (test_daemon_connection_cap(defused) != 0)
         return 1;
 
     return 0;
