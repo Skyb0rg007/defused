@@ -15,13 +15,16 @@
  */
 #define _GNU_SOURCE
 #include "common.h"
+#include "defused-syscall.h"
 #include "defused_proto.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -116,17 +119,69 @@ static __attribute__((__noreturn__)) void exec_child(int conn, char *argv[]) {
         safe_close(conn);
     } else if (fcntl(conn, F_SETFD, 0) == -1)
         _exit(EXIT_FAILURE);
+    /* Nothing above the connection is the child's business, and what it
+     * does inherit reaches a seccomp-sandboxed grandchild that may
+     * write(). */
+    (void)sys_close_range((unsigned)STDERR_FILENO + 2, ~0U, 0);
+
+    /* Like systemd's FORK_RESET_SIGNALS: an ignored or blocked signal
+     * survives exec, and defused reaps a child of its own. */
+    for (int sig = 1; sig < _NSIG; sig++)
+        (void)signal(sig, SIG_DFL);
+    sigset_t empty;
+    sigemptyset(&empty);
+    (void)sigprocmask(SIG_SETMASK, &empty, NULL);
 
     char pid[16];
     snprintf(pid, sizeof(pid), "%d", (int)getpid());
     if (setenv("LISTEN_PID", pid, 1) == -1 ||
         setenv("LISTEN_FDS", "1", 1) == -1 ||
-        setenv("LISTEN_FDNAMES", "varlink", 1) == -1)
+        setenv("LISTEN_FDNAMES", "varlink", 1) == -1 ||
+        /* Ours, if we were socket-activated ourselves: it no longer
+         * matches, and sd_listen_fds(3) then quietly ignores the fd. */
+        unsetenv("LISTEN_PIDFDID") == -1 ||
+        /* sd_varlink_server_listen_auto(3) honours it, and we are the one
+         * handing this process its socket. */
+        unsetenv("SYSTEMD_VARLINK_LISTEN") == -1)
         _exit(EXIT_FAILURE);
 
     execv(argv[0], argv);
     log_error(-errno, "exec %s", argv[0]);
     _exit(127);
+}
+
+/* accept(2) says to retry on these. Most are reachable only on IP
+ * sockets, but the manual draws no distinction. */
+static bool accept_again(int e) {
+    switch (e) {
+    case ECONNABORTED:
+    case ECONNREFUSED:
+    case ECONNRESET:
+    case EAGAIN:
+    case EHOSTDOWN:
+    case EHOSTUNREACH:
+    case EINTR:
+    case ENETDOWN:
+    case ENETRESET:
+    case ENETUNREACH:
+    case ENONET:
+    case ENOPROTOOPT:
+    case ENOTCONN:
+    case EOPNOTSUPP:
+    case EPIPE:
+    case EPROTO:
+    case ESHUTDOWN:
+    case ETIMEDOUT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Also worth retrying, but not immediately: the fds come back as the
+ * connections being served end, so retrying at once just spins. */
+static bool accept_later(int e) {
+    return e == EMFILE || e == ENFILE || e == ENOMEM || e == ENOBUFS;
 }
 
 /* Returns only on a fatal error. */
@@ -138,13 +193,14 @@ static int run(const char *path, char *argv[]) {
     for (;;) {
         _cleanup_close_ int conn = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
         if (conn == -1) {
-            if (errno == EINTR)
+            if (accept_again(errno))
                 continue;
+            if (!accept_later(errno))
+                return log_error(-errno, "accept4");
             log_error(-errno, "accept4");
-            /* Transient near the cap; keep listening. */
-            if (errno == EMFILE || errno == ENFILE || errno == ECONNABORTED)
-                continue;
-            return -errno;
+            reap_children();
+            (void)poll(NULL, 0, 100);
+            continue;
         }
         /* Only here, so zombies pile up while idle -- never past the cap. */
         reap_children();
