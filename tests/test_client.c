@@ -10,8 +10,8 @@
  * A mount's -o string must arrive as the right request and the device fd
  * must reach _FUSE_COMMFD framed as libfuse's receive_fd() expects; -u -z
  * must arrive as op UNMOUNT with lazy set, and an error must surface as a
- * nonzero exit. A privileged caller spawns `defused --child` (this binary,
- * via DEFUSED_PATH) and never touches the socket.
+ * nonzero exit. A privileged caller performs the request in its own
+ * process and never touches the socket.
  */
 #define _GNU_SOURCE
 #include "common.h"
@@ -157,13 +157,9 @@ static void check_mount_request(const struct defused_request *req, int fuse_fd,
                               DEFUSED_MOUNT_SYNCHRONOUS |
                               DEFUSED_MOUNT_DIRSYNC |
                               DEFUSED_FUSE_DEFAULT_PERMISSIONS;
-    /* No NOATIME: the later atime in the -o string clears what noatime set.
-     *
-     * suid and dev are ignored for an unprivileged caller and honored for a
-     * privileged one, which also sends blkdev (see privileged_mount_opts). */
-    if (strcmp(getenv("DEFUSED_TEST_UID"), "0") == 0)
-        expected_flags |= DEFUSED_MOUNT_ALLOW_SUID | DEFUSED_MOUNT_ALLOW_DEV |
-                          DEFUSED_MOUNT_BLKDEV;
+    /* No NOATIME: the later atime clears what noatime set. No suid or dev
+     * either: only the unprivileged path reaches the service, and it
+     * drops both with a warning. */
     CHECK(req->mount_flags == expected_flags);
     CHECK(req->max_read == 4096);
     CHECK(req->blksize == 0);
@@ -202,8 +198,7 @@ static void check_unmount_request(const struct defused_request *req,
     CHECK(fd_st.st_dev == parent_st.st_dev && fd_st.st_ino == parent_st.st_ino);
 }
 
-/* Plays the service for one connection: one request in, one reply out.
- * Takes ownership of conn_fd. */
+/* Takes ownership of conn_fd. */
 static int serve_connection(int conn_fd) {
     _cleanup_close_ int conn = conn_fd;
     struct defused_request req;
@@ -237,10 +232,7 @@ static void serve_one(int listen_fd) {
     CHECK(serve_connection(TAKE_FD(conn)) == 0);
 }
 
-/* listen_fd >= 0 drives the unprivileged path, where the client connects to
- * the socket and this process plays the service; listen_fd < 0 drives the
- * privileged one, where the client spawns fake_defused_child() itself and
- * the socket is never touched. */
+/* listen_fd < 0 means the client should send no request at all. */
 static void test_mount(const char *client, int listen_fd, const char *opts) {
     _cleanup_close_pair_ int comm[2] = EBADF_PAIR;
     CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, comm) == 0);
@@ -259,8 +251,11 @@ static void test_mount(const char *client, int listen_fd, const char *opts) {
     CHECK(wait_exit_code(pid) == 0);
 }
 
-static void test_unmount(const char *client, int listen_fd) {
-    char *args[] = {(char *)"-u", (char *)"-z", (char *)"."};
+/* mnt is "." for the unprivileged path, which is what the fake service
+ * expects; the privileged path really calls umount2(), so it gets a
+ * scratch directory that is certainly not a mountpoint. */
+static void test_unmount(const char *client, int listen_fd, const char *mnt) {
+    char *args[] = {(char *)"-u", (char *)"-z", (char *)mnt};
     pid_t pid;
     CHECK(spawn_client(client, -1, args, 3, &pid) == 0);
 
@@ -271,21 +266,55 @@ static void test_unmount(const char *client, int listen_fd) {
     CHECK(wait_exit_code(pid) == 1);
 }
 
-/* Runs as the `defused --child` the client spawned. The socket arrives as
- * fd 3 via $LISTEN_FDS, as the real defused expects. A failed CHECK here is
- * only visible in stderr, since the client's exit code reflects the reply. */
-static int fake_defused_child(int argc, char *argv[]) {
-    CHECK(argc == 2 && strcmp(argv[0], "defused") == 0);
-    const char *listen_fds = getenv("LISTEN_FDS");
-    CHECK(listen_fds != NULL && strcmp(listen_fds, "1") == 0);
-    CHECK(serve_connection(DEFUSED_LISTEN_FD) == 0);
-    return failures ? EXIT_FAILURE : EXIT_SUCCESS;
+/*
+ * A privileged caller mounts in its own process, so there is no request
+ * to intercept. What is still observable: the socket is never contacted
+ * (DEFUSED_SOCKET points at nothing), and the privileged options were
+ * accepted -- the flag mask is checked first, so reaching any later
+ * complaint proves suid/dev/blkdev were allowed. Here the run stops at
+ * the FUSE device check, since the test hands it /dev/null.
+ */
+static void test_privileged_mount(const char *client, const char *opts) {
+    int errpipe[2];
+    CHECK(pipe(errpipe) == 0);
+    _cleanup_close_pair_ int comm[2] = EBADF_PAIR;
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, comm) == 0);
+
+    char *args[] = {(char *)"-o", (char *)opts, (char *)"."};
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        (void)dup2(errpipe[1], STDERR_FILENO);
+        (void)close(errpipe[0]);
+        (void)close(errpipe[1]);
+        (void)close(comm[0]);
+        char fdstr[16];
+        snprintf(fdstr, sizeof(fdstr), "%d", comm[1]);
+        setenv("_FUSE_COMMFD", fdstr, 1);
+        setenv("DEFUSED_FUSE_DEVICE", "/dev/null", 1);
+        char *argv[] = {(char *)"fusermount3", args[0], args[1], args[2], NULL};
+        execv(client, argv);
+        _exit(127);
+    }
+    (void)close(errpipe[1]);
+    char buf[1024] = {0};
+    ssize_t n = read(errpipe[0], buf, sizeof(buf) - 1);
+    (void)close(errpipe[0]);
+
+    CHECK(wait_exit_code(pid) == 1);
+    CHECK(n > 0);
+    bool ok = strstr(buf, "mount options rejected") == NULL &&
+              strstr(buf, "cannot connect") == NULL;
+    /* One message, from fusermount3 -- not a second from a helper logging
+     * to the caller's stderr, as `defused --child` used to. */
+    ok = ok && strncmp(buf, "defused: ", 9) != 0 &&
+         strstr(buf, "\ndefused: ") == NULL;
+    CHECK(ok);
+    if (!ok)
+        fprintf(stderr, "  privileged mount printed: %s", buf);
 }
 
 int main(int argc, char *argv[]) {
-    if (argc == 2 && strcmp(argv[1], "--child") == 0)
-        return fake_defused_child(argc, argv);
-
     if (argc != 2) {
         fprintf(stderr, "usage: %s /path/to/fusermount3\n", argv[0]);
         return 2;
@@ -311,8 +340,14 @@ int main(int argc, char *argv[]) {
      * that fails immediately so a wrong turn is an error, not a hang. */
     setenv("DEFUSED_TEST_UID", "0", 1);
     setenv("DEFUSED_SOCKET", "/nonexistent/defused.sock", 1);
-    test_mount(argv[1], -1, privileged_mount_opts);
-    test_unmount(argv[1], -1);
+    test_privileged_mount(argv[1], privileged_mount_opts);
+    char priv_dir[] = "/tmp/defused-client-priv-XXXXXX";
+    if (mkdtemp(priv_dir) != NULL) {
+        test_unmount(argv[1], -1, priv_dir);
+        rmdir(priv_dir);
+    } else {
+        CHECK(false);
+    }
 
     setenv("DEFUSED_TEST_UID", "1", 1);
 
@@ -341,7 +376,7 @@ int main(int argc, char *argv[]) {
     setenv("DEFUSED_SOCKET", sock_path, 1);
 
     test_mount(argv[1], listen_fd, mount_opts);
-    test_unmount(argv[1], listen_fd);
+    test_unmount(argv[1], listen_fd, ".");
 
     unlink(sock_path);
     rmdir(dir);

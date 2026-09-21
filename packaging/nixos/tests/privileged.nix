@@ -11,9 +11,9 @@ common.mkTest {
   name = "privileged";
 
   # Deliberately not common.baseNode, and not services.defused.enable: a
-  # caller that is root or holds CAP_SYS_ADMIN gets a `defused --child`
-  # spawned by fusermount3 and never talks to the service, so neither the
-  # socket unit nor the service exist on this machine at all.
+  # caller that is root or holds CAP_SYS_ADMIN mounts from fusermount3
+  # itself and never talks to the service, so neither the socket unit nor
+  # the service exist on this machine at all.
   nodes.machine =
     { ... }:
     {
@@ -32,7 +32,8 @@ common.mkTest {
     boot(machine, socket=False)
 
     machine.fail("test -e /run/defused/defused.sock")
-    machine.succeed("test -x ${package}/lib/defused/defused")
+    # Nothing below execs it; the privileged path is fusermount3 alone.
+    machine.succeed("test -x ${package}/bin/fusermount3")
 
     with subtest("root mounts and unmounts without the service"):
         machine.succeed("install -d /root/mnt")

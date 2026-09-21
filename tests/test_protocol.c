@@ -318,7 +318,7 @@ static int test_bad_args(const char *defused_path) {
         {"--max-mounts=ten", NULL},
         {"--allow-groups=defused-no-such-group", NULL},
         {"--allow-other=yes", NULL},
-        {"--daemon", "--child", NULL},
+        {"--child", NULL}, /* removed: privileged callers mount in-process */
         {"stray-argument", NULL},
     };
     for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
@@ -589,7 +589,7 @@ int main(int argc, char *argv[]) {
                            DEFUSED_ERR_BAD_OPTION, "all policy options") != 0)
         return 1;
 
-    /* Only `defused --child` accepts these, never the service. */
+    /* Only a privileged fusermount3 honors these; the service never does. */
     const struct defused_request privileged_opts[] = {
         mount_req(DEFUSED_MOUNT_ALLOW_SUID, NULL),
         mount_req(DEFUSED_MOUNT_ALLOW_DEV, NULL),

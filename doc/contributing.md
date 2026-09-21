@@ -19,7 +19,7 @@ meson compile -C build
 meson test -C build
 ```
 
-Each Meson test spawns a `defused`/`fusermount3` binary and drives it
+Most Meson tests spawn a `defused`/`fusermount3` binary and drive it
 via the wire protocol/namespaces (`test_mountns.c` uses
 `unshare(CLONE_NEWUSER|CLONE_NEWNS)` to obtain the privileges needed to run
 defused within its namespace).

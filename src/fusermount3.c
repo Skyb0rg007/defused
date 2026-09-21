@@ -12,6 +12,7 @@
  */
 #define _GNU_SOURCE
 #include "common.h"
+#include "defused-mount.h"
 #include "defused-proto.h"
 #include "defused-syscall.h"
 
@@ -27,7 +28,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -37,9 +37,6 @@
 
 #ifndef DEFUSED_VERSION
 #define DEFUSED_VERSION "unknown"
-#endif
-#ifndef DEFUSED_PATH
-#define DEFUSED_PATH "/usr/lib/defused/defused"
 #endif
 
 static const char *progname = "fusermount3";
@@ -56,17 +53,32 @@ die(const char *fmt, ...) {
     exit(EXIT_FAILURE);
 }
 
-/* A non-root caller keeps CAP_SYS_ADMIN across exec only via the ambient
- * set. */
+/* CAP_SYS_ADMIN in the effective set, raised from permitted if it is
+ * only there. Nothing has to survive an execve() any more, so the
+ * ambient set is left alone. */
+static bool raise_cap_sys_admin(void) {
+    struct __user_cap_header_struct hdr = {
+        .version = _LINUX_CAPABILITY_VERSION_3, .pid = 0};
+    struct __user_cap_data_struct caps[2] = {};
+    if (syscall(SYS_capget, &hdr, caps) == -1)
+        return false;
+    const unsigned idx = CAP_TO_INDEX(CAP_SYS_ADMIN);
+    const uint32_t bit = CAP_TO_MASK(CAP_SYS_ADMIN);
+    if (caps[idx].effective & bit)
+        return true;
+    if (!(caps[idx].permitted & bit))
+        return false;
+    caps[idx].effective |= bit;
+    return syscall(SYS_capset, &hdr, caps) == 0;
+}
+
 static bool caller_is_privileged(void) {
 #ifdef DEFUSED_TEST
     const char *forced_uid = getenv("DEFUSED_TEST_UID");
     if (forced_uid != NULL)
         return strcmp(forced_uid, "0") == 0;
 #endif
-    return getuid() == 0 || geteuid() == 0 ||
-           prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_SYS_ADMIN, 0, 0) ==
-               0;
+    return geteuid() == 0 || raise_cap_sys_admin();
 }
 
 /*** Mount options ***/
@@ -197,25 +209,7 @@ static void parse_mount_opts(const char *opts, struct defused_request *req) {
     req->mount_flags = flags;
 }
 
-/*** The service ***/
-
-/* Where a request goes: the service socket, or the `defused --child` a
- * privileged caller runs instead. */
-struct service {
-    int sock;
-    pid_t child; /* 0 when this is the socket */
-};
-#define SERVICE_UNSET {.sock = -EBADF, .child = 0}
-
-static void service_done(struct service *svc) {
-    svc->sock = safe_close(svc->sock);
-    if (svc->child > 0) {
-        while (waitpid(svc->child, NULL, 0) == -1 && errno == EINTR)
-            ;
-        svc->child = 0;
-    }
-}
-#define _cleanup_service_ _cleanup_(service_done)
+/*** Reaching the service ***/
 
 static int connect_socket(const char *path) {
     struct sockaddr_un sa = {.sun_family = AF_UNIX};
@@ -231,85 +225,57 @@ static int connect_socket(const char *path) {
     return TAKE_FD(fd);
 }
 
-/* A privileged caller needs no service: it runs `defused --child` on a
- * socket pair, handed over the way Accept=yes hands over a connection. */
-static int spawn_child(struct service *svc) {
-    int sv[2];
-    if (socketpair(AF_UNIX, DEFUSED_SOCKET_TYPE | SOCK_CLOEXEC, 0, sv) == -1)
-        return -errno;
-    pid_t pid = fork();
-    if (pid < 0) {
-        int ret = -errno;
-        safe_close(sv[0]);
-        safe_close(sv[1]);
-        return ret;
+/* A privileged caller performs the request here -- it holds the
+ * privilege and is already in the right mount namespace -- and everyone
+ * else sends it to the service. Both fill *err the same way, so only
+ * this function knows the difference. */
+static int submit(const struct defused_request *req, const int *fds,
+                  struct defused_error *err) {
+    if (privileged)
+        return defused_perform(req, fds, err);
+
+    const char *path = getenv("DEFUSED_SOCKET");
+    if (path == NULL || *path == '\0')
+        path = DEFUSED_SOCKET_PATH;
+    _cleanup_close_ int sock = connect_socket(path);
+    if (sock < 0) {
+        if (!quiet)
+            fprintf(stderr,
+                    "%s: cannot connect to the defused service at %s: %s\n",
+                    progname, path, strerror(-sock));
+        return sock;
     }
-    if (pid == 0) {
-        /* sv[0] first: it may be sitting on DEFUSED_LISTEN_FD itself. */
-        (void)close(sv[0]);
-        if (sv[1] == DEFUSED_LISTEN_FD ? fcntl(sv[1], F_SETFD, 0) == -1
-                                       : dup2(sv[1], DEFUSED_LISTEN_FD) == -1)
-            _exit(127);
-        char pidbuf[16];
-        snprintf(pidbuf, sizeof(pidbuf), "%d", (int)getpid());
-        setenv("LISTEN_PID", pidbuf, 1);
-        setenv("LISTEN_FDS", "1", 1);
-        char *argv[] = {(char *)"defused", (char *)"--child", NULL};
-        execv(DEFUSED_PATH, argv);
-        _exit(127);
-    }
-    (void)close(sv[1]);
-    svc->sock = sv[0];
-    svc->child = pid;
-    return 0;
+    return defused_call(sock, req, fds, err);
 }
 
-static int connect_service(struct service *svc) {
-    const char *target = DEFUSED_PATH;
-    int ret;
-    if (privileged) {
-        ret = spawn_child(svc);
-    } else {
-        target = getenv("DEFUSED_SOCKET");
-        if (target == NULL || *target == '\0')
-            target = DEFUSED_SOCKET_PATH;
-        ret = connect_socket(target);
-        if (ret >= 0) {
-            svc->sock = ret;
-            ret = 0;
-        }
-    }
-    if (ret < 0 && !quiet)
-        fprintf(stderr, "%s: cannot %s %s: %s\n", progname,
-                privileged ? "spawn" : "connect to the defused service at",
-                target, strerror(-ret));
-    return ret;
-}
-
-/* ret if the exchange failed, -EPERM for an error from the service
+/* ret if the request never got an answer, -EPERM for a failure
  * (explained unless quiet), 0 for success. */
 static int check_reply(int ret, const char *what, const char *mnt,
                        const struct defused_error *err) {
     if (ret < 0) {
         if (!quiet)
-            fprintf(stderr, "%s: %s request to %s failed: %s\n", progname, what,
-                    privileged ? DEFUSED_PATH : "the service", strerror(-ret));
+            fprintf(stderr,
+                    "%s: %s request to the defused service failed: "
+                    "%s\n",
+                    progname, what, strerror(-ret));
         return ret;
     }
     if (err->code == DEFUSED_OK)
         return 0;
     if (quiet)
         return -EPERM;
-    const char *reason = err->sys_errno ? strerror(err->sys_errno)
-                                        : "no reason given by the service";
+    /* detail is set only on the privileged path; over the socket it stays
+     * in the service's log and arrives empty. */
+    const char *reason =
+        err->sys_errno ? strerror(err->sys_errno) : "no reason given";
+    const char *by = privileged ? "defused" : "the defused service";
     switch (err->code) {
     case DEFUSED_ERR_MALFORMED:
-        fprintf(stderr, "%s: %s request rejected by the defused service: %s\n",
-                progname, what, reason);
+        fprintf(stderr, "%s: %s request rejected by %s: %s\n", progname, what,
+                by, reason);
         break;
     case DEFUSED_ERR_BAD_OPTION:
-        fprintf(stderr, "%s: mount options rejected by the defused service\n",
-                progname);
+        fprintf(stderr, "%s: mount options rejected by %s\n", progname, by);
         break;
     case DEFUSED_ERR_NOT_ALLOWED:
         fprintf(stderr,
@@ -322,8 +288,8 @@ static int check_reply(int ret, const char *what, const char *mnt,
         fprintf(stderr, "%s: %s is not a FUSE mount\n", progname, mnt);
         break;
     default: /* MountFailed, UnmountFailed */
-        fprintf(stderr, "%s: failed to %s %s: %s\n", progname, what, mnt,
-                reason);
+        fprintf(stderr, "%s: failed to %s %s: %s%s%s\n", progname, what, mnt,
+                reason, err->detail[0] ? " -- " : "", err->detail);
         break;
     }
     return -EPERM;
@@ -362,14 +328,9 @@ static int do_unmount(const char *mnt, bool lazy) {
         return ret;
     }
 
-    _cleanup_service_ struct service svc = SERVICE_UNSET;
-    int ret = connect_service(&svc);
-    if (ret < 0)
-        return ret;
     struct defused_error err;
-    return check_reply(
-        defused_call(svc.sock, &req, (const int[]){parent_fd}, &err), "unmount",
-        mnt, &err);
+    return check_reply(submit(&req, (const int[]){parent_fd}, &err), "unmount",
+                       mnt, &err);
 }
 
 /* Hands fd to libfuse over the _FUSE_COMMFD socket, framed the way its
@@ -417,15 +378,10 @@ static int do_mount(const char *mnt, const char *opts, int cfd) {
     if (fuse_fd == -1)
         die("failed to open %s: %s", dev, strerror(errno));
 
-    _cleanup_service_ struct service svc = SERVICE_UNSET;
-    int ret = connect_service(&svc);
-    if (ret < 0)
-        return ret;
     struct defused_error err;
     /* The order the protocol fixes: /dev/fuse, then the mountpoint. */
-    ret = check_reply(
-        defused_call(svc.sock, &req, (const int[]){fuse_fd, mnt_fd}, &err),
-        "mount", mnt, &err);
+    int ret = check_reply(submit(&req, (const int[]){fuse_fd, mnt_fd}, &err),
+                          "mount", mnt, &err);
     if (ret < 0)
         return ret;
 

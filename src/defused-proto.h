@@ -25,9 +25,6 @@
  * message's descriptors cannot arrive attached to another. */
 #define DEFUSED_SOCKET_TYPE SOCK_SEQPACKET
 
-/* Where $LISTEN_PID/$LISTEN_FDS leaves the connection. */
-#define DEFUSED_LISTEN_FD 3
-
 /* Catches a peer that is not defused, or one from a different build. Bump
  * it whenever anything below changes; both sides ship together, so there
  * is nothing to stay compatible with. */
