@@ -20,6 +20,20 @@ let
   };
   inherit (common) package mountHelper;
   inherit (pkgs) lib;
+
+  # A libfuse2 filesystem, from libfuse2's own example: nixpkgs has no
+  # packaged fuse2 filesystem left. It execs /run/wrappers/bin/fusermount.
+  fuse2Hello =
+    pkgs.runCommandCC "fuse2-hello"
+      {
+        nativeBuildInputs = [ pkgs.pkg-config ];
+        buildInputs = [ pkgs.fuse ];
+      }
+      ''
+        mkdir -p $out/bin
+        $CC -o $out/bin/fuse2-hello ${pkgs.fuse.src}/example/hello.c \
+          $(pkg-config --cflags --libs fuse)
+      '';
 in
 pkgs.testers.nixosTest {
   name = "defused-desktop-${kernelPackages.kernel.version}";
@@ -38,8 +52,11 @@ pkgs.testers.nixosTest {
       # module's own defaults.
       services.defused.allowOther = lib.mkForce false;
 
-      # A stock libfuse filesystem, to mount through that helper.
-      environment.systemPackages = [ pkgs.fuse-overlayfs ];
+      # Stock libfuse3 and libfuse2 filesystems, to mount through the helpers.
+      environment.systemPackages = [
+        pkgs.fuse-overlayfs
+        fuse2Hello
+      ];
     };
 
   testScript =
@@ -59,15 +76,23 @@ pkgs.testers.nixosTest {
               "runuser -u alice -- /run/wrappers/bin/fusermount3 -V | "
               "grep -F 'fusermount3 version:' | grep -F '(defused)'"
           )
-          # Only the fuse3 wrapper is taken over; programs.fuse is otherwise intact.
-          machine.succeed("test -u /run/wrappers/bin/fusermount")
+          # programs.fuse is otherwise intact.
           machine.succeed("test -e /etc/fuse.conf")
 
-      with subtest("the system path prefers defused's fusermount3 too"):
+      with subtest("/run/wrappers/bin/fusermount is defused's too, for libfuse2"):
+          machine.succeed("test -x /run/wrappers/bin/fusermount")
+          machine.fail("test -u /run/wrappers/bin/fusermount")
           machine.succeed(
-              "test \"$(readlink -f /run/current-system/sw/bin/fusermount3)\" = "
-              "${package}/bin/fusermount3"
+              "runuser -u alice -- /run/wrappers/bin/fusermount -V | "
+              "grep -F 'fusermount version:' | grep -F '(defused)'"
           )
+
+      with subtest("the system path prefers defused's helpers too"):
+          for name in ("fusermount", "fusermount3"):
+              machine.succeed(
+                  f"test \"$(readlink -f /run/current-system/sw/bin/{name})\" = "
+                  "${package}/bin/fusermount3"
+              )
 
       with subtest("a libfuse filesystem mounts through defused under no_new_privs"):
           machine.succeed("install -d -o alice -g users /home/alice/lower /home/alice/mnt")
@@ -84,6 +109,27 @@ pkgs.testers.nixosTest {
           assert "nosuid" in line and "nodev" in line, line
           machine.succeed("test \"$(runuser -u alice -- cat /home/alice/mnt/file)\" = hello")
           machine.succeed("journalctl -u 'defused@*' --no-pager | grep -F defused")
+
+      with subtest("a libfuse2 filesystem mounts through defused as well"):
+          machine.succeed("install -d -o alice -g users /home/alice/mnt2")
+          machine.succeed(
+              "timeout 45s runuser -u alice -- setpriv --no-new-privs -- "
+              "${fuse2Hello}/bin/fuse2-hello /home/alice/mnt2"
+          )
+          line = machine.succeed("grep -F ' /home/alice/mnt2 ' /proc/self/mountinfo").strip()
+          print(line)
+          # libfuse2's fuse_main() derives subtype= from the program name.
+          assert " - fuse.fuse2-hello " in line, line
+          assert "nosuid" in line and "nodev" in line, line
+          machine.succeed(
+              "test \"$(runuser -u alice -- cat /home/alice/mnt2/hello)\" "
+              "= 'Hello World!'"
+          )
+          machine.succeed(
+              "timeout 45s runuser -u alice -- setpriv --no-new-privs -- "
+              "/run/wrappers/bin/fusermount -u /home/alice/mnt2"
+          )
+          machine.wait_until_succeeds("! grep -F ' /home/alice/mnt2 ' /proc/self/mountinfo")
 
       with subtest("but allow_other still needs --allow-other"):
           machine.succeed("install -d -o alice -g users /home/alice/mnt-other")

@@ -10,6 +10,11 @@ This document describes the protocol spoken between the unprivileged
 `fusermount3` replacement (the *client*) and the privileged `defused` system
 service.
 
+The client is installed under both of libfuse's helper names, `fusermount3`
+and libfuse2's `fusermount`: one binary, one wire protocol. libfuse2's
+command line and `-o` option set are a subset of libfuse3's, so nothing below
+depends on which name the client was invoked under.
+
 The authoritative constants are in `src/defused_proto.h`; the Varlink
 interface is defined in `src/defused-varlink.c`.
 

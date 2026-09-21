@@ -6,6 +6,11 @@
  * Drop-in replacement for libfuse's setuid-root fusermount3,
  * implemented as an unprivileged client of defused.service.
  *
+ * The same binary is installed under both helper names: libfuse2's
+ * `fusermount` speaks the same protocol as libfuse3's `fusermount3` and
+ * takes a subset of its command line. Only the -V banner follows argv[0];
+ * everything else behaves identically under either name.
+ *
  * The fusermount3 binary receives a communication file descriptor indicated
  * via the _FUSE_COMMFD environment variable or --comm-fd command-line option.
  * After the mount occurs, the the opened /dev/fuse file descriptor will be
@@ -74,6 +79,7 @@ static const struct flag_opt flag_opts[] = {
     {"noexec", DEFUSED_MOUNT_NOEXEC, true, true},
     {"async", DEFUSED_MOUNT_SYNCHRONOUS, false, true},
     {"sync", DEFUSED_MOUNT_SYNCHRONOUS, true, true},
+    {"atime", DEFUSED_MOUNT_NOATIME, false, true},
     {"noatime", DEFUSED_MOUNT_NOATIME, true, true},
     {"nodiratime", DEFUSED_MOUNT_NODIRATIME, true, true},
     {"norelatime", 0, false, true},
@@ -128,12 +134,18 @@ static noreturn void die(const char *fmt, ...)
 static bool caller_is_privileged(void);
 
 static const char *progname;
+/* argv[0] without directories: "fusermount3", or libfuse2's "fusermount". */
+static const char *progbase;
 static bool quiet;
 static bool auto_unmount;
 static bool privileged;
 
 int main(int argc, char *argv[]) {
-    progname = argc > 0 ? argv[0] : "fusermount3";
+    progname = argc > 0 && argv[0] != NULL && argv[0][0] != '\0'
+                   ? argv[0]
+                   : "fusermount3";
+    const char *slash = strrchr(progname, '/');
+    progbase = slash != NULL && slash[1] != '\0' ? slash + 1 : progname;
 
     privileged = caller_is_privileged();
 
@@ -149,7 +161,7 @@ int main(int argc, char *argv[]) {
             usage();
             break;
         case 'V':
-            printf("fusermount3 version: %s (defused)\n", DEFUSED_VERSION);
+            printf("%s version: %s (defused)\n", progbase, DEFUSED_VERSION);
             return 0;
         case 'o':
             opts = optarg;
@@ -516,7 +528,8 @@ static void usage(void) {
  *
  * - fsname=/subtype= honor backslash escapes
  * - auto_unmount sets the global configuration variable
- * - the legacy/internal options are dropped silently
+ * - the legacy/internal options are dropped silently; large_read is one of
+ *   them, since libfuse's own helper ignores it on anything past Linux 2.4
  * - unsafe flag options (suid, dev) and blkdev are privileged: otherwise
  *   they are warned about and ignored, blkdev is an error
  * - anything unrecognized is a hard error.
@@ -564,9 +577,10 @@ static int parse_mount_opts(const char *opts, struct defused_mount_req *req) {
             int ret = parse_u32(s, len, "blksize=", &req->blksize);
             if (ret < 0)
                 return ret;
-        } else if (opt_eq(s, len, "nonempty") || begins_with(s, "fd=") ||
-                   begins_with(s, "rootmode=") || begins_with(s, "user_id=") ||
-                   begins_with(s, "group_id=") || begins_with(s, "x-")) {
+        } else if (opt_eq(s, len, "nonempty") || opt_eq(s, len, "large_read") ||
+                   begins_with(s, "fd=") || begins_with(s, "rootmode=") ||
+                   begins_with(s, "user_id=") || begins_with(s, "group_id=") ||
+                   begins_with(s, "x-")) {
             /* dropped silently */
         } else {
             const struct flag_opt *fo;

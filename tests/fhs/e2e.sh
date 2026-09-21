@@ -19,6 +19,8 @@ socket=/run/defused/defused.sock
 # libfuse execs fusermount3 by this absolute path, so this is the one that
 # has to be defused's, whatever else is on $PATH.
 fusermount3=/usr/bin/fusermount3
+# libfuse2 execs this one; the same binary serves both.
+fusermount=/usr/bin/fusermount
 defused=/usr/lib/defused/defused
 here=$(dirname "$0")
 
@@ -72,6 +74,7 @@ check_mount() {
 [ -S "$socket" ] || fail "$socket is not a socket: is defused running?"
 [ -x "$defused" ] || fail "$defused is not installed"
 [ -x "$fusermount3" ] || fail "$fusermount3 is not installed"
+[ -x "$fusermount" ] || fail "$fusermount is not installed"
 for tool in fuse-overlayfs python3 runuser setpriv; do
     command -v "$tool" >/dev/null || fail "$tool is not installed"
 done
@@ -85,6 +88,9 @@ mnt=$home/mnt
 echo "# $fusermount3 is defused's, for root and for $user"
 "$fusermount3" -V | grep -F '(defused)'
 as_user "$fusermount3" -V | grep -F '(defused)'
+
+echo "# $fusermount is the same binary, reporting libfuse2's name"
+as_user "$fusermount" -V | grep -F 'fusermount version:' | grep -F '(defused)'
 
 echo "# unmounting a directory that is not a FUSE mount is rejected"
 as_user mkdir -p "$home/notfuse"

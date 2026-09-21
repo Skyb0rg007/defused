@@ -52,6 +52,10 @@ This project provides the following:
 
 - A system service that listens on `/run/defused/defused.sock`.
 - A replacement `fusermount3` binary to communicate with the service.
+  The same binary is also installed as `fusermount`, libfuse2's helper:
+  the two speak the same protocol, and libfuse2's command line is a subset
+  of libfuse3's. Which name it was invoked under only changes the `-V`
+  banner.
 
 The system service is written to use systemd socket activation with
 `Accept=yes`.
@@ -134,8 +138,10 @@ works.
 }
 ```
 
-This replaces `/run/wrappers/bin/fusermount3` with defused's, so every FUSE
-program uses it.
+This replaces `/run/wrappers/bin/fusermount3` and `/run/wrappers/bin/fusermount`
+with defused's, so every FUSE program uses it, libfuse2 and libfuse3 alike.
+`services.defused.replaceFusermount3` and `replaceFusermount` turn either
+takeover off.
 `services.defused.maxMounts`, `allowGroups` and `allowOther` configure the
 policy.
 See `services.defused.*` for the options.
