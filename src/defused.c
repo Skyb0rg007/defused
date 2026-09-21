@@ -21,8 +21,6 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <grp.h>
-#include <mntent.h>
-#include <paths.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -86,17 +84,35 @@ static int parse_long(const char *s, long *out) {
 
 /*** Policy: whether the caller may use defused at all ***/
 
-/* Like libfuse's mount_max: FUSE mounts in the service's own namespace. */
+/* Like libfuse's mount_max: the FUSE mounts in the service's own mount
+ * namespace. */
 static int count_fuse_mounts(void) {
-    FILE *fp = setmntent(_PATH_MOUNTED, "r");
-    if (fp == NULL)
-        return -errno;
+    struct mnt_id_req req = {
+        .size = MNT_ID_REQ_SIZE_VER1,
+        .mnt_id = LSMT_ROOT,
+    };
+    uint64_t ids[256];
     int count = 0;
-    for (struct mntent *e; (e = getmntent(fp)) != NULL;)
-        count += strcmp(e->mnt_type, "fuse") == 0 ||
-                 strncmp(e->mnt_type, "fuse.", 5) == 0;
-    endmntent(fp);
-    return count;
+    for (;;) {
+        ssize_t n = (ssize_t)syscall(SYS_listmount, &req, ids,
+                                     (long)ARRAY_SIZE(ids), 0L);
+        if (n < 0)
+            return -errno;
+        for (ssize_t i = 0; i < n; i++) {
+            /* libfuse's mount_max counts "fuse" and not "fuseblk". */
+            bool blkdev = false;
+            int ret = defused_is_fuse_mount(0, ids[i], &blkdev, NULL);
+            /* A mount that went away is one fewer mount, not an error. */
+            if (ret == 1 && !blkdev)
+                count++;
+            else if (ret < 0 && ret != -ENOENT)
+                return ret;
+        }
+        if (n < (ssize_t)ARRAY_SIZE(ids))
+            return count;
+        /* Continue after the last id returned. */
+        req.param = ids[n - 1];
+    }
 }
 
 /* Returns 1, 0, or a negative errno. SO_PEERGROUPS needs Linux 4.13. */
@@ -557,41 +573,26 @@ static int umount_request(sd_varlink *link,
                                   "basename, not \"%s\"",
                                   req->name);
 
-    /* The service's own procfs, kept for use after entering the client's
-     * mount namespace. */
-    _cleanup_close_ int proc_fd =
-        open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (proc_fd == -1)
-        return defused_error_setf(err, DEFUSED_ERROR_UNMOUNT_FAILED, errno,
-                                  "opening /proc failed");
-    _cleanup_close_ int mnt_fd =
-        openat(parent_fd, req->name, O_PATH | O_NOFOLLOW | O_CLOEXEC);
-    if (mnt_fd == -1)
-        return defused_error_setf(err, DEFUSED_ERROR_MALFORMED, errno,
-                                  "opening \"%s\" under the parent directory "
-                                  "failed",
-                                  req->name);
-    long parent_mnt_id = -1, mnt_id = -1;
-    int ret = defused_fd_mnt_id(proc_fd, parent_fd, &parent_mnt_id);
+    /* No open fd: a reference to the mount, here or inherited by the
+     * sandboxed child, makes a non-lazy umount2() fail with EBUSY. */
+    uint64_t parent_mnt_id = 0, mnt_id = 0;
+    int ret = defused_mnt_id(parent_fd, "", &parent_mnt_id);
     if (ret == 0)
-        ret = defused_fd_mnt_id(proc_fd, mnt_fd, &mnt_id);
+        ret = defused_mnt_id(parent_fd, req->name, &mnt_id);
     if (ret < 0)
         return defused_error_setf(err, DEFUSED_ERROR_MALFORMED, -ret,
                                   "could not read the mnt_id of \"%s\" or its "
-                                  "parent directory from procfs",
+                                  "parent directory",
                                   req->name);
     if (mnt_id == parent_mnt_id) {
         defused_error_setf(err, DEFUSED_ERROR_NOT_A_FUSE_MOUNT, 0,
                            "nothing is mounted on \"%s\" (it shares mnt_id "
-                           "%ld with its parent directory); already "
+                           "%llu with its parent directory); already "
                            "unmounted?",
-                           req->name, mnt_id);
+                           req->name, (unsigned long long)mnt_id);
         return -EINVAL;
     }
-    /* From here on mnt_id identifies the target. An open reference to the
-     * mount, here or inherited by the sandboxed child, makes a non-lazy
-     * umount2() fail with EBUSY. */
-    mnt_fd = safe_close(mnt_fd);
+    /* From here on mnt_id identifies the target. */
     int umount_flags = UMOUNT_NOFOLLOW | (req->lazy ? MNT_DETACH : 0);
 
     if (cfg_child) {
@@ -613,8 +614,8 @@ static int umount_request(sd_varlink *link,
     ret = policy_check(link, peer, DEFUSED_OP_UNMOUNT, 0, err);
     if (ret < 0)
         return ret;
-    return defused_sandbox_unmount(pidfd, proc_fd, parent_fd, req->name,
-                                   req->lazy, mnt_id, peer->uid, err);
+    return defused_sandbox_unmount(pidfd, parent_fd, req->name, req->lazy,
+                                   mnt_id, peer->uid, err);
 }
 
 static int varlink_unmount(sd_varlink *link, sd_json_variant *parameters,

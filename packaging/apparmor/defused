@@ -21,9 +21,11 @@ profile defused flags=(attach_disconnected) {
   # on the client, whatever that client's own label is.
   ptrace (read),
 
-  /proc/ r,
   /proc/@{pid}/fdinfo/* r,
-  /proc/@{pid}/mountinfo r,
+
+  # An fd on /proc/<pid>/ns/mnt is an nsfs file with no path of its own, so
+  # attach_disconnected reports it as "/", which /** does not match.
+  / r,
 
   # The client passes already-open mountpoint and parent directory fds.
   # Permit metadata lookups through those delegated descriptors.

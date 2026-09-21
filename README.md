@@ -37,11 +37,14 @@ with Landlock.
 
 ## Requirements
 
-Defused requires Linux 6.5 or later, for `SO_PEERPIDFD`. To authorize
-unmounts, the service resolves a client's pidfd to its pid with the
-`PIDFD_GET_INFO` ioctl on Linux 6.13 or later, and falls back to the `Pid:`
-line of `/proc/self/fdinfo/<pidfd>` on older kernels.
-Privileged callers (see below) have neither requirement.
+Defused requires Linux 6.12 or later: `statmount()` needs 6.8, naming a
+mount namespace for it needs 6.11, and `name_to_handle_at()`'s
+`AT_HANDLE_MNT_ID_UNIQUE` needs 6.12. Debian 13 and Ubuntu 24.04 both ship
+a kernel that new.
+To authorize unmounts, the service resolves a client's pidfd to its pid with
+the `PIDFD_GET_INFO` ioctl on Linux 6.13 or later, and falls back to the
+`Pid:` line of `/proc/self/fdinfo/<pidfd>` on older kernels.
+Privileged callers (see below) skip the authorization entirely.
 
 Building needs libsystemd 258 or later, for the sd-varlink file descriptor
 passing API. Debian 13 (systemd 257) and Ubuntu 24.04 (255) are too old.
