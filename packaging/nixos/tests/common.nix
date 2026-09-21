@@ -245,22 +245,10 @@ let
       services.defused = {
         enable = true;
         package = package;
+        # These tests exercise defused's own mount plumbing, not the policy:
+        # grant allow_other, which mount-options.nix's real mount needs.
+        allowOther = true;
       };
-
-      # These tests exercise defused's own mount plumbing, not polkit's
-      # interactive-auth UX (there's no session/agent in a headless VM to
-      # answer an AUTH_ADMIN_KEEP challenge), so grant every defused action
-      # unconditionally here, regardless of privileged-flags -- including
-      # allow_other, which mount-options.nix's real mount needs. A real
-      # deployment would tighten or replace this rule -- see
-      # doc/protocol.md.
-      security.polkit.extraConfig = ''
-        polkit.addRule(function(action, subject) {
-          if (action.id.indexOf("website.soss.defused.") == 0) {
-            return polkit.Result.YES;
-          }
-        });
-      '';
 
       users.users.alice = {
         isNormalUser = true;

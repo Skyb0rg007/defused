@@ -26,8 +26,7 @@ let
     mount-options = ./mount-options.nix;
     file-mountpoint = ./file-mountpoint.nix;
     non-lazy-unmount = ./non-lazy-unmount.nix;
-    polkit = ./polkit.nix;
-    builtin-policy = ./builtin-policy.nix;
+    policy = ./policy.nix;
     apparmor = ./apparmor.nix;
     privileged = ./privileged.nix;
     desktop = ./desktop.nix;

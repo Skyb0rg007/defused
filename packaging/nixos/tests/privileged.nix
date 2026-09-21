@@ -26,7 +26,7 @@ pkgs.testers.nixosTest {
   # Deliberately not common.baseNode, and not services.defused.enable: a
   # caller that is root or holds CAP_SYS_ADMIN gets a `defused --child`
   # spawned by fusermount3 and never talks to the service, so neither the
-  # socket unit nor polkit exist on this machine at all.
+  # socket unit nor the service exist on this machine at all.
   nodes.machine =
     { ... }:
     {
@@ -47,7 +47,6 @@ pkgs.testers.nixosTest {
     machine.wait_for_unit("multi-user.target")
 
     machine.fail("test -e /run/defused/defused.sock")
-    machine.fail("systemctl is-active polkit.service")
     machine.succeed("test -x ${package}/lib/defused/defused")
 
     helper = "timeout 45s ${pkgs.python3}/bin/python3 ${mountHelper} "
@@ -60,7 +59,7 @@ pkgs.testers.nixosTest {
         )
         machine.succeed(helper + "assert-unmount /root/mnt __empty__")
 
-    with subtest("privileged options need no polkit"):
+    with subtest("privileged options need no service policy"):
         machine.succeed(
             helper + "assert-mount /root/mnt allow_other "
             "' - fuse fuse ' allow_other"

@@ -108,7 +108,8 @@ pkgs.testers.nixosTest {
           machine.wait_until_succeeds("! grep -F ' /home/alice/aa-mnt ' /proc/self/mountinfo")
 
       with subtest("no AppArmor denials for the defused profile"):
-          # Kernel-mediated denials land in the kernel log, D-Bus ones in the journal.
+          # Kernel-mediated denials land in the kernel log; the journal catches
+          # any that only a userspace mediator records.
           machine.fail("dmesg | grep -F 'apparmor=\"DENIED\"' | grep -F 'profile=\"defused'")
           machine.fail(
               "journalctl --no-pager | grep -F 'apparmor=\"DENIED\"' | grep -F 'profile=\"defused'"

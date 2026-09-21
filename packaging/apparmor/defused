@@ -9,7 +9,6 @@ include <tunables/global>
 # No attachment path: nothing is confined until AppArmorProfile= asks for it.
 profile defused flags=(attach_disconnected) {
   include <abstractions/base>
-  include <abstractions/dbus-strict>
 
   capability dac_read_search,
   capability sys_admin,
@@ -21,16 +20,6 @@ profile defused flags=(attach_disconnected) {
   # setns() into a client's mount namespace via its pidfd needs PTRACE_MODE_READ
   # on the client, whatever that client's own label is.
   ptrace (read),
-
-  dbus send
-    bus=system
-    path=/org/freedesktop/PolicyKit1/Authority
-    interface=org.freedesktop.PolicyKit1.Authority
-    member=CheckAuthorization
-    peer=(name=org.freedesktop.PolicyKit1),
-  dbus receive
-    bus=system
-    peer=(name=org.freedesktop.PolicyKit1),
 
   /proc/ r,
   /proc/@{pid}/fdinfo/* r,

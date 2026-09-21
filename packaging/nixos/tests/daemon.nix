@@ -41,34 +41,15 @@ pkgs.testers.nixosTest {
         pkgs.attr
       ];
 
-      # defused asks polkit whether a client may create a FUSE mount at all
-      # -- polkitd has to actually be running for that check to ever
-      # succeed rather than fail closed (see nixos/module.nix, which this
-      # standalone unit otherwise deliberately bypasses).
-      security.polkit.enable = true;
-
       systemd.services.defused = {
         description = "defused FUSE mount service (fork-daemon mode)";
         wantedBy = [ "multi-user.target" ];
-        wants = [ "polkit.service" ];
-        after = [ "polkit.service" ];
 
         serviceConfig = {
           ExecStart = "${package}/lib/defused/defused --daemon";
           RuntimeDirectory = "defused";
         };
       };
-
-      # Headless VM tests can't answer an interactive polkit prompt, so
-      # unconditionally allow every defused action -- see common.nix's
-      # baseNode for the same rule and its rationale.
-      security.polkit.extraConfig = ''
-        polkit.addRule(function(action, subject) {
-          if (action.id.indexOf("website.soss.defused.") == 0) {
-            return polkit.Result.YES;
-          }
-        });
-      '';
 
       users.users.alice = {
         isNormalUser = true;
