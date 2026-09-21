@@ -699,6 +699,10 @@ int main(int argc, char *argv[]) {
     if (run_mount_req_expect(argv[1], NULL, &privileged_opt, ".",
                              DEFUSED_VARLINK_ERROR_BAD_OPTION) != 0)
         return 1;
+    privileged_opt.mount_flags = DEFUSED_MOUNT_ALLOW_DEV;
+    if (run_mount_req_expect(argv[1], NULL, &privileged_opt, ".",
+                             DEFUSED_VARLINK_ERROR_BAD_OPTION) != 0)
+        return 1;
     privileged_opt.mount_flags = DEFUSED_MOUNT_BLKDEV;
     strcpy(privileged_opt.fsname, "dev");
     if (run_mount_req_expect(argv[1], NULL, &privileged_opt, ".",

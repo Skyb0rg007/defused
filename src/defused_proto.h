@@ -72,7 +72,7 @@ enum defused_op {
 enum defused_mount_flag {
     /* Create a read-only mount */
     DEFUSED_MOUNT_RDONLY = 1u << 0,
-    /* Allow device files */
+    /* Allow device files (privileged) */
     DEFUSED_MOUNT_ALLOW_DEV = 1u << 1,
     /* Strip the execute bit from files */
     DEFUSED_MOUNT_NOEXEC = 1u << 2,
@@ -96,13 +96,13 @@ enum defused_mount_flag {
     DEFUSED_MOUNT_BLKDEV = 1u << 11,
 };
 #define DEFUSED_MOUNT_PRIVILEGED_FLAGS                                         \
-    (DEFUSED_MOUNT_ALLOW_SUID | DEFUSED_MOUNT_BLKDEV)
+    (DEFUSED_MOUNT_ALLOW_SUID | DEFUSED_MOUNT_ALLOW_DEV | DEFUSED_MOUNT_BLKDEV)
 #define DEFUSED_MOUNT_FLAGS_MASK                                               \
-    (DEFUSED_MOUNT_RDONLY | DEFUSED_MOUNT_ALLOW_DEV | DEFUSED_MOUNT_NOEXEC |   \
-     DEFUSED_MOUNT_NOATIME | DEFUSED_MOUNT_NODIRATIME |                        \
-     DEFUSED_MOUNT_NOSYMFOLLOW | DEFUSED_MOUNT_SYNCHRONOUS |                   \
-     DEFUSED_MOUNT_DIRSYNC | DEFUSED_FUSE_ALLOW_OTHER |                        \
-     DEFUSED_FUSE_DEFAULT_PERMISSIONS | DEFUSED_MOUNT_PRIVILEGED_FLAGS)
+    (DEFUSED_MOUNT_RDONLY | DEFUSED_MOUNT_NOEXEC | DEFUSED_MOUNT_NOATIME |     \
+     DEFUSED_MOUNT_NODIRATIME | DEFUSED_MOUNT_NOSYMFOLLOW |                    \
+     DEFUSED_MOUNT_SYNCHRONOUS | DEFUSED_MOUNT_DIRSYNC |                       \
+     DEFUSED_FUSE_ALLOW_OTHER | DEFUSED_FUSE_DEFAULT_PERMISSIONS |             \
+     DEFUSED_MOUNT_PRIVILEGED_FLAGS)
 
 /*
  * Request a FUSE mount. The Varlink call carries two file descriptors,

@@ -66,9 +66,12 @@ pkgs.testers.nixosTest {
             "' - fuse fuse ' allow_other"
         )
 
-    with subtest("suid and blkdev work like libfuse's root path"):
+    with subtest("suid, dev and blkdev work like libfuse's root path"):
         machine.succeed(
             helper + "assert-mount /root/mnt suid ' - fuse fuse ' rw '!nosuid'"
+        )
+        machine.succeed(
+            helper + "assert-mount /root/mnt dev ' - fuse fuse ' rw '!nodev'"
         )
         machine.succeed("truncate -s 1M /root/blk.img")
         dev = machine.succeed("losetup -f --show /root/blk.img").strip()
