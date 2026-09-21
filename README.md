@@ -46,8 +46,11 @@ the `PIDFD_GET_INFO` ioctl on Linux 6.13 or later, and falls back to the
 `Pid:` line of `/proc/self/fdinfo/<pidfd>` on older kernels.
 Privileged callers (see below) skip the authorization entirely.
 
-Building needs libsystemd 258 or later, for the sd-varlink file descriptor
-passing API. Debian 13 (systemd 257) and Ubuntu 24.04 (255) are too old.
+Building needs libseccomp and the Linux UAPI headers, and nothing else:
+the client and the service speak a small binary protocol of their own over
+a Unix socket, so there is no RPC library in the picture. systemd is
+useful at runtime, for socket activation, but is not required either to
+build or to run -- see `defused --daemon` below.
 
 ## Project structure
 
@@ -60,8 +63,8 @@ This project provides the following:
 The system service is written to use systemd socket activation with
 `Accept=yes`.
 For testing or on systems without systemd, `defused --daemon` can be used
-to create the Varlink socket and fork off child processes to handle
-accepted connections.
+to create the socket and fork off child processes to handle accepted
+connections.
 
 ## Mount policy
 

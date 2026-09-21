@@ -4,27 +4,18 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * End-to-end test of the fusermount3 client against a fake defused
- * service, without root: it binds a SOCK_STREAM listener at a temp
- * path (handed to the client via the DEFUSED_SOCKET env override), runs
- * the client, and checks both directions of the protocol:
+ * service, without root: a seqpacket listener at a temp path (given to
+ * the client via $DEFUSED_SOCKET), then both directions of the protocol.
  *
- *  - mount: a fusermount3-style -o string arrives as the right typed
- *    defused_mount_req (generic options parsed into mount_flags, names
- *    unescaped, numbers parsed), carrying an fd for the right directory;
- *    and the fd the fake service returns is forwarded to _FUSE_COMMFD
- *    framed the way libfuse's receive_fd() expects (1 zero byte +
- *    SCM_RIGHTS).
- *
- *  - unmount: -u -z becomes a defused_umount_req with lazy set, and a
- *    service error status surfaces as a nonzero exit.
- *
- *  - privileged caller: the client spawns `defused --child` (this binary,
- *    via DEFUSED_PATH) instead of connecting to the socket; the fake child
- *    runs the same mount/unmount checks as above.
+ * A mount's -o string must arrive as the right request and the device fd
+ * must reach _FUSE_COMMFD framed as libfuse's receive_fd() expects; -u -z
+ * must arrive as op UNMOUNT with lazy set, and an error must surface as a
+ * nonzero exit. A privileged caller spawns `defused --child` (this binary,
+ * via DEFUSED_PATH) and never touches the socket.
  */
 #define _GNU_SOURCE
 #include "common.h"
-#include "defused_proto.h"
+#include "defused-proto.h"
 #include "test_util.h"
 
 #include <errno.h>
@@ -40,9 +31,6 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
-#include <systemd/sd-event.h>
-#include <systemd/sd-json.h>
-#include <systemd/sd-varlink.h>
 #include <unistd.h>
 
 static int recv_with_fd(int sock, void *buf, size_t len, ssize_t *out_len,
@@ -153,7 +141,7 @@ static void check_forwarded_fd(int comm_fd) {
 }
 
 /* The -o string test_mount() sends, and what
- * method_mount() expects it to have been parsed into. noatime,atime and
+ * check_mount_request() expects it to have been parsed into. noatime,atime and
  * large_read are here for libfuse2's fusermount, whose option set is a
  * subset of fusermount3's apart from those two. */
 #define MOUNT_OPTS                                                             \
@@ -163,14 +151,8 @@ static void check_forwarded_fd(int comm_fd) {
 static const char mount_opts[] = MOUNT_OPTS;
 static const char privileged_mount_opts[] = MOUNT_OPTS ",blkdev";
 
-static int method_mount(sd_varlink *link, sd_json_variant *parameters,
-                        sd_varlink_method_flags_t flags, void *userdata) {
-    (void)flags;
-    (void)userdata;
-    struct defused_mount_req p = {0};
-    CHECK(sd_varlink_dispatch(link, parameters, defused_mount_fields, &p) == 0);
-    CHECK(sd_varlink_get_n_fds(link) == 2);
-
+static void check_mount_request(const struct defused_request *req, int fuse_fd,
+                                int mnt_fd) {
     uint32_t expected_flags = DEFUSED_MOUNT_RDONLY | DEFUSED_MOUNT_NOEXEC |
                               DEFUSED_MOUNT_SYNCHRONOUS |
                               DEFUSED_MOUNT_DIRSYNC |
@@ -182,34 +164,26 @@ static int method_mount(sd_varlink *link, sd_json_variant *parameters,
     if (strcmp(getenv("DEFUSED_TEST_UID"), "0") == 0)
         expected_flags |= DEFUSED_MOUNT_ALLOW_SUID | DEFUSED_MOUNT_ALLOW_DEV |
                           DEFUSED_MOUNT_BLKDEV;
-    CHECK(p.mount_flags == expected_flags);
-    CHECK(p.max_read == 4096);
-    CHECK(p.blksize == 0);
-    CHECK(strcmp(p.fsname, "test,fs") == 0);
-    CHECK(strcmp(p.subtype, "mem,fs") == 0);
+    CHECK(req->mount_flags == expected_flags);
+    CHECK(req->max_read == 4096);
+    CHECK(req->blksize == 0);
+    CHECK(strcmp(req->fsname, "test,fs") == 0);
+    CHECK(strcmp(req->subtype, "mem,fs") == 0);
 
-    _cleanup_close_ int fuse_fd = sd_varlink_take_fd(link, p.fuse_fd);
-    CHECK(fuse_fd >= 0);
-    struct stat fuse_in_st;
-    CHECK(fstat(fuse_fd, &fuse_in_st) == 0 && S_ISCHR(fuse_in_st.st_mode));
+    struct stat fuse_st;
+    CHECK(fstat(fuse_fd, &fuse_st) == 0 && S_ISCHR(fuse_st.st_mode));
 
-    _cleanup_close_ int mnt_fd = sd_varlink_take_fd(link, p.mnt_fd);
-    CHECK(mnt_fd >= 0);
     struct stat fd_st, dot_st;
     CHECK(fstat(mnt_fd, &fd_st) == 0 && stat(".", &dot_st) == 0);
     CHECK(S_ISDIR(fd_st.st_mode));
     CHECK(fd_st.st_dev == dot_st.st_dev && fd_st.st_ino == dot_st.st_ino);
-
-    return sd_varlink_reply(link, NULL);
 }
 
 /* Expects an unmount of ".": the client resolves it via realpath() before
  * splitting it into a parent dir + basename, so compute the same split here
  * -- nothing chdir()s, so the client's cwd is this process's cwd. */
-static int method_unmount(sd_varlink *link, sd_json_variant *parameters,
-                          sd_varlink_method_flags_t flags, void *userdata) {
-    (void)flags;
-    (void)userdata;
+static void check_unmount_request(const struct defused_request *req,
+                                  int parent_fd) {
     char cwd[PATH_MAX];
     CHECK(getcwd(cwd, sizeof(cwd)) != NULL);
     _cleanup_free_ char *dir_copy = strdup(cwd);
@@ -218,56 +192,42 @@ static int method_unmount(sd_varlink *link, sd_json_variant *parameters,
     const char *expect_parent = dirname(dir_copy);
     const char *expect_name = basename(base_copy);
 
-    struct defused_umount_req p = {0};
-    CHECK(sd_varlink_dispatch(link, parameters, defused_umount_fields, &p) ==
-          0);
-    CHECK(sd_varlink_get_n_fds(link) == 1);
-    CHECK(p.lazy);
-    CHECK(strcmp(p.name, expect_name) == 0);
+    CHECK(req->lazy);
+    CHECK(strcmp(req->name, expect_name) == 0);
     /* The parent directory, never the mountpoint itself: an fd held open on
      * the mount would make a non-lazy umount2() fail with EBUSY. */
-    _cleanup_close_ int parent_fd = sd_varlink_take_fd(link, p.parent_fd);
-    CHECK(parent_fd >= 0);
     struct stat fd_st, parent_st;
     CHECK(fstat(parent_fd, &fd_st) == 0 &&
           stat(expect_parent, &parent_st) == 0);
     CHECK(fd_st.st_dev == parent_st.st_dev && fd_st.st_ino == parent_st.st_ino);
-    return sd_varlink_error(link, DEFUSED_ERROR_NOT_A_FUSE_MOUNT, NULL);
 }
 
-/* Serves one connection to completion. Takes ownership of conn_fd. */
+/* Plays the service for one connection: one request in, one reply out.
+ * Takes ownership of conn_fd. */
 static int serve_connection(int conn_fd) {
     _cleanup_close_ int conn = conn_fd;
-    _cleanup_(sd_event_unrefp) sd_event *event = NULL;
-    _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *server = NULL;
-    int ret = sd_event_new(&event);
-    if (ret < 0)
+    struct defused_request req;
+    int fds[DEFUSED_MAX_FDS];
+    size_t n_fds = 0;
+    int ret = defused_recv_request(conn, &req, fds, &n_fds);
+    if (ret < 0) {
+        fprintf(stderr, "FAIL: reading the request failed: %s\n",
+                strerror(-ret));
+        failures++;
         return ret;
-    ret = sd_varlink_server_new(&server,
-                                SD_VARLINK_SERVER_ALLOW_FD_PASSING_INPUT |
-                                    SD_VARLINK_SERVER_INHERIT_USERDATA);
-    if (ret < 0)
-        return ret;
-    ret = sd_varlink_server_add_interface(server,
-                                          &vl_interface_website_soss_defused);
-    if (ret < 0)
-        return ret;
-    ret = sd_varlink_server_bind_method_many(
-        server, DEFUSED_METHOD_MOUNT, method_mount, DEFUSED_METHOD_UNMOUNT,
-        method_unmount);
-    if (ret < 0)
-        return ret;
-    ret = sd_varlink_server_set_exit_on_idle(server, true);
-    if (ret < 0)
-        return ret;
-    ret = sd_varlink_server_attach_event(server, event, 0);
-    if (ret < 0)
-        return ret;
-    ret = sd_varlink_server_add_connection(server, conn, NULL);
-    if (ret < 0)
-        return ret;
-    TAKE_FD(conn);
-    return sd_event_loop(event);
+    }
+    _cleanup_close_ int fd0 = fds[0];
+    _cleanup_close_ int fd1 = n_fds > 1 ? fds[1] : -EBADF;
+
+    struct defused_error err = {};
+    if (req.op == DEFUSED_OP_MOUNT) {
+        check_mount_request(&req, fd0, fd1);
+    } else {
+        check_unmount_request(&req, fd0);
+        /* An error the client must turn into a nonzero exit. */
+        defused_error_set(&err, DEFUSED_ERR_NOT_A_FUSE_MOUNT, 0, NULL);
+    }
+    return defused_send_reply(conn, &err);
 }
 
 /* Accepts one connection on listen_fd and plays the service to completion. */
@@ -318,7 +278,7 @@ static int fake_defused_child(int argc, char *argv[]) {
     CHECK(argc == 2 && strcmp(argv[0], "defused") == 0);
     const char *listen_fds = getenv("LISTEN_FDS");
     CHECK(listen_fds != NULL && strcmp(listen_fds, "1") == 0);
-    CHECK(serve_connection(3) == 0);
+    CHECK(serve_connection(DEFUSED_LISTEN_FD) == 0);
     return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }
 
@@ -372,7 +332,7 @@ int main(int argc, char *argv[]) {
     struct sockaddr_un sa = {.sun_family = AF_UNIX};
     strcpy(sa.sun_path, sock_path);
     _cleanup_close_ int listen_fd =
-        socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        socket(AF_UNIX, DEFUSED_SOCKET_TYPE | SOCK_CLOEXEC, 0);
     if (listen_fd < 0 || bind(listen_fd, (struct sockaddr *)&sa, sizeof(sa)) ||
         listen(listen_fd, 2)) {
         perror("listen socket");

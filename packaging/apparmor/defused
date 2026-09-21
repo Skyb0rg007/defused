@@ -15,7 +15,7 @@ profile defused flags=(attach_disconnected) {
   capability sys_chroot,
   capability sys_ptrace,
 
-  network unix stream,
+  network unix seqpacket,
 
   # setns() into a client's mount namespace via its pidfd needs PTRACE_MODE_READ
   # on the client, whatever that client's own label is.

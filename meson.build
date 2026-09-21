@@ -11,9 +11,6 @@ project(
 )
 
 seccomp_dep = dependency('libseccomp')
-# sd-varlink fd passing (SD_VARLINK_SERVER_FD_PASSING_INPUT_STRICT,
-# sd_varlink_get_n_fds) is new in systemd 258.
-systemd_dep = dependency('libsystemd', version : '>= 258')
 
 # Not $libdir: the AppArmor profile hard-codes this path.
 defused_install_dir = get_option('prefix') / 'lib/defused'
@@ -36,8 +33,8 @@ sandbox_lib = static_library(
 defused_exe = executable(
   'defused',
   'src/defused.c',
-  'src/defused-varlink.c',
-  dependencies : [seccomp_dep, systemd_dep],
+  'src/defused-proto.c',
+  dependencies : [seccomp_dep],
   link_with : sandbox_lib,
   install_dir : defused_install_dir,
   install : true,
@@ -46,9 +43,8 @@ defused_exe = executable(
 fusermount3_exe = executable(
   'fusermount3',
   'src/fusermount3.c',
-  'src/defused-varlink.c',
+  'src/defused-proto.c',
   c_args : fusermount3_c_args,
-  dependencies : [systemd_dep],
   install : true,
 )
 
@@ -80,16 +76,15 @@ install_data(
 test_timeout = 120
 test_inc = include_directories('src')
 
-# These three speak the Varlink protocol, so each links the client helpers
-# and takes the binary it drives as its single argument.
-varlink_tests = {}
+# These three speak the wire protocol, so each links its implementation and
+# takes the binary it drives as its single argument.
+protocol_tests = {}
 foreach name : ['protocol', 'client', 'mountns']
-  varlink_tests += {
+  protocol_tests += {
     name: executable(
       'test-' + name,
       'tests/test_@0@.c'.format(name),
-      'src/defused-varlink.c',
-      dependencies : [systemd_dep],
+      'src/defused-proto.c',
       include_directories : test_inc,
     ),
   }
@@ -98,14 +93,13 @@ endforeach
 test_fusermount3_exe = executable(
   'test-fusermount3',
   'src/fusermount3.c',
-  'src/defused-varlink.c',
+  'src/defused-proto.c',
   c_args : [
     '-DDEFUSED_TEST',
     '-DDEFUSED_VERSION="@0@"'.format(meson.project_version()),
     # test-client doubles as the fake `defused --child` for privileged callers.
-    '-DDEFUSED_PATH="@0@"'.format(varlink_tests['client'].full_path()),
+    '-DDEFUSED_PATH="@0@"'.format(protocol_tests['client'].full_path()),
   ],
-  dependencies : [systemd_dep],
 )
 
 foreach name, driven : {
@@ -113,7 +107,7 @@ foreach name, driven : {
   'client': test_fusermount3_exe,
   'mountns': defused_exe,
 }
-  test(name, varlink_tests[name], args : [driven], timeout : test_timeout)
+  test(name, protocol_tests[name], args : [driven], timeout : test_timeout)
 endforeach
 
 test_sandbox_exe = executable(

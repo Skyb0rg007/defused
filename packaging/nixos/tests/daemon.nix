@@ -2,12 +2,10 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-{ pkgs, common, ... }:
+{ common, ... }:
 
 let
-  inherit (common) package kernelVersion;
-  # user.* xattrs on socket inodes need Linux >= 7.0.
-  socketXattrSupported = pkgs.lib.versionAtLeast kernelVersion "7.0";
+  inherit (common) package;
 in
 common.mkTest {
   name = "daemon";
@@ -23,10 +21,7 @@ common.mkTest {
       boot.kernelPackages = common.kernelPackages;
       boot.kernelModules = [ "fuse" ];
 
-      environment.systemPackages = [
-        package
-        pkgs.attr
-      ];
+      environment.systemPackages = [ package ];
 
       systemd.services.defused = {
         description = "defused FUSE mount service (fork-daemon mode)";
@@ -59,28 +54,13 @@ common.mkTest {
 
     # --daemon binds the socket 0666 itself, unlike systemd's Accept=yes
     # (mode 0644) -- see issue #3. wait_until_succeeds rather than succeed:
-    # bind() and chmod() are separate syscalls in create_listening_socket(),
+    # bind() and chmod() are separate syscalls in listen_socket(),
     # so wait_for_file above can observe the socket a moment before its mode
     # is updated.
     machine.wait_until_succeeds(
         "stat -c '%a' /run/defused/defused.sock | grep -qx 666"
     )
 
-    # This VM runs kernel ${kernelVersion}.
-    ${
-      if socketXattrSupported then
-        ''
-          machine.wait_until_succeeds(
-              "getfattr --only-values -n user.varlink /run/defused/defused.sock | "
-              "grep -qx entrypoint"
-          )
-        ''
-      else
-        ''
-          # setxattr() failed with EPERM; the daemon must have carried on.
-          machine.fail("getfattr -n user.varlink /run/defused/defused.sock")
-        ''
-    }
     machine.succeed("test -e /dev/fuse")
     mkmnt(machine, "/home/alice/daemon-mnt-a", "/home/alice/daemon-mnt-b")
 

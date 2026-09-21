@@ -9,8 +9,8 @@ SPDX-License-Identifier: GPL-2.0-or-later
 ## Build and test
 
 If possible, use a Nix dev shell to make the tools available.
-Otherwise, the project has runtime dependencies on libseccomp and libsystemd
-(258 or later), build-time dependencies on meson and ninja.
+Otherwise, the project has a runtime dependency on libseccomp and
+build-time dependencies on meson and ninja.
 You should also install treefmt, nixfmt, and clang-tools for development.
 
 ```sh
@@ -64,8 +64,7 @@ C code follows the systemd coding style for resource management: a resource
 is released by a `_cleanup_` attribute on the variable holding it, not by a
 `goto out` label. `src/common.h` provides `_cleanup_close_`,
 `_cleanup_free_`, `_cleanup_fclose_`, `_cleanup_close_pair_`, and
-`DEFINE_TRIVIAL_CLEANUP_FUNC()` for other release functions; libsystemd's own
-`*_unrefp` helpers work with `_cleanup_()` directly. Hand a resource off with
+`DEFINE_TRIVIAL_CLEANUP_FUNC()` for other release functions. Hand a resource off with
 `TAKE_FD()`/`TAKE_PTR()`, close one early with `fd = safe_close(fd);`, and
 initialize unset fds to `-EBADF`.
 

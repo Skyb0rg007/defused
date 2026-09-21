@@ -14,7 +14,7 @@ let
     import sys
     import time
 
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     s.connect(sys.argv[1])
     time.sleep(120)
   '';
@@ -38,7 +38,7 @@ common.mkTest {
   script =
     { nodes, ... }:
     let
-      socketPath = nodes.machine.systemd.sockets.defused.socketConfig.ListenStream;
+      socketPath = nodes.machine.systemd.sockets.defused.socketConfig.ListenSequentialPacket;
     in
     ''
       boot(machine)
