@@ -1,0 +1,46 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: 2026 Skye Soss <skye@soss.website>
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+# The machine the tests expect: the users they mount as, the socket unit
+# enabled the way a package's preset would, and the AppArmor policy a
+# distribution that ships its own has to reconcile with defused.
+
+set -eu
+
+# alice mounts; bob is the user outside --allow-groups in the policy test.
+for user in alice bob; do
+    useradd --create-home --user-group --shell /bin/sh "$user"
+done
+groupadd fusers
+usermod --append --groups fusers alice
+
+# The shipped profile needs nothing added for the service itself here; this
+# is only for the mediation probe in the apparmor test, which has to be able
+# to exec something under a profile that grants no exec of its own.
+mkdir -p /etc/apparmor.d/local
+cat >/etc/apparmor.d/local/defused <<'RULES'
+/usr/bin/* ix,
+RULES
+
+# Ubuntu's apparmor package ships a profile attached to the path
+# /usr/bin/fusermount3, written for libfuse's setuid helper: it grants that
+# binary the mounts it may perform and nothing else. So it denies defused's
+# client the one thing it does -- connecting to /run/defused/defused.sock --
+# and it would hold a privileged caller, which mounts from fusermount3
+# itself, to libfuse's list of permitted mountpoints.
+#
+# Defused's fusermount3 is not setuid: an unprivileged caller gains nothing
+# from it, and a privileged one was already allowed to mount. A package
+# replacing the binary has to replace the profile too, and disabling it is
+# how AppArmor spells that.
+if [ -e /etc/apparmor.d/fusermount3 ]; then
+    mkdir -p /etc/apparmor.d/disable
+    ln -sf /etc/apparmor.d/fusermount3 /etc/apparmor.d/disable/fusermount3
+fi
+
+systemctl enable defused.socket
+
+# Nothing in the image needs the network, and waiting for it costs a boot.
+systemctl mask systemd-networkd-wait-online.service

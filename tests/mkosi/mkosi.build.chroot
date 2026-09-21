@@ -1,0 +1,41 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: 2026 Skye Soss <skye@soss.website>
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+# Builds defused inside the image, with the distribution's own toolchain,
+# and installs it the way a package would: `meson install --prefix=/usr`.
+# The guest half of the test suite goes in beside it.
+
+set -eu
+
+guest=$SRCDIR/tests/mkosi/guest
+testdir=$DESTDIR/usr/lib/defused-test
+
+if [ ! -f "$BUILDDIR/build.ninja" ]; then
+    meson setup "$BUILDDIR" "$SRCDIR" --prefix=/usr
+fi
+meson compile -C "$BUILDDIR"
+
+# The unit tests, built against the distribution's own toolchain. They skip
+# (exit 77) what the build sandbox cannot support; the VM tests below are
+# the ones that mount for real.
+if [ "${WITH_TESTS:-1}" = 1 ]; then
+    meson test -C "$BUILDDIR" --print-errorlogs
+fi
+
+meson install -C "$BUILDDIR" --destdir "$DESTDIR" --no-rebuild
+
+install -d "$testdir" "$testdir/tests"
+install -m 0755 "$guest/run-test" "$testdir/run-test"
+install -m 0644 "$guest/harness.py" "$guest/hold-connection.py" "$testdir/"
+install -m 0644 "$SRCDIR/tests/mount-helper.py" "$testdir/mount-helper.py"
+install -m 0644 "$guest"/tests/*.py "$testdir/tests/"
+
+install -d "$DESTDIR/usr/lib/systemd/system"
+install -m 0644 "$guest/defused-test.service" "$DESTDIR/usr/lib/systemd/system/"
+
+# A libfuse2 filesystem to mount in the desktop test: libfuse2 execs
+# /usr/bin/fusermount, the other name defused takes over.
+cc -O1 -Wall -o "$testdir/fuse2-hello" "$guest/fuse2-hello.c" \
+    $(pkg-config --cflags --libs fuse)

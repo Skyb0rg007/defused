@@ -58,6 +58,24 @@ running them, so this local run is the only thing that exercises them.
 Pass `--print-build-logs` (`-L`) to see the Meson test output as it runs;
 without it a passing build prints nothing.
 
+## The mkosi VM tests
+
+`tests/mkosi/` is the same VM suite on an FHS distribution, one test file
+per NixOS test, built and installed with `meson install --prefix=/usr`:
+
+```sh
+sudo tests/mkosi/run-tests
+```
+
+It needs mkosi and qemu rather than Nix, and it is where packaging problems
+show up -- the paths libfuse execs, the units in `/usr/lib/systemd/system`,
+and a distribution's own AppArmor policy, none of which a NixOS machine has.
+See [tests/mkosi/README.md](../tests/mkosi/README.md).
+
+Both suites drive `fusermount3` through the same `tests/mount-helper.py`, so
+a change to how a mount is checked belongs there rather than in either
+suite.
+
 ## Coding style
 
 C code follows the systemd coding style for resource management: a resource
