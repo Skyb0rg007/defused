@@ -261,7 +261,7 @@ static const char *describe_mount_req(const struct defused_request *req,
 static int finish_request(const char *what, const char *target,
                           const struct peer *peer, int ret,
                           const struct defused_error *err) {
-    int sent = defused_sandbox_reply(peer->sock, err);
+    int sent = defused_send_reply(peer->sock, err);
     if (ret >= 0)
         fprintf(stderr, "defused: %sed %s for uid %u\n", what, target,
                 (unsigned)peer->uid);

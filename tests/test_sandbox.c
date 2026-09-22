@@ -53,9 +53,11 @@ enum {
     ARG_HANDLE, /* the pinned file handle, and an unpinned buffer */
     ARG_HANDLE_COPY,
     ARG_HANDLE_ID, /* the pinned mount-id out-parameter */
-    ARG_REPLY,     /* the pinned reply buffer, and its pinned length */
-    ARG_REPLY_LEN,
+    ARG_REPLY,     /* an unpinned buffer holding a reply-sized message */
 };
+
+/* The filter pins the reply's length, not where it is formatted. */
+#define PROBE_REPLY_LEN ((long)sizeof(struct defused_reply))
 
 static long probe_arg(long v, const struct sandbox_job *job) {
     /* Filled at run time, so it is a distinct object whatever the compiler
@@ -75,11 +77,9 @@ static long probe_arg(long v, const struct sandbox_job *job) {
         return (long)defused_test_handle_id(job);
     case ARG_HANDLE_COPY:
         return (long)handle_copy;
-    case ARG_REPLY:
-    case ARG_REPLY_LEN: {
-        size_t len;
-        const void *buf = defused_test_reply_buf(job, &len);
-        return v == ARG_REPLY ? (long)buf : (long)len;
+    case ARG_REPLY: {
+        static struct defused_reply reply;
+        return (long)&reply;
     }
     default:
         return v;
@@ -101,22 +101,24 @@ struct probe {
     const long *args; /* six: what the kernel reads */
 };
 
-/* What either operation may do once it is done: reply with that one exact
- * sendto(), and log. A zero-length write goes through the descriptor check
- * without printing anything. */
+/* What either operation may do once it is done: answer the client with
+ * that one sendto(), and log. Neither is a filesystem operation, so the
+ * buffers are the caller's business and only the descriptors, the reply's
+ * length and its flags are pinned. A zero-length write goes through the
+ * descriptor check without printing anything. */
 static const struct probe reply_probes[] = {
     {"sendto as the process replies with", ALLOW, SYS_sendto,
-     ARGS(FD_SOCK, ARG_REPLY, ARG_REPLY_LEN, MSG_NOSIGNAL, 0, 0)},
+     ARGS(FD_SOCK, ARG_REPLY, PROBE_REPLY_LEN, MSG_NOSIGNAL, 0, 0)},
+    {"sendto from wherever the reply was formatted", ALLOW, SYS_sendto,
+     ARGS(FD_SOCK, ARG_HANDLE_COPY, PROBE_REPLY_LEN, MSG_NOSIGNAL, 0, 0)},
     {"sendto on another descriptor", DENY, SYS_sendto,
-     ARGS(FD_PARENT, ARG_REPLY, ARG_REPLY_LEN, MSG_NOSIGNAL, 0, 0)},
-    {"sendto from an unpinned buffer", DENY, SYS_sendto,
-     ARGS(FD_SOCK, ARG_HANDLE_COPY, ARG_REPLY_LEN, MSG_NOSIGNAL, 0, 0)},
+     ARGS(FD_PARENT, ARG_REPLY, PROBE_REPLY_LEN, MSG_NOSIGNAL, 0, 0)},
     {"sendto of a different length", DENY, SYS_sendto,
      ARGS(FD_SOCK, ARG_REPLY, 1, MSG_NOSIGNAL, 0, 0)},
     {"sendto without MSG_NOSIGNAL", DENY, SYS_sendto,
-     ARGS(FD_SOCK, ARG_REPLY, ARG_REPLY_LEN, 0, 0, 0)},
-    {"sendto with an address", DENY, SYS_sendto,
-     ARGS(FD_SOCK, ARG_REPLY, ARG_REPLY_LEN, MSG_NOSIGNAL, ARG_HANDLE_COPY,
+     ARGS(FD_SOCK, ARG_REPLY, PROBE_REPLY_LEN, 0, 0, 0)},
+    {"sendto to an address of its own", DENY, SYS_sendto,
+     ARGS(FD_SOCK, ARG_REPLY, PROBE_REPLY_LEN, MSG_NOSIGNAL, ARG_HANDLE_COPY,
           16)},
     {"write to stderr, as the logger does", ALLOW, SYS_write,
      ARGS(STDERR_FILENO, ARG_HANDLE_COPY, 0)},
@@ -125,7 +127,7 @@ static const struct probe reply_probes[] = {
     {"write to stdout", DENY, SYS_write,
      ARGS(STDOUT_FILENO, ARG_HANDLE_COPY, 0)},
     {"write to the client socket", DENY, SYS_write,
-     ARGS(FD_SOCK, ARG_REPLY, ARG_REPLY_LEN)},
+     ARGS(FD_SOCK, ARG_REPLY, PROBE_REPLY_LEN)},
     {"writev to another descriptor", DENY, SYS_writev,
      ARGS(FD_PARENT, ARG_HANDLE_COPY, 0)},
 };

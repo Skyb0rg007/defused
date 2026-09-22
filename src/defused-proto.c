@@ -10,6 +10,7 @@
 #define _GNU_SOURCE
 #include "defused-proto.h"
 #include "common.h"
+#include "defused-syscall.h"
 
 #include <errno.h>
 #include <sys/socket.h>
@@ -165,11 +166,22 @@ int defused_recv_request(int sock, struct defused_request *req, int *fds,
     return -EBADMSG;
 }
 
+/* sendto(), not the sendmsg() above: a reply carries no descriptors, and
+ * the service sends it from inside its seccomp sandbox, whose allowlist
+ * has to name one entry point. */
 int defused_send_reply(int sock, const struct defused_error *err) {
     struct defused_reply reply = {
         .magic = DEFUSED_MAGIC,
         .code = err->code,
         .sys_errno = err->sys_errno,
     };
-    return send_msg(sock, &reply, sizeof(reply), NULL, 0);
+    ssize_t n;
+    do
+        n = sys_sendto(sock, &reply, sizeof(reply), DEFUSED_REPLY_SEND_FLAGS,
+                       NULL, 0);
+    while (n < 0 && errno == EINTR);
+    if (n < 0)
+        return -errno;
+    /* Seqpacket delivers a message whole or not at all. */
+    return n == (ssize_t)sizeof(reply) ? 0 : -EIO;
 }

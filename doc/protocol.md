@@ -252,22 +252,27 @@ For unmounts, it can additionally `fchdir()` to the parent directory,
 Either way it may then `sendto()` the reply to the client, write to stderr,
 and exit.
 
-The filter pins every argument of all of those, not just the syscall numbers:
-each rule is an equality test against the exact descriptor, pointer and flag
-word the process is about to pass.
+What the filter is guarding against is libc reaching the client's filesystem
+on its own, so the scrutiny goes where a call names a file.
+For those, every argument is pinned, not just the syscall number: each rule
+is an equality test against the exact descriptor, pointer and flag word the
+process is about to pass.
 seccomp-bpf cannot dereference pointers, so the process first copies its one
 path argument into an anonymous mapping and `mprotect()`s it read-only, and
-takes the kernel's output buffers, the reply among them, from a second
-mapping.
+takes the kernel's output buffers from a second mapping.
 `mprotect()` is not on the allowlist, so those addresses are fixed for the
 rest of the process's life, and comparing them by value is as good as
 comparing the strings.
 The post-`setns()` operation uses explicit syscall wrappers so the filter's
 allowlist fully describes its possible kernel interface.
 
-The one allowance pinned by descriptor alone is stderr: `write()` and
-`writev()` to it go through with any buffer, so that libc can format the log
-line for the outcome after the operation.
+A call that only acts on a descriptor already opened reaches no file, and is
+allowed by descriptor rather than by buffer.
+The reply is one `sendto()` of its exact size, with `MSG_NOSIGNAL` and no
+address, on the client socket and no other; where it was formatted does not
+matter.
+The log line is `write()` or `writev()` to stderr with any buffer, so libc
+can format it after the operation.
 Nothing else libc might reach for is allowed, so a libc that needs another
 call there loses the log line and nothing more; the reply does not depend on
 it.
