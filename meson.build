@@ -125,6 +125,7 @@ test_sandbox_exe = executable(
   'test-sandbox',
   'tests/test_sandbox.c',
   'src/defused-sandbox.c',
+  'src/defused-proto.c',
   c_args : ['-DDEFUSED_TEST', '-ffreestanding'],
   dependencies : [seccomp_dep],
   include_directories : test_inc,

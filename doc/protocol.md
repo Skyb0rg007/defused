@@ -162,7 +162,8 @@ mount namespace (found from the socket peer's pidfd) so that nothing has to
 be entered, and checks that the mount is a `fuse` or `fuseblk` one whose
 `user_id=` superblock option matches the caller's uid.
 
-Finally, a sandboxed child joins the caller's mount namespace, changes
+Finally, the service loads its seccomp filter, joins the caller's mount
+namespace, changes
 directory to the parent fd, and asks `name_to_handle_at()` about `name`
 again to check that its `mnt_id` is still the one that was authorized.
 It then calls `umount2(name, UMOUNT_NOFOLLOW)`, adding `MNT_DETACH` if `lazy`
@@ -187,7 +188,7 @@ Like root's `umount`, it unmounts any mount below the parent directory.
 Both binaries link `src/defused-mount.c`, so the shape checks and the
 superblock construction are the same code either way. Only what surrounds
 them differs: the service puts its authorization between the steps, and
-hands the finished mount to a sandboxed child rather than attaching it
+attaches the finished mount from under a seccomp filter rather than attaching it
 itself.
 
 Two things follow from the privileged path no longer being the service:
@@ -240,25 +241,38 @@ The service uses `SO_PEERPIDFD` on the accepted socket to identify the
 connecting process and joins that process's mount namespace before the
 mount/umount operation.
 
-The main service process never enters the client-controlled namespace.
-After validating and authorizing the request, it forks a short-lived child that
-installs an enforcing seccomp filter and then joins the namespace.
-For mounts, the parent creates a detached FUSE mount first, leaving the child
-only `setns()` and `move_mount()`.
-For unmounts, the child can additionally `fchdir()` to the parent directory,
+The service enters the client-controlled namespace only under an enforcing
+seccomp filter, and never leaves it: the process handling the connection
+serves one request and exits, so after validating and authorizing the
+request it loads the filter on itself and then joins the namespace.
+For mounts, it creates a detached FUSE mount first, leaving only `setns()`
+and `move_mount()` for after the filter.
+For unmounts, it can additionally `fchdir()` to the parent directory,
 `name_to_handle_at()` `name` under it, and call `umount2()`.
-Both may `write()` their result back and exit.
+Either way it may then `sendto()` the reply to the client, write to stderr,
+and exit.
 
 The filter pins every argument of all of those, not just the syscall numbers:
 each rule is an equality test against the exact descriptor, pointer and flag
-word the child is about to pass.
-seccomp-bpf cannot dereference pointers, so the child first copies its one
+word the process is about to pass.
+seccomp-bpf cannot dereference pointers, so the process first copies its one
 path argument into an anonymous mapping and `mprotect()`s it read-only, and
-takes the kernel's output buffers from a second mapping.
+takes the kernel's output buffers, the reply among them, from a second
+mapping.
 `mprotect()` is not on the allowlist, so those addresses are fixed for the
-child's life, and comparing them by value is as good as comparing the strings.
-The post-`setns()` code uses explicit syscall wrappers so the filter's
+rest of the process's life, and comparing them by value is as good as
+comparing the strings.
+The post-`setns()` operation uses explicit syscall wrappers so the filter's
 allowlist fully describes its possible kernel interface.
+
+The one allowance pinned by descriptor alone is stderr: `write()` and
+`writev()` to it go through with any buffer, so that libc can format the log
+line for the outcome after the operation.
+Nothing else libc might reach for is allowed, so a libc that needs another
+call there loses the log line and nothing more; the reply does not depend on
+it.
+Anything the log line needs from the filesystem, such as the mountpoint's
+path, is resolved before the filter goes up.
 
 ## Why unmount passes a parent-directory fd
 
@@ -280,7 +294,7 @@ handle that need not be decodable, which every filesystem can produce, and
 reuses, so an id recycled inside the window cannot pass for the mount that
 was authorized.
 
-That parent-relative lookup is what the sandboxed child re-checks right before
+That parent-relative lookup is what the sandboxed process re-checks right before
 `umount2()`: `name` must still resolve to the authorized `mnt_id`, so a rename
 or replacement of `name` after authorization is caught instead of redirecting
 the unmount to a different mount.

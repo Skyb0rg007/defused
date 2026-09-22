@@ -253,11 +253,15 @@ static const char *describe_mount_req(const struct defused_request *req,
     return buf;
 }
 
-/* Logs the outcome and answers. Only the code and errno go on the wire;
- * err->detail stays in the log. */
+/* Answers, then logs the outcome. Only the code and errno go on the wire;
+ * err->detail stays in the log. After a sandboxed operation this runs
+ * under the seccomp filter, which lets the reply and stderr through and
+ * nothing else: target was formatted beforehand, and the log line is
+ * best-effort. */
 static int finish_request(const char *what, const char *target,
                           const struct peer *peer, int ret,
                           const struct defused_error *err) {
+    int sent = defused_sandbox_reply(peer->sock, err);
     if (ret >= 0)
         fprintf(stderr, "defused: %sed %s for uid %u\n", what, target,
                 (unsigned)peer->uid);
@@ -269,7 +273,6 @@ static int finish_request(const char *what, const char *target,
                 defused_error_description(err->code),
                 strerror(err->sys_errno ? err->sys_errno : -ret),
                 err->detail[0] ? " -- " : "", err->detail);
-    int sent = defused_send_reply(peer->sock, err);
     return sent < 0 ? log_error(sent, "sending the reply failed") : ret;
 }
 
@@ -347,22 +350,22 @@ static int mount_request(const struct defused_request *req, int mnt_fd,
         req, dev_fd, st.st_mode & S_IFMT, peer->uid, peer->gid, err);
     if (mountfd < 0)
         return mountfd;
-    return defused_sandbox_mount(peer->pidfd, mountfd, mnt_fd, err);
+    return defused_sandbox_mount(peer->pidfd, mountfd, mnt_fd, peer->sock, err);
 }
 
 static int handle_mount(const struct defused_request *req, int dev_fd,
                         int mnt_fd, struct peer *peer,
                         struct defused_error *err) {
+    /* Before the operation: readlink() is not allowed afterwards. */
+    char target[512];
+    describe_mount_req(req, mnt_fd, target, sizeof(target));
     int ret = get_peer_pidfd(peer);
     if (ret < 0)
         defused_error_setf(err, DEFUSED_ERR_MOUNT_FAILED, -ret,
                            "SO_PEERPIDFD on the client socket failed");
     else
         ret = mount_request(req, mnt_fd, dev_fd, peer, err);
-    char target[512];
-    return finish_request(
-        "mount", describe_mount_req(req, mnt_fd, target, sizeof(target)), peer,
-        ret, err);
+    return finish_request("mount", target, peer, ret, err);
 }
 
 /*** Unmount ***/
@@ -378,28 +381,31 @@ static int umount_request(const struct defused_request *req, int parent_fd,
         return ret;
     /* From here on mnt_id identifies the target. */
     return defused_sandbox_unmount(peer->pidfd, parent_fd, req->name, req->lazy,
-                                   mnt_id, peer->uid, err);
+                                   mnt_id, peer->uid, peer->sock, err);
 }
 
 static int handle_unmount(const struct defused_request *req, int parent_fd,
                           struct peer *peer, struct defused_error *err) {
+    /* Before the operation: readlink() is not allowed afterwards. */
+    char path[256], target[512];
+    snprintf(target, sizeof(target), "\"%s/%s\"%s",
+             fd_path(parent_fd, path, sizeof(path)), req->name,
+             req->lazy ? " (lazy)" : "");
     int ret = get_peer_pidfd(peer);
     if (ret < 0)
         defused_error_setf(err, DEFUSED_ERR_UNMOUNT_FAILED, -ret,
                            "SO_PEERPIDFD on the client socket failed");
     else
         ret = umount_request(req, parent_fd, peer, err);
-    char path[256], target[512];
-    snprintf(target, sizeof(target), "\"%s/%s\"%s",
-             fd_path(parent_fd, path, sizeof(path)), req->name,
-             req->lazy ? " (lazy)" : "");
     return finish_request("unmount", target, peer, ret, err);
 }
 
 /*** Connections ***/
 
 /* One request in, one reply out. Takes ownership of sock_fd; the exit
- * status says whether the client was answered, not what the answer was. */
+ * status says whether the client was answered, not what the answer was.
+ * The operation itself leaves the process under a seccomp filter, so the
+ * descriptor cleanup on the way out fails with EPERM and is ignored. */
 static int handle_connection(int sock_fd) {
     _cleanup_close_ int sock = sock_fd;
     struct defused_error err = {};
@@ -514,8 +520,6 @@ static int run_daemon(void) {
         }
         if (pid == 0) {
             listen_fd = safe_close(listen_fd);
-            /* This child waits for a sandbox child of its own. */
-            signal(SIGCHLD, SIG_DFL);
             _exit(handle_connection(TAKE_FD(conn)));
         }
         live_children++;
