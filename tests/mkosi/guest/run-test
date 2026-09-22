@@ -27,13 +27,22 @@ RESULT = "DEFUSED-TEST-RESULT:"
 
 
 def load(name):
-    path = os.path.join(TESTDIR, "tests", f"{name}.py")
-    if not os.path.exists(path):
-        raise SystemExit(f"no such test: {name} ({path} does not exist)")
-    spec = importlib.util.spec_from_file_location(f"defused_test_{name}", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    """Import the test module of that name, chosen from what is installed.
+
+    The name arrives from the kernel command line, so the file to import is
+    picked out of the directory listing rather than built from it.
+    """
+    tests = os.path.join(TESTDIR, "tests")
+    available = sorted(f for f in os.listdir(tests) if f.endswith(".py"))
+    for entry in available:
+        if entry[: -len(".py")] == name:
+            spec = importlib.util.spec_from_file_location(
+                f"defused_test_{entry}", os.path.join(tests, entry)
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+    raise SystemExit(f"no such test: {name!r} (have: {', '.join(available)})")
 
 
 def power_off(status):

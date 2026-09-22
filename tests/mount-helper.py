@@ -5,8 +5,9 @@
 """Drive fusermount3 the way libfuse does, and check what it mounted.
 
 Used by both VM test suites -- packaging/nixos/tests/ and tests/mkosi/ --
-so the two check the same things. $DEFUSED_FUSERMOUNT3 names the binary to
-drive; the default is the FHS path libfuse itself execs.
+so the two check the same things. The mkosi image installs fusermount3 at
+the FHS path below; the NixOS suite rewrites that literal to point at the
+build under test (see packaging/nixos/tests/common.nix).
 """
 
 import array
@@ -18,7 +19,11 @@ import subprocess
 import sys
 import time
 
-fusermount3 = os.environ.get("DEFUSED_FUSERMOUNT3") or "/usr/bin/fusermount3"
+fusermount3 = "/usr/bin/fusermount3"
+# Where hold-mount reports the mount and waits to be let go. Both suites'
+# harnesses name these paths as well.
+READY = "/tmp/defused-ready"
+RELEASE = "/tmp/defused-release"
 FUSE_INIT = 26
 FUSE_KERNEL_VERSION = 7
 FUSE_KERNEL_MINOR_VERSION = 31
@@ -149,12 +154,11 @@ def assert_tokens(line, tokens):
             f"missing {missing!r}, unexpected {present!r} in mountinfo line: {line}"
         )
 
-def assert_mount(mountpoint, opts, tokens, ready=None, release=None):
+def assert_mount(mountpoint, opts, tokens, hold=False):
     """Mount, check the mountinfo line against tokens, lazily unmount.
 
-    Given ready/release, write the line to the ready path and hold the
-    mount open until the release path appears, so another process can
-    observe it live.
+    Asked to hold, write the line to READY and keep the mount open until
+    RELEASE appears, so another process can observe it live.
     """
     fuse_fd = mount_fuse(mountpoint, opts)
     try:
@@ -162,10 +166,10 @@ def assert_mount(mountpoint, opts, tokens, ready=None, release=None):
         line = mountinfo_for(mountpoint)
         print(line, flush=True)
         assert_tokens(line, tokens)
-        if ready:
-            with open(ready, "w", encoding="utf-8") as f:
+        if hold:
+            with open(READY, "w", encoding="utf-8") as f:
                 f.write(line + "\n")
-            while not os.path.exists(release):
+            while not os.path.exists(RELEASE):
                 time.sleep(0.1)
     finally:
         try:
@@ -209,7 +213,7 @@ if mode == "assert-mount":
 elif mode == "assert-unmount":
     assert_unmount(sys.argv[2], sys.argv[3])
 elif mode == "hold-mount":
-    assert_mount(sys.argv[2], sys.argv[3], sys.argv[6:], sys.argv[4], sys.argv[5])
+    assert_mount(sys.argv[2], sys.argv[3], sys.argv[4:], hold=True)
 elif mode == "expect-failure":
     expect_failure(sys.argv[2], sys.argv[3], sys.argv[4])
 else:

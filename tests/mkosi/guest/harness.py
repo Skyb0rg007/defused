@@ -20,6 +20,7 @@ import time
 
 TESTDIR = "/usr/lib/defused-test"
 HELPER = f"python3 {TESTDIR}/mount-helper.py"
+# The paths hold-mount signals through, named by mount-helper.py itself.
 # /tmp, not /run: the helper writes them as the unprivileged user.
 READY, RELEASE = "/tmp/defused-ready", "/tmp/defused-release"
 USER = "alice"
@@ -135,8 +136,6 @@ def hold(mnt, opts, *tokens, logfile="/run/defused-hold.log", timeout=120, **kw)
         "hold-mount",
         mnt,
         opts,
-        READY,
-        RELEASE,
         *tokens,
         timeout=timeout,
         suffix=f" >{logfile} 2>&1 &",

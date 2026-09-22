@@ -12,10 +12,17 @@
 
 let
   # Shared with tests/mkosi/, so both VM suites drive fusermount3 the same
-  # way; $DEFUSED_FUSERMOUNT3 below points it at this variant's build.
-  mountHelper = pkgs.writeText "defused-mount-helper.py" (
-    builtins.readFile ../../../tests/mount-helper.py
-  );
+  # way. The helper names the FHS path an installed fusermount3 has, which
+  # is no path at all here: rewrite it to this variant's build. The assert
+  # turns a renamed literal into an eval error rather than a VM that spends
+  # its run failing to exec /usr/bin/fusermount3.
+  helperSource = builtins.readFile ../../../tests/mount-helper.py;
+  fhsHelperPath = "\"/usr/bin/fusermount3\"";
+  mountHelper =
+    assert pkgs.lib.hasInfix fhsHelperPath helperSource;
+    pkgs.writeText "defused-mount-helper.py" (
+      builtins.replaceStrings [ fhsHelperPath ] [ "\"${package}/bin/fusermount3\"" ] helperSource
+    );
 
   baseNode =
     { ... }:
@@ -46,10 +53,7 @@ let
   prelude = ''
     import shlex
 
-    HELPER = (
-        "env DEFUSED_FUSERMOUNT3=${package}/bin/fusermount3 "
-        "${pkgs.python3}/bin/python3 ${mountHelper}"
-    )
+    HELPER = "${pkgs.python3}/bin/python3 ${mountHelper}"
     READY, RELEASE = "/tmp/defused-ready", "/tmp/defused-release"
 
 
@@ -66,8 +70,8 @@ let
         helper(machine, "assert-unmount", mnt, opts, **kw)
 
 
-    def hold(machine, mnt, opts, *tokens, ready=READY, release=RELEASE, **kw):
-        helper(machine, "hold-mount", mnt, opts, ready, release, *tokens, **kw)
+    def hold(machine, mnt, opts, *tokens, **kw):
+        helper(machine, "hold-mount", mnt, opts, *tokens, **kw)
 
 
     def refuse(machine, mnt, opts, expected="not allowed by the defused service", **kw):
