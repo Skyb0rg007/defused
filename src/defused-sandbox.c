@@ -3,7 +3,7 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * The sandboxed child that joins a client's mount namespace, and the
+ * Joining a client's mount namespace under a seccomp allowlist, and the
  * unmount ownership check that gates it.
  */
 #define _GNU_SOURCE
@@ -17,15 +17,13 @@
 #include <poll.h>
 #include <sched.h>
 #include <seccomp.h>
-#include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 /* MOVE_MOUNT_*, struct mnt_id_req, struct statmount, NS_GET_MNTNS_ID:
@@ -47,11 +45,8 @@ DEFINE_TRIVIAL_CLEANUP_FUNC(scmp_filter_ctx, seccomp_release);
     (AT_EMPTY_PATH | AT_HANDLE_FID | AT_HANDLE_MNT_ID_UNIQUE)
 #define SANDBOX_MOVE_MOUNT_FLAGS                                               \
     (MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH)
-
-struct sandbox_result {
-    struct defused_error err;
-    int32_t ret;
-};
+/* A client that hung up must not SIGPIPE the reply. */
+#define SANDBOX_SEND_FLAGS MSG_NOSIGNAL
 
 /* struct file_handle ends in a flexible array member, so it cannot be a
  * member of anything else. The same layout, at the largest size. */
@@ -64,13 +59,18 @@ _Static_assert(offsetof(struct sandbox_handle, f_handle) ==
                    sizeof(struct file_handle),
                "struct sandbox_handle must match struct file_handle");
 
-/* The child's writable pinned memory, kept out of the strings' mapping so
- * that one can stay read-only. */
+/* The writable pinned memory, kept out of the strings' mapping so that one
+ * can stay read-only. */
 struct sandbox_buf {
     struct sandbox_handle handle;
     uint64_t mnt_id;
-    struct sandbox_result result;
+    struct defused_reply reply;
 };
+
+/* Set once the filter is loaded: from then on the reply can only leave
+ * through the pinned buffer, on the pinned socket. */
+static struct sandbox_buf *sandboxed_buf;
+static int sandboxed_sock = -EBADF;
 
 /* move_mount()'s empty path: one const object, so it sits in .rodata at a
  * fixed address and the filter rule and the call site cannot differ. */
@@ -82,16 +82,9 @@ struct sandbox_strings {
     char path[DEFUSED_MAX_FILENAME];
 };
 
-/* exit_group() ends the process; the loop only keeps this noreturn. */
-static __attribute__((__noreturn__)) void sandbox_exit(int status) {
-    sys_exit_group(status);
-    for (;;)
-        sys_exit(status);
-}
-
 /* statx() would call fuse_getattr(), which refuses a non-empty request
  * from anyone but the mount's user_id, root included. AT_HANDLE_FID
- * encodes on any filesystem; buf is the child's pinned scratch. */
+ * encodes on any filesystem; buf is the pinned scratch. */
 static int sandbox_mnt_id(int dir_fd, const char *name, struct sandbox_buf *buf,
                           uint64_t *out_id) {
     buf->handle.handle_bytes = MAX_HANDLE_SZ;
@@ -132,24 +125,29 @@ static int pin_job_memory(struct sandbox_job *job) {
 
 #define ARG(n, v) {(n), SCMP_CMP_EQ, (scmp_datum_t)(long)(v), 0}
 
-/* Each rule pins every argument of the one call the child will make, so an
- * allowed syscall cannot be aimed elsewhere. Anything else is EPERM. */
+/* Each rule pins every argument of the one call the process will make, so
+ * an allowed syscall cannot be aimed elsewhere. The exception is stderr:
+ * libc formats the log line after the operation, so its writes there are
+ * pinned by descriptor only, and a libc that reaches for any other call
+ * merely loses the line. Anything else is EPERM. */
 static int install_seccomp(const struct sandbox_job *job) {
     const struct sandbox_buf *buf = job->buf;
     const struct {
         int nr;
         int only; /* 0: both operations */
         unsigned int nargs;
-        struct scmp_arg_cmp args[5];
+        struct scmp_arg_cmp args[6];
     } rules[] = {
         {SCMP_SYS(rt_sigreturn), 0, 0, {{0}}},
         {SCMP_SYS(exit), 0, 0, {{0}}},
         {SCMP_SYS(exit_group), 0, 0, {{0}}},
-        {SCMP_SYS(write),
+        {SCMP_SYS(write), 0, 1, {ARG(0, STDERR_FILENO)}},
+        {SCMP_SYS(writev), 0, 1, {ARG(0, STDERR_FILENO)}},
+        {SCMP_SYS(sendto),
          0,
-         3,
-         {ARG(0, job->pipe_fd), ARG(1, &buf->result),
-          ARG(2, sizeof(buf->result))}},
+         6,
+         {ARG(0, job->sock), ARG(1, &buf->reply), ARG(2, sizeof(buf->reply)),
+          ARG(3, SANDBOX_SEND_FLAGS), ARG(4, NULL), ARG(5, 0)}},
         {SCMP_SYS(setns), 0, 2, {ARG(0, job->pidfd), ARG(1, CLONE_NEWNS)}},
         {SCMP_SYS(move_mount),
          DEFUSED_OP_MOUNT,
@@ -312,7 +310,7 @@ int defused_peer_mnt_ns_id(int pidfd, uint64_t *out_id) {
 }
 
 /* statmount() is told which namespace to look in, so this needs neither
- * the fork nor setns(). */
+ * the filter nor setns(). */
 static int peer_fuse_mount_owner(int pidfd, uint64_t mnt_id, uid_t *out_uid) {
     uint64_t ns_id;
     int ret = defused_peer_mnt_ns_id(pidfd, &ns_id);
@@ -322,8 +320,8 @@ static int peer_fuse_mount_owner(int pidfd, uint64_t mnt_id, uid_t *out_uid) {
     return ret < 0 ? ret : ret == 0 ? -EINVAL : 0;
 }
 
-/* The rest runs after setns(). detail must be a fixed string: the child
- * cannot format one. */
+/* The rest runs after setns(). detail is a fixed string: nothing here
+ * calls libc, so nothing here leans on the stderr allowance. */
 static int sandbox_do_mount(const struct sandbox_job *job,
                             const char **detail) {
     if (sys_move_mount(job->mountfd, job->path, job->mnt_fd, job->path,
@@ -365,78 +363,62 @@ static int sandbox_do_unmount(const struct sandbox_job *job,
     return 0;
 }
 
-/* Forks the sandboxed child and returns what it reported. */
+/* Pins, loads the filter, joins the namespace and runs the operation, all
+ * in this process. The filter stays loaded on return: the caller replies
+ * through defused_sandbox_reply(), logs, and exits. */
 static int run_sandboxed(struct sandbox_job *job, struct defused_error *err) {
     uint32_t fail_code = job->op == DEFUSED_OP_MOUNT
                              ? DEFUSED_ERR_MOUNT_FAILED
                              : DEFUSED_ERR_UNMOUNT_FAILED;
-    _cleanup_close_pair_ int pipefd[2] = EBADF_PAIR;
-    if (pipe2(pipefd, O_CLOEXEC) == -1)
-        return defused_error_setf(err, fail_code, errno,
-                                  "pipe2() for the sandboxed helper failed");
-    job->pipe_fd = pipefd[1];
-    pid_t pid = fork();
-    if (pid == -1)
-        return defused_error_setf(err, fail_code, errno,
-                                  "fork() of the sandboxed helper failed");
-    if (pid == 0) {
-        /* Only reached before pinning, when no filter is loaded either and
-         * any write() still goes through. */
-        struct sandbox_result fallback = {0};
-        struct sandbox_result *result = &fallback;
-        const char *detail = "pinning the sandboxed helper's memory failed";
-        int ret = pin_job_memory(job);
-        if (ret == 0) {
-            result = &job->buf->result;
-            detail = "installing the sandbox seccomp filter failed";
-            ret = install_seccomp(job);
-        }
-        if (ret == 0) {
-            detail = "setns() into the client's mount namespace failed";
-            ret = sys_setns(job->pidfd, CLONE_NEWNS) == -1 ? -errno : 0;
-        }
-        if (ret == 0)
-            ret = job->op == DEFUSED_OP_MOUNT
-                      ? sandbox_do_mount(job, &detail)
-                      : sandbox_do_unmount(job, &detail);
-        result->ret = ret;
-        if (ret < 0)
-            defused_error_set(&result->err, fail_code, -ret, detail);
-        /* Under PIPE_BUF, so it arrives whole or not at all. */
-        (void)sys_write(job->pipe_fd, result, sizeof(*result));
-        sandbox_exit(ret == 0 ? 0 : 1);
+    const char *detail = "pinning the sandbox's memory failed";
+    int ret = pin_job_memory(job);
+    if (ret == 0) {
+        detail = "installing the sandbox seccomp filter failed";
+        ret = install_seccomp(job);
     }
-    pipefd[1] = safe_close(pipefd[1]);
-
-    struct sandbox_result result;
-    ssize_t n;
-    do
-        n = read(pipefd[0], &result, sizeof(result));
-    while (n < 0 && errno == EINTR);
-    int read_errno = n < 0 ? errno : EPIPE, status = 0;
-    while (waitpid(pid, &status, 0) == -1 && errno == EINTR)
-        ;
-    if (n == (ssize_t)sizeof(result)) {
-        *err = result.err;
-        return result.ret;
+    if (ret == 0) {
+        /* Loaded: from here only the pinned reply reaches the client. */
+        sandboxed_buf = job->buf;
+        sandboxed_sock = job->sock;
+        detail = "setns() into the client's mount namespace failed";
+        ret = sys_setns(job->pidfd, CLONE_NEWNS) == -1 ? -errno : 0;
     }
-    /* SIGSYS here means the seccomp filter refused a syscall. */
-    if (WIFSIGNALED(status))
-        return defused_error_setf(
-            err, fail_code, read_errno,
-            "the sandboxed helper was killed by signal %d%s before reporting "
-            "a result",
-            WTERMSIG(status), WTERMSIG(status) == SIGSYS ? " (seccomp)" : "");
-    return defused_error_setf(err, fail_code, read_errno,
-                              "the sandboxed helper exited with status %d "
-                              "without reporting a result",
-                              WEXITSTATUS(status));
+    if (ret == 0)
+        ret = job->op == DEFUSED_OP_MOUNT ? sandbox_do_mount(job, &detail)
+                                          : sandbox_do_unmount(job, &detail);
+    if (ret < 0)
+        defused_error_set(err, fail_code, -ret, detail);
+    return ret;
 }
 
-int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd,
+int defused_sandbox_reply(int sock, const struct defused_error *err) {
+    if (sandboxed_buf == NULL)
+        return defused_send_reply(sock, err);
+    /* The filter pinned the socket, so only that one can be answered. */
+    if (sock != sandboxed_sock)
+        return -EBADF;
+    sandboxed_buf->reply = (struct defused_reply){
+        .magic = DEFUSED_MAGIC,
+        .code = err->code,
+        .sys_errno = err->sys_errno,
+    };
+    ssize_t n;
+    do
+        n = sys_sendto(sock, &sandboxed_buf->reply,
+                       sizeof(sandboxed_buf->reply), SANDBOX_SEND_FLAGS, NULL,
+                       0);
+    while (n < 0 && errno == EINTR);
+    if (n < 0)
+        return -errno;
+    /* Seqpacket delivers a message whole or not at all. */
+    return n == (ssize_t)sizeof(sandboxed_buf->reply) ? 0 : -EIO;
+}
+
+int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd, int sock,
                           struct defused_error *err) {
     struct sandbox_job job = {.op = DEFUSED_OP_MOUNT,
                               .pidfd = pidfd,
+                              .sock = sock,
                               .mountfd = mountfd,
                               .mnt_fd = mnt_fd,
                               .path = sandbox_empty};
@@ -444,9 +426,9 @@ int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd,
 }
 
 int defused_sandbox_unmount(int pidfd, int parent_fd, const char *name,
-                            bool lazy, uint64_t mnt_id, uid_t uid,
+                            bool lazy, uint64_t mnt_id, uid_t uid, int sock,
                             struct defused_error *err) {
-    /* Before forking, so an unauthorized caller's namespace is never
+    /* Before the filter, so an unauthorized caller's namespace is never
      * entered. GCC cannot see that owner is set whenever this returns 0,
      * hence the initializer. */
     uid_t owner = (uid_t)-1;
@@ -473,6 +455,7 @@ int defused_sandbox_unmount(int pidfd, int parent_fd, const char *name,
     struct sandbox_job job = {
         .op = DEFUSED_OP_UNMOUNT,
         .pidfd = pidfd,
+        .sock = sock,
         .parent_fd = parent_fd,
         .umount_flags = UMOUNT_NOFOLLOW | (lazy ? MNT_DETACH : 0),
         .path = name,
@@ -498,10 +481,10 @@ const void *defused_test_handle_id(const struct sandbox_job *job) {
     return &job->buf->mnt_id;
 }
 
-const void *defused_test_result_buf(const struct sandbox_job *job,
-                                    size_t *size) {
-    *size = sizeof(job->buf->result);
-    return &job->buf->result;
+const void *defused_test_reply_buf(const struct sandbox_job *job,
+                                   size_t *size) {
+    *size = sizeof(job->buf->reply);
+    return &job->buf->reply;
 }
 
 int defused_test_mount_opts_owner(const char *opts, uid_t *out_uid) {

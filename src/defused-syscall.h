@@ -3,7 +3,8 @@
 
 /*
  * The kernel calls defused makes by number: some have no libc wrapper, and
- * the child's seccomp allowlist has to name the exact entries it reaches.
+ * the seccomp allowlist has to name the exact entries the sandboxed process
+ * reaches.
  * Scalars are widened to a full register, the width a filter compares.
  */
 
@@ -23,8 +24,13 @@ static inline int sys_setns(int fd, int nstype) {
     return (int)syscall(SYS_setns, (long)fd, (long)nstype);
 }
 
-static inline ssize_t sys_write(int fd, const void *buf, size_t count) {
-    return (ssize_t)syscall(SYS_write, (long)fd, buf, (long)count);
+/* send() is sendto() without an address, and libc issues it as such, but
+ * the filter has to be certain of the entry and of the two null tail
+ * arguments. */
+static inline ssize_t sys_sendto(int fd, const void *buf, size_t len, int flags,
+                                 const void *addr, unsigned int addrlen) {
+    return (ssize_t)syscall(SYS_sendto, (long)fd, buf, (long)len, (long)flags,
+                            addr, (long)addrlen);
 }
 
 static inline int sys_fchdir(int fd) {
@@ -35,14 +41,6 @@ static inline int sys_fchdir(int fd) {
  * not fit. The kernel takes an unsigned int, so pass the number itself. */
 static inline int sys_ioctl(int fd, unsigned long request, void *arg) {
     return (int)syscall(SYS_ioctl, (long)fd, (long)request, arg);
-}
-
-static inline void sys_exit_group(int status) {
-    (void)syscall(SYS_exit_group, (long)status);
-}
-
-static inline void sys_exit(int status) {
-    (void)syscall(SYS_exit, (long)status);
 }
 
 /* handle is a struct file_handle, whose flexible array member callers lay
