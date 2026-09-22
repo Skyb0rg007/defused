@@ -91,6 +91,11 @@ struct defused_reply {
     int32_t sys_errno; /* 0 if the code carries none */
 };
 
+/* How a reply leaves: MSG_NOSIGNAL, so a client that hung up cannot raise
+ * SIGPIPE in the service. The sandbox's seccomp filter pins this value, so
+ * the sender and that rule read it from here. */
+#define DEFUSED_REPLY_SEND_FLAGS MSG_NOSIGNAL
+
 /* Only code and sys_errno reach the client; detail stays in the log. */
 struct defused_error {
     uint32_t code;
