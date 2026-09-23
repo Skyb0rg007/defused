@@ -4,8 +4,9 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * Putting a message on the wire and taking it off again: a
- * sendmsg()/recvmsg() pair plus the SCM_RIGHTS bookkeeping. Nothing here
- * inspects a request beyond checking that it is one.
+ * sendmsg()/recvmsg() pair plus the SCM_RIGHTS bookkeeping, and a plain
+ * sendto() for the reply. Nothing here inspects a request beyond checking
+ * that it is one.
  */
 #define _GNU_SOURCE
 #include "defused-proto.h"
