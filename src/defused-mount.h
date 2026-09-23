@@ -4,7 +4,7 @@
 /*
  * Performing a request, with no policy of its own. The service calls the
  * pieces one at a time so it can interleave its authorization and hand
- * the finished mount to a sandboxed child; a privileged fusermount3 calls
+ * the finished mount to its seccomp sandbox; a privileged fusermount3 calls
  * defused_perform() and is done.
  */
 

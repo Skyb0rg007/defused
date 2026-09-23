@@ -104,8 +104,7 @@ struct defused_error {
 };
 
 /* Both return -sys_errno, so a caller can `return defused_error_set(...)`.
- * Only the plain one is usable in the sandboxed child, which may not call
- * vsnprintf(); a NULL detail means "". */
+ * A NULL detail means "". */
 static inline int defused_error_set(struct defused_error *err, uint32_t code,
                                     int sys_errno, const char *detail) {
     err->code = code;
