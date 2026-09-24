@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/auxv.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -501,6 +502,9 @@ int main(int argc, char *argv[]) {
     };
     if (argc > 0 && argv[0] != NULL && argv[0][0] != '\0')
         progname = argv[0];
+    if (getauxval(AT_SECURE))
+        die("refusing to run setuid, setgid, or with file capabilities: "
+            "defused's fusermount3 must be installed unprivileged");
     privileged = caller_is_privileged();
 
     bool unmount = false, lazy = false, auto_unmount_only = false;

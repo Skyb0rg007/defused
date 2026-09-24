@@ -103,6 +103,21 @@ case "$output" in
 *) fail "unexpected fusermount3 -u output" ;;
 esac
 
+echo "# a setuid-root copy of $fusermount3 refuses to run"
+# Next to the installed binary, so a nosuid /tmp cannot hide the setuid bit.
+suidcopy=$(dirname "$defused")/fusermount3-setuid-test
+trap 'rm -f "$suidcopy"' EXIT
+install -m 4755 "$fusermount3" "$suidcopy"
+if output=$(as_user "$suidcopy" -V 2>&1); then
+    fail "setuid-root fusermount3 ran"
+fi
+rm -f "$suidcopy"
+echo "$output"
+case "$output" in
+*"refusing to run setuid"*) ;;
+*) fail "unexpected setuid fusermount3 output" ;;
+esac
+
 as_user mkdir -p "$lower" "$mnt"
 echo hello | as_user tee "$lower/hello" >/dev/null
 
