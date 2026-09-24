@@ -56,6 +56,15 @@ install_symlink(
   pointing_to : 'fusermount3',
 )
 
+# mount(8) and umount(8) run these for fuse.* filesystems, but only look for
+# them in /sbin: a /usr/local prefix will not be found.
+install_data(
+  'packaging/scripts/mount.fuse',
+  'packaging/scripts/umount.fuse',
+  install_dir : get_option('sbindir'),
+  install_mode : 'rwxr-xr-x',
+)
+
 unit_conf = configuration_data()
 unit_conf.set('DEFUSED_PATH', defused_install_dir / 'defused')
 configure_file(
