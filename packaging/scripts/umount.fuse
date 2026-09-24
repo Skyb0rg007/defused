@@ -1,4 +1,8 @@
 #!/bin/sh
+#
+# SPDX-FileCopyrightText: 2026 Skye Soss <skye@soss.website>
+#
+# SPDX-License-Identifier: MIT-0
 
 set -eu
 
