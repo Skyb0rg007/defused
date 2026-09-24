@@ -315,8 +315,7 @@ static int peer_fuse_mount_owner(int pidfd, uint64_t mnt_id, uid_t *out_uid) {
     return ret < 0 ? ret : ret == 0 ? -EINVAL : 0;
 }
 
-/* The rest runs after setns(). The filter leaves stderr open, so these
- * describe their own failures like anything else in the service. */
+/* The rest runs after setns(). */
 static int sandbox_do_mount(const struct sandbox_job *job,
                             struct defused_error *err) {
     if (sys_move_mount(job->mountfd, job->path, job->mnt_fd, job->path,
@@ -349,8 +348,6 @@ static int sandbox_do_unmount(const struct sandbox_job *job,
                                   "mnt_id %llu, expected %llu",
                                   (unsigned long long)id,
                                   (unsigned long long)job->mnt_id);
-    /* The errno says the rest: a non-lazy unmount of a mount still in use
-     * comes back EBUSY. */
     if (sys_umount2(job->path, job->umount_flags) == -1)
         return defused_error_setf(
             err, DEFUSED_ERR_UNMOUNT_FAILED, errno, "umount2(\"%s\"%s) failed",

@@ -30,8 +30,7 @@ struct sandbox_job {
 /* The client's mount namespace is entered only under a seccomp allowlist,
  * which these load on the calling process and never lift. Once one
  * returns the process can answer on sock, log to stderr and exit, and
- * nothing else; the connection handler is one process per request, so
- * that is all it had left to do. */
+ * nothing else. */
 int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd, int sock,
                           struct defused_error *err);
 int defused_sandbox_unmount(int pidfd, int parent_fd, const char *name,
