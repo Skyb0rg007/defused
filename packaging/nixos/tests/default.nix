@@ -33,6 +33,7 @@ let
     "mount-options"
     "file-mountpoint"
     "non-lazy-unmount"
+    "auto-unmount"
     "policy"
     "apparmor"
     "privileged"

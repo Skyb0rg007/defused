@@ -125,6 +125,7 @@ test_sandbox_exe = executable(
   'test-sandbox',
   'tests/test_sandbox.c',
   'src/defused-sandbox.c',
+  defused_mount_sources,
   c_args : ['-DDEFUSED_TEST', '-ffreestanding'],
   dependencies : [seccomp_dep],
   include_directories : test_inc,

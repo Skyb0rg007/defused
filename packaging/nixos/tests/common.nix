@@ -13,6 +13,7 @@
 let
   mountHelper = pkgs.writeText "defused-mount-helper.py" ''
     import array
+    import errno
     import os
     import select
     import socket
@@ -193,6 +194,50 @@ let
         finally:
             os.close(fuse_fd)
 
+    def auto_unmount(mountpoint, replacement):
+        """Mount with auto_unmount and let the server die.
+
+        replacement "none" expects the mount gone. Otherwise another mount
+        takes its place first and is expected to be left alone:
+        "other-type" of another subtype, whose server is gone too, or
+        "live-server" of the same type, whose server is still answering.
+        """
+        local, remote = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        # With auto_unmount it outlives the mount, until local closes.
+        proc = subprocess.Popen(
+            [fusermount3, "--comm-fd", str(remote.fileno()),
+             "-o", "auto_unmount,subtype=first", mountpoint],
+            pass_fds=[remote.fileno()],
+        )
+        remote.close()
+        fuse_fd = recv_fd(local)
+        init_fuse(fuse_fd)
+        print(mountinfo_for(mountpoint), flush=True)
+        subtype = "second" if replacement == "other-type" else "first"
+        if replacement != "none":
+            unmount_fuse(mountpoint, lazy=True)
+            other_fd = mount_fuse(mountpoint, f"subtype={subtype}")
+            init_fuse(other_fd)
+            if replacement == "other-type":
+                os.close(other_fd)
+        os.close(fuse_fd)
+        local.close()
+        # The live server answers every request, the probe's open() included,
+        # with EIO.
+        while replacement == "live-server" and proc.poll() is None:
+            if select.select([other_fd], [], [], 0.1)[0]:
+                unique = struct.unpack("<IIQ", os.read(other_fd, 135168)[:16])[2]
+                os.write(other_fd, struct.pack("<IiQ", 16, -errno.EIO, unique))
+        if proc.wait(10) != 0:
+            raise RuntimeError(f"fusermount3 exited with {proc.returncode}")
+        line = mountinfo_line(mountpoint)
+        if replacement == "none" and line is not None:
+            raise AssertionError(f"not auto-unmounted: {line}")
+        if replacement != "none":
+            if line is None or f"fuse.{subtype}" not in line:
+                raise AssertionError(f"fuse.{subtype} replacement not left mounted: {line}")
+            unmount_fuse(mountpoint, lazy=True)
+
     def expect_failure(mountpoint, opts, expected):
         local, remote = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -215,6 +260,8 @@ let
         assert_mount(sys.argv[2], sys.argv[3], sys.argv[6:], sys.argv[4], sys.argv[5])
     elif mode == "expect-failure":
         expect_failure(sys.argv[2], sys.argv[3], sys.argv[4])
+    elif mode == "auto-unmount":
+        auto_unmount(sys.argv[2], sys.argv[3])
     else:
         raise SystemExit(f"unknown mode: {mode}")
   '';

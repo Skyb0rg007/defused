@@ -41,13 +41,6 @@ int defused_sandbox_unmount(int pidfd, int parent_fd, const char *name,
  * listmount() at it. */
 int defused_peer_mnt_ns_id(int pidfd, uint64_t *out_id);
 
-/* 1 if mnt_id names a FUSE mount in namespace mnt_ns_id (0 for the
- * caller's own), 0 for any other mount, or a negative errno. The optional
- * out_blkdev distinguishes "fuseblk"; the optional out_uid gets user_id=,
- * and asking for it makes a FUSE mount without one an error. */
-int defused_is_fuse_mount(uint64_t mnt_ns_id, uint64_t mnt_id, bool *out_blkdev,
-                          uid_t *out_uid);
-
 #ifdef DEFUSED_TEST
 /* What the process does before setns(). A test pins without installing,
  * to see what the kernel alone answers. */
@@ -56,7 +49,6 @@ int defused_test_install_seccomp(const struct sandbox_job *job);
 /* The buffers pinning handed the filter: the handle and the mount id. */
 const void *defused_test_handle_buf(const struct sandbox_job *job);
 const void *defused_test_handle_id(const struct sandbox_job *job);
-int defused_test_mount_opts_owner(const char *opts, uid_t *out_uid);
 pid_t defused_test_fdinfo_pid(const char *text);
 #endif
 

@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
@@ -58,6 +59,64 @@ const char *defused_mount_flags_str(uint32_t flags, char *buf, size_t size) {
     if (off == 0)
         snprintf(buf, size, "none");
     return buf;
+}
+
+/* FUSE's user_id= among the comma-separated options. Matched only at an
+ * option start, so a value ending in "user_id=" cannot pass for one. */
+static int mount_opts_owner(const char *opts, uid_t *out_uid) {
+    for (const char *p = opts;; p++) {
+        if (strncmp(p, "user_id=", 8) == 0 && p[8] >= '0' && p[8] <= '9') {
+            char *end;
+            errno = 0;
+            unsigned long uid = strtoul(p + 8, &end, 10);
+            if (errno != 0 || uid > (uid_t)-1 || (*end != ',' && *end != '\0'))
+                return -EINVAL;
+            *out_uid = (uid_t)uid;
+            return 0;
+        }
+        p += strcspn(p, ",");
+        if (*p != ',')
+            return -EINVAL;
+    }
+}
+
+int defused_is_fuse_mount(uint64_t mnt_ns_id, uint64_t mnt_id, bool *out_blkdev,
+                          const char *subtype, uid_t *out_uid) {
+    struct mnt_id_req req = {
+        .size = MNT_ID_REQ_SIZE_VER1,
+        .mnt_id = mnt_id,
+        .param = STATMOUNT_FS_TYPE | (subtype ? STATMOUNT_FS_SUBTYPE : 0) |
+                 (out_uid ? STATMOUNT_MNT_OPTS : 0),
+        .mnt_ns_id = mnt_ns_id,
+    };
+    /* An over-long string fails with EOVERFLOW rather than truncating. */
+    union {
+        struct statmount sm;
+        char raw[4096];
+    } buf;
+    if (sys_statmount(&req, &buf.sm, sizeof(buf), 0) == -1)
+        return -errno;
+    if (!(buf.sm.mask & STATMOUNT_FS_TYPE))
+        return -EINVAL;
+    /* A "fuse.sshfs" mount reports its subtype separately, so these are
+     * the only two spellings. */
+    const char *fstype = buf.sm.str + buf.sm.fs_type;
+    bool blkdev = strcmp(fstype, "fuseblk") == 0;
+    if (!blkdev && strcmp(fstype, "fuse") != 0)
+        return 0;
+    /* Linux 6.12 reports no subtype at all, and later kernels report none
+     * for a mount without one, so only a reported subtype is compared. */
+    if (subtype && (buf.sm.mask & STATMOUNT_FS_SUBTYPE) &&
+        strcmp(buf.sm.str + buf.sm.fs_subtype, subtype) != 0)
+        return 0;
+    if (out_blkdev)
+        *out_blkdev = blkdev;
+    if (!out_uid)
+        return 1;
+    if (!(buf.sm.mask & STATMOUNT_MNT_OPTS))
+        return -EINVAL;
+    int ret = mount_opts_owner(buf.sm.str + buf.sm.mnt_opts, out_uid);
+    return ret < 0 ? ret : 1;
 }
 
 /* struct file_handle ends in a flexible array member, so it cannot be
@@ -369,3 +428,9 @@ int defused_perform(const struct defused_request *req, const int *fds,
                           -ret, NULL);
     return 0;
 }
+
+#ifdef DEFUSED_TEST
+int defused_test_mount_opts_owner(const char *opts, uid_t *out_uid) {
+    return mount_opts_owner(opts, out_uid);
+}
+#endif
