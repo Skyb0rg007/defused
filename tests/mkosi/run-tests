@@ -1,0 +1,235 @@
+#!/usr/bin/python3
+# SPDX-FileCopyrightText: 2026 Skye Soss <skye@soss.website>
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+"""Build the test image with mkosi and boot one VM per test.
+
+Each test is a module in guest/tests/. The VM boots straight into
+defused-test.service, which runs that test and powers the machine off; the
+result comes back on the serial console, and the full console log of each
+run is kept.
+
+The image is booted with qemu directly, from the kernel, initrd and disk
+image mkosi split out: `mkosi vm` needs systemd running on the host, which
+a container-based CI job does not have. `mkosi vm` still works by hand for
+an interactive look at the machine -- see README.md.
+"""
+
+import argparse
+import concurrent.futures
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TESTS_DIR = os.path.join(HERE, "guest", "tests")
+OUTPUT_DIR = os.path.join(HERE, "mkosi.output")
+IMAGE = os.path.join(OUTPUT_DIR, "defused.raw")
+KERNEL = os.path.join(OUTPUT_DIR, "defused.vmlinuz")
+INITRD = os.path.join(OUTPUT_DIR, "defused.initrd")
+RESULT = "DEFUSED-TEST-RESULT:"
+# What the guest's own output looks like once systemd has prefixed it.
+GUEST = "run-test["
+# The GPT type of a root partition for this architecture, from the
+# Discoverable Partitions Specification.
+ROOT_PARTITION_TYPE = {
+    "x86_64": "4f68bce3-e8cd-4db1-96e7-fbcaf984b709",
+    "aarch64": "b921b045-1df0-41c3-af44-4c6f280d3fae",
+}
+
+
+def available_tests():
+    return sorted(
+        f[: -len(".py")]
+        for f in os.listdir(TESTS_DIR)
+        if f.endswith(".py") and not f.startswith("_")
+    )
+
+
+def build(extra, verbose):
+    print("### building the image", flush=True)
+    subprocess.run(
+        ["mkosi", "--directory", HERE, *extra, "--force", "build"],
+        check=True,
+        stdout=None if verbose else subprocess.DEVNULL,
+    )
+
+
+def root_partuuid(image):
+    """The root partition's UUID, lowercased the way udev names its links."""
+    table = json.loads(
+        subprocess.run(
+            ["sfdisk", "--json", image], check=True, stdout=subprocess.PIPE, text=True
+        ).stdout
+    )["partitiontable"]
+    want = ROOT_PARTITION_TYPE.get(os.uname().machine)
+    for partition in table["partitions"]:
+        if want and partition["type"].lower() == want:
+            return partition["uuid"].lower()
+    raise SystemExit(f"{image} has no root partition for {os.uname().machine}")
+
+
+def qemu_argv(image, partuuid, test, cpus, ram):
+    accel = ["-accel", "kvm", "-cpu", "host"]
+    if not os.access("/dev/kvm", os.R_OK | os.W_OK):
+        accel = ["-accel", "tcg", "-cpu", "max"]
+    cmdline = " ".join(
+        [
+            "console=ttyS0",
+            f"root=PARTUUID={partuuid}",
+            "rw",
+            "loglevel=4",
+            "TERM=dumb",
+            # The test runner, and the test it is to run.
+            "systemd.unit=defused-test.service",
+            f"systemd.setenv=DEFUSED_TEST={test}",
+        ]
+    )
+    return [
+        f"qemu-system-{os.uname().machine}",
+        "-machine", "q35",
+        *accel,
+        "-smp", str(cpus),
+        "-m", f"{ram}M",
+        "-nographic",
+        "-nodefaults",
+        # The guest powers itself off; if it reboots instead, stop there.
+        "-no-reboot",
+        "-serial", "mon:stdio",
+        "-device", "virtio-rng-pci",
+        "-drive", f"if=virtio,file={image},format=raw,cache=unsafe",
+        "-kernel", KERNEL,
+        "-initrd", INITRD,
+        "-append", cmdline,
+    ]  # fmt: skip
+
+
+def run_one(name, partuuid, logdir, tmpdir, timeout, cpus, ram):
+    """Boot the image with this test as its default unit; return whether it passed."""
+    log = os.path.join(logdir, f"{name}.log")
+    # Its own copy of the disk, so tests can run at the same time and none
+    # of them leaves anything behind.
+    image = os.path.join(tmpdir, f"{name}.raw")
+    subprocess.run(["cp", "--reflink=auto", IMAGE, image], check=True)
+    argv = qemu_argv(image, partuuid, name, cpus, ram)
+
+    start = time.monotonic()
+    try:
+        with open(log, "wb") as out:
+            out.write(f"$ {' '.join(argv)}\n\n".encode())
+            out.flush()
+            proc = subprocess.Popen(
+                argv, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT
+            )
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                out.write(f"\n{RESULT} FAIL {name} (host timeout after {timeout}s)\n".encode())
+    finally:
+        os.unlink(image)
+
+    elapsed = time.monotonic() - start
+    with open(log, "r", encoding="utf-8", errors="replace") as f:
+        ok = any(f"{RESULT} PASS {name}" in line for line in f)
+    print(f"{'PASS' if ok else 'FAIL'} {name:22} {elapsed:6.0f}s  {log}", flush=True)
+    return ok
+
+
+def guest_output(log, tail):
+    """The test's own output, without the kernel and systemd around it."""
+    lines = []
+    with open(log, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            _, sep, rest = line.partition(GUEST)
+            if sep:
+                lines.append(rest.partition(": ")[2].rstrip())
+    return lines[-tail:]
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("tests", nargs="*", help="tests to run (default: all)")
+    parser.add_argument("-l", "--list", action="store_true", help="list the tests and exit")
+    parser.add_argument("-B", "--no-build", action="store_true", help="use the image as built")
+    parser.add_argument("-j", "--jobs", type=int, default=2, help="VMs to run at once")
+    parser.add_argument("--cpus", type=int, default=2, help="CPUs per VM")
+    parser.add_argument("--ram", type=int, default=2048, help="MB of RAM per VM")
+    parser.add_argument(
+        "-t", "--timeout", type=int, default=1800, help="seconds to give one VM (default: 1800)"
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="show the image build")
+    parser.add_argument(
+        "--tail", type=int, default=40, help="lines of a failing test's output to print"
+    )
+    parser.add_argument(
+        "mkosi_args",
+        nargs=argparse.REMAINDER,
+        metavar="-- MKOSI ARGS",
+        help="arguments for the build, e.g. -- --distribution=debian",
+    )
+    args = parser.parse_args()
+
+    tests = available_tests()
+    if args.list:
+        print("\n".join(tests))
+        return 0
+    if args.tests:
+        unknown = [t for t in args.tests if t not in tests]
+        if unknown:
+            parser.error(f"no such test: {', '.join(unknown)} (--list to see them)")
+        tests = args.tests
+
+    for tool in ("mkosi", "sfdisk", f"qemu-system-{os.uname().machine}"):
+        if not shutil.which(tool):
+            parser.error(f"{tool} is not installed")
+    if os.geteuid() != 0:
+        parser.error("run this as root: mkosi builds the image and qemu reads it")
+
+    if not args.no_build:
+        build([a for a in args.mkosi_args if a != "--"], args.verbose)
+    if not os.path.exists(IMAGE):
+        parser.error(f"{IMAGE} does not exist; build the image first")
+
+    logdir = os.path.join(OUTPUT_DIR, "logs")
+    tmpdir = os.path.join(OUTPUT_DIR, "ephemeral")
+    os.makedirs(logdir, exist_ok=True)
+    os.makedirs(tmpdir, exist_ok=True)
+    partuuid = root_partuuid(IMAGE)
+
+    print(f"### running {len(tests)} test(s), {args.jobs} at a time", flush=True)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        results = dict(
+            zip(
+                tests,
+                pool.map(
+                    lambda t: run_one(
+                        t, partuuid, logdir, tmpdir, args.timeout, args.cpus, args.ram
+                    ),
+                    tests,
+                ),
+            )
+        )
+
+    failed = [name for name, ok in results.items() if not ok]
+    for name in failed:
+        log = os.path.join(logdir, f"{name}.log")
+        print(f"\n### the last {args.tail} lines {name} printed ({log})")
+        print("\n".join(guest_output(log, args.tail)) or "(nothing: it never got that far)")
+
+    print(f"\n### {len(results) - len(failed)}/{len(results)} passed")
+    if failed:
+        print("failed: " + ", ".join(failed))
+        print(f"logs in {logdir}")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

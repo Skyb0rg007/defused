@@ -5,3 +5,10 @@ result
 result-*
 .envrc
 .cache
+
+# tests/mkosi build artifacts and machine-local settings
+mkosi.output/
+mkosi.cache/
+mkosi.pkgcache/
+mkosi.builddir/
+mkosi.local.conf

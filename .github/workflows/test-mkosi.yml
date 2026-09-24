@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: 2026 Skye Soss <skye@soss.website>
+#
+# SPDX-License-Identifier: MIT-0
+
+# The VM test suite in tests/mkosi: builds an image of an FHS distribution
+# with defused installed as a package installs it, and boots one VM per
+# test. This is where the privileged mount paths are exercised outside Nix.
+#
+# Manually triggered: a full run is eleven VM boots, and the hosted runners
+# have KVM, so it is worth the few minutes when packaging or the units
+# change.
+
+name: test-mkosi
+
+on:
+  workflow_dispatch: ~
+
+permissions:
+  contents: read
+
+jobs:
+  vm-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      # mkosi's own action, which installs the mkosi this ref points at (v26,
+      # above mkosi.conf's MinimumVersion=), the package managers it
+      # bootstraps other distributions with, and the /dev/kvm permissions the
+      # VMs want. It also removes the runner's AppArmor: that only ever
+      # confined the host, and the profile the apparmor test looks at is
+      # inside the image.
+      - uses: systemd/mkosi@84af20892b61c8e177e391f997ded8b4cb5514f2
+      # `mkosi dependencies` prints what this configuration needs to build
+      # an image of this distribution and format; qemu is ours to add.
+      - name: Install what the image build and the VMs need
+        run: |
+          sudo apt-get update
+          sudo apt-get install --assume-yes --no-install-recommends \
+            qemu-system-x86 util-linux $(mkosi --directory tests/mkosi dependencies)
+      # Builds defused in the image with the distribution's toolchain, runs
+      # the Meson tests there, then boots a VM per test.
+      - name: Build the image and run the tests
+        run: sudo tests/mkosi/run-tests -j 4

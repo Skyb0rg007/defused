@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: 2026 Skye Soss <skye@soss.website>
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+# Booted as the default unit, with systemd.unit= on the kernel command line,
+# by tests/mkosi/run-tests. It is never enabled: an image booted without that
+# reaches multi-user.target and stays there for poking at by hand.
+
+[Unit]
+Description=defused VM test runner
+Requires=multi-user.target
+After=multi-user.target
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/defused-test/run-test
+# The console is the only channel out of the VM the runner needs.
+StandardOutput=journal+console
+StandardError=journal+console
+TimeoutStartSec=900
