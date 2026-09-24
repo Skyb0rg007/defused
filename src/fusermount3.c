@@ -364,10 +364,13 @@ static int send_fd(int sock, int fd) {
     return 0;
 }
 
-static int do_mount(const char *mnt, const char *opts, int cfd) {
-    struct defused_request req = {.magic = DEFUSED_MAGIC,
-                                  .op = DEFUSED_OP_MOUNT};
-    parse_mount_opts(opts, &req);
+/* *req is left as the request, for auto_unmount to recognize the mount
+ * by. */
+static int do_mount(const char *mnt, const char *opts, int cfd,
+                    struct defused_request *req) {
+    *req = (struct defused_request){.magic = DEFUSED_MAGIC,
+                                    .op = DEFUSED_OP_MOUNT};
+    parse_mount_opts(opts, req);
 
     _cleanup_close_ int mnt_fd = open(mnt, O_PATH | O_NOFOLLOW | O_CLOEXEC);
     if (mnt_fd == -1)
@@ -381,7 +384,7 @@ static int do_mount(const char *mnt, const char *opts, int cfd) {
 
     struct defused_error err;
     /* The order the protocol fixes: /dev/fuse, then the mountpoint. */
-    int ret = check_reply(submit(&req, (const int[]){fuse_fd, mnt_fd}, &err),
+    int ret = check_reply(submit(req, (const int[]){fuse_fd, mnt_fd}, &err),
                           "mount", mnt, &err);
     if (ret < 0)
         return ret;
@@ -424,11 +427,34 @@ static int close_inherited_fds(int cfd) {
     return 0;
 }
 
+/* libfuse's should_auto_unmount(): mnt must still be a mount of the type
+ * mounted says -- of any type after --auto-unmount, which mounted nothing
+ * and passes NULL -- and its server must be gone, which open() reports as
+ * ENOTCONN, or as ECONNABORTED once the connection was aborted. */
+static bool should_auto_unmount(const char *mnt,
+                                const struct defused_request *mounted) {
+    uint64_t mnt_id;
+    bool blkdev = false;
+    if (mounted != NULL &&
+        (defused_mnt_id(AT_FDCWD, mnt, &mnt_id) < 0 ||
+         defused_is_fuse_mount(0, mnt_id, &blkdev, mounted->subtype, NULL) !=
+             1 ||
+         blkdev != !!(mounted->mount_flags & DEFUSED_MOUNT_BLKDEV)))
+        return false;
+    int fd = open(mnt, O_RDONLY | O_NOFOLLOW | O_NOCTTY | O_CLOEXEC);
+    if (fd >= 0) {
+        close(fd);
+        return false;
+    }
+    return errno == ENOTCONN || errno == ECONNABORTED;
+}
+
 /* Detaches from the caller's session in place (no fork: the caller already
  * has the FUSE fd and isn't waiting on this process), then blocks until the
  * FUSE server exits -- seen as EOF on the communication socket -- and lazily
- * unmounts the filesystem. */
-static int wait_and_auto_unmount(int cfd, const char *mnt) {
+ * unmounts the filesystem if it is still the one mounted describes. */
+static int wait_and_auto_unmount(int cfd, const char *mnt,
+                                 const struct defused_request *mounted) {
     int ret = close_inherited_fds(cfd);
     if (ret < 0)
         return ret;
@@ -446,6 +472,8 @@ static int wait_and_auto_unmount(int cfd, const char *mnt) {
     while (n > 0 || (n < 0 && errno == EINTR));
 
     quiet = true;
+    if (!should_auto_unmount(mnt, mounted))
+        return 0;
     return do_unmount(mnt, true);
 }
 
@@ -572,12 +600,15 @@ int main(int argc, char *argv[]) {
     if (!S_ISSOCK(st.st_mode))
         die("file descriptor %ld is not a socket", cfd);
 
+    struct defused_request req;
     if (!auto_unmount_only) {
-        if (do_mount(mnt, opts, (int)cfd) < 0)
+        if (do_mount(mnt, opts, (int)cfd, &req) < 0)
             return EXIT_FAILURE;
         if (!auto_unmount)
             return EXIT_SUCCESS;
     }
-    return wait_and_auto_unmount((int)cfd, mnt) < 0 ? EXIT_FAILURE
-                                                    : EXIT_SUCCESS;
+    return wait_and_auto_unmount((int)cfd, mnt,
+                                 auto_unmount_only ? NULL : &req) < 0
+               ? EXIT_FAILURE
+               : EXIT_SUCCESS;
 }

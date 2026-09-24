@@ -20,6 +20,14 @@
 /* "ro,allow_other"; unknown bits are appended in hex. */
 const char *defused_mount_flags_str(uint32_t flags, char *buf, size_t size);
 
+/* 1 if mnt_id names a FUSE mount in namespace mnt_ns_id (0 for the
+ * caller's own), 0 for any other mount, or a negative errno. The optional
+ * out_blkdev distinguishes "fuseblk"; given subtype, a mount reporting
+ * another subtype counts as another mount; the optional out_uid gets
+ * user_id=, and asking for it makes a FUSE mount without one an error. */
+int defused_is_fuse_mount(uint64_t mnt_ns_id, uint64_t mnt_id, bool *out_blkdev,
+                          const char *subtype, uid_t *out_uid);
+
 /* The 64-bit mount id, which the kernel never reuses. From the VFS, so it
  * works even when the FUSE server is dead. */
 int defused_mnt_id(int dir_fd, const char *name, uint64_t *out_id);
@@ -54,5 +62,9 @@ int defused_check_umount_request(const struct defused_request *req,
  * reporting in *err, so the two are interchangeable at the call site. */
 int defused_perform(const struct defused_request *req, const int *fds,
                     struct defused_error *err);
+
+#ifdef DEFUSED_TEST
+int defused_test_mount_opts_owner(const char *opts, uid_t *out_uid);
+#endif
 
 #endif /* DEFUSED_MOUNT_H */

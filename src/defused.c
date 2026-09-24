@@ -111,7 +111,7 @@ static int count_fuse_mounts(int pidfd) {
         for (ssize_t i = 0; i < n; i++) {
             /* libfuse's mount_max counts "fuse" and not "fuseblk". */
             bool blkdev = false;
-            ret = defused_is_fuse_mount(ns_id, ids[i], &blkdev, NULL);
+            ret = defused_is_fuse_mount(ns_id, ids[i], &blkdev, NULL, NULL);
             /* A mount that went away is one fewer mount, not an error. */
             if (ret == 1 && !blkdev)
                 count++;

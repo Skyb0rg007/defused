@@ -5,6 +5,7 @@
  */
 #define _GNU_SOURCE
 #include "common.h"
+#include "defused-mount.h"
 #include "defused-sandbox.h"
 #include "test_util.h"
 
