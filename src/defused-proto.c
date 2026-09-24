@@ -167,9 +167,8 @@ int defused_recv_request(int sock, struct defused_request *req, int *fds,
     return -EBADMSG;
 }
 
-/* sendto(), not the sendmsg() above: a reply carries no descriptors, and
- * the service sends it from inside its seccomp sandbox, whose allowlist
- * has to name one entry point. */
+/* The service sends this from inside its seccomp sandbox, whose allowlist
+ * names this exact sendto(). */
 int defused_send_reply(int sock, const struct defused_error *err) {
     struct defused_reply reply = {
         .magic = DEFUSED_MAGIC,

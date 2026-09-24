@@ -24,9 +24,6 @@ static inline int sys_setns(int fd, int nstype) {
     return (int)syscall(SYS_setns, (long)fd, (long)nstype);
 }
 
-/* send() is sendto() without an address, and libc issues it as such, but
- * the filter has to be certain of the entry and of the two null tail
- * arguments. */
 static inline ssize_t sys_sendto(int fd, const void *buf, size_t len, int flags,
                                  const void *addr, unsigned int addrlen) {
     return (ssize_t)syscall(SYS_sendto, (long)fd, buf, (long)len, (long)flags,
