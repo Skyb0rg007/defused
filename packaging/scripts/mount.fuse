@@ -1,0 +1,104 @@
+#!/bin/sh
+#
+# SPDX-FileCopyrightText: 2026 Skye Soss <skye@soss.website>
+#
+# SPDX-License-Identifier: MIT-0
+
+set -eu
+
+usage() {
+    echo "usage: $0 <type#source|source> <mountpoint> [-sfnv] [-o <options>] [-t <type.subtype>] [-N <nspath>]"
+    exit 1
+} >&2
+
+[ $# -ge 2 ] || usage
+
+prog=${0##*/}
+source=$1; mountpoint=$2; shift 2
+type=
+fake=
+verbose=
+namespace=
+options=
+
+while getopts ":sfnvo:t:N:" arg; do
+    case $arg in
+        s|n) ;;
+        f)  fake=1;;
+        o)  options="${options:+$options,}$OPTARG";;
+        t)  type="$OPTARG";;
+        N)  namespace="$OPTARG";;
+        v)  verbose=1;;
+        *)  echo >&2 "$prog: unrecognized option $OPTARG"; usage;;
+    esac
+done
+
+shift $((OPTIND - 1))
+[ "$#" -eq 0 ] || usage
+
+case $type in
+    fuse.?*)    type=${type#fuse.};;
+    fuseblk.?*) type=${type#fuseblk.};;
+    fuse|fuseblk|"")
+        # No subtype: fstab's older "type#source" form.
+        type=${source%%#*}
+        case $source in
+            *#*) source=${source#*#};;
+            *)   source=;;
+        esac
+        ;;
+esac
+if [ -z "$type" ]; then
+    echo >&2 "$prog: empty filesystem type"
+    exit 1
+fi
+
+# Like libfuse's mount.fuse3: drop the options meant for mount(8) alone, and
+# ask for dev and suid unless told otherwise, since mount(8) defaults to
+# them where libfuse does not.
+setuid=
+dev=dev
+suid=suid
+fsopts=
+set -f
+IFS=,
+for opt in $options; do
+    case $opt in
+        setuid=*)   setuid=${opt#setuid=};;
+        drop_privileges)
+            echo >&2 "$prog: drop_privileges is not supported"
+            exit 1
+            ;;
+        ""|user|nouser|users|auto|noauto|nofail|_netdev) ;;
+        *)
+            case $opt in
+                nodev)  dev=;;
+                nosuid) suid=;;
+            esac
+            fsopts="${fsopts:+$fsopts,}$opt"
+            ;;
+    esac
+done
+unset IFS
+set +f
+for opt in $dev $suid; do
+    fsopts="${fsopts:+$fsopts,}$opt"
+done
+
+set -- "$type"
+[ -z "$source" ] || set -- "$@" "$source"
+set -- "$@" "$mountpoint" -o "$fsopts"
+
+if [ -n "$setuid" ]; then
+    set -- runuser -u "$setuid" -- "$@"
+else
+    # Filesystems started at boot may otherwise have no HOME.
+    export HOME="${HOME-/root}"
+fi
+if [ -n "$namespace" ]; then
+    set -- nsenter --mount="$namespace" -- "$@"
+fi
+
+[ -z "$verbose" ] || echo >&2 "$prog: $*"
+[ -z "$fake" ] || exit 0
+exec "$@"

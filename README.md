@@ -59,6 +59,9 @@ This project provides the following:
 - A system service that listens on `/run/defused/defused.sock`.
 - A replacement `fusermount3` and `fusermount` binary to communicate with
   the service.
+- `mount.fuse` and `umount.fuse` helper scripts for `mount` and `umount`,
+  so `fuse.*` filesystems in `/etc/fstab` work without libfuse's
+  `mount.fuse3`, and `umount` unmounts through `fusermount3`.
 
 The system service is written to use systemd socket activation with
 `Accept=yes`.
