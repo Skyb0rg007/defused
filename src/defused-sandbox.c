@@ -32,11 +32,25 @@
 #include <linux/mount.h>
 #include <linux/nsfs.h>
 
-/* AT_HANDLE_FID, AT_HANDLE_MNT_ID_UNIQUE and PIDFD_GET_INFO. The define
+/* AT_HANDLE_FID, AT_HANDLE_MNT_ID_UNIQUE and PIDFS_IOCTL_MAGIC. The define
  * skips <asm-generic/fcntl.h>, which would clash with <fcntl.h> above. */
 #define _ASM_GENERIC_FCNTL_H
 #include <linux/fcntl.h>
 #include <linux/pidfd.h>
+
+/* PIDFD_GET_INFO's first layout (Linux 6.13, PIDFD_INFO_SIZE_VER0), spelled
+ * out so this builds against older UAPI headers. The size is part of the
+ * request number, and the kernel accepts any from this one up. */
+struct pidfd_info_v0 {
+    __u64 mask;
+    __u64 cgroupid;
+    __u32 pid;
+    __u32 unused[11];
+};
+_Static_assert(sizeof(struct pidfd_info_v0) == 64,
+               "struct pidfd_info_v0 must be PIDFD_INFO_SIZE_VER0 bytes");
+#define PIDFD_GET_INFO_V0 _IOWR(PIDFS_IOCTL_MAGIC, 11, struct pidfd_info_v0)
+#define PIDFD_INFO_PID_V0 (1ULL << 0)
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(scmp_filter_ctx, seccomp_release);
 
@@ -180,10 +194,10 @@ static int install_seccomp(const struct sandbox_job *job) {
 /* Linux 6.13+. ENODATA, not EINVAL, for a useless reply: EINVAL means the
  * kernel lacks the ioctl. */
 static pid_t pidfd_to_pid_ioctl(int pidfd) {
-    struct pidfd_info info = {0};
-    if (sys_ioctl(pidfd, PIDFD_GET_INFO, &info) == -1)
+    struct pidfd_info_v0 info = {0};
+    if (sys_ioctl(pidfd, PIDFD_GET_INFO_V0, &info) == -1)
         return -errno;
-    if (!(info.mask & PIDFD_INFO_PID) || info.pid == 0 ||
+    if (!(info.mask & PIDFD_INFO_PID_V0) || info.pid == 0 ||
         info.pid > (unsigned int)INT_MAX)
         return -ENODATA;
     return (pid_t)info.pid;

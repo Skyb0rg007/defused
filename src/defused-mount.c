@@ -15,6 +15,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +36,25 @@
 
 #define DEFUSED_MOVE_MOUNT_FLAGS                                               \
     (MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH)
+
+/* Linux 6.13's subtype: a request bit, and a string offset in the __u32
+ * after mnt_ns_id, which older UAPI headers leave as padding. Read by
+ * position so this builds against those headers too. */
+#define STATMOUNT_FS_SUBTYPE_OFFSET                                            \
+    (offsetof(struct statmount, mnt_ns_id) + sizeof(__u64))
+#ifdef STATMOUNT_FS_SUBTYPE
+_Static_assert(offsetof(struct statmount, fs_subtype) ==
+                   STATMOUNT_FS_SUBTYPE_OFFSET,
+               "fs_subtype must follow mnt_ns_id");
+#else
+#define STATMOUNT_FS_SUBTYPE 0x00000100U
+#endif
+
+static uint32_t statmount_fs_subtype(const struct statmount *sm) {
+    uint32_t off;
+    memcpy(&off, (const char *)sm + STATMOUNT_FS_SUBTYPE_OFFSET, sizeof(off));
+    return off;
+}
 
 const char *defused_mount_flags_str(uint32_t flags, char *buf, size_t size) {
     static const char *const names[] = {
@@ -107,7 +127,7 @@ int defused_is_fuse_mount(uint64_t mnt_ns_id, uint64_t mnt_id, bool *out_blkdev,
     /* Linux 6.12 reports no subtype at all, and later kernels report none
      * for a mount without one, so only a reported subtype is compared. */
     if (subtype && (buf.sm.mask & STATMOUNT_FS_SUBTYPE) &&
-        strcmp(buf.sm.str + buf.sm.fs_subtype, subtype) != 0)
+        strcmp(buf.sm.str + statmount_fs_subtype(&buf.sm), subtype) != 0)
         return 0;
     if (out_blkdev)
         *out_blkdev = blkdev;
