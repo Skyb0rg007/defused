@@ -19,9 +19,13 @@ jobs:
           - os: ubuntu-latest
             system: x86_64-linux
             system-features: benchmark big-parallel nixos-test uid-range kvm
+            # filnix only cross-compiles to x86_64-unknown-linux-gnufilc0,
+            # so the Fil-C check exists on this system alone.
+            filc: true
           - os: ubuntu-24.04-arm
             system: aarch64-linux
             system-features: benchmark big-parallel nixos-test uid-range
+            filc: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       # Ubuntu sets kernel.apparmor_restrict_unprivileged_userns=1, which
@@ -39,7 +43,14 @@ jobs:
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
         with:
           nix_path: nixpkgs=channel:nixos-unstable
-          extra_nix_config: 'system-features = ${{ matrix.system-features }}'
+          # filnix's cache serves its Fil-C package set, which saves building
+          # libseccomp and a Fil-C libc here. It is deliberately not in
+          # flake.nix: nothing outside this repo should have to take a
+          # third-party cache on faith to build defused.
+          extra_nix_config: |
+            system-features = ${{ matrix.system-features }}
+            extra-substituters = https://filc.cachix.org
+            extra-trusted-public-keys = filc.cachix.org-1:8rA7kXyu1HaJuMTsAKfA9fU/+r8YtLv5KiZ5hfDNZMk=
       - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866
         with:
           name: defused
@@ -54,3 +65,9 @@ jobs:
           nix build -L \
             .#checks.${{ matrix.system }}.meson-tests \
             .#checks.${{ matrix.system }}.reuse-lint
+      # --cores 2 only matters when filc.cachix.org lacks the Fil-C compiler
+      # for the pinned filnix: building it runs one 3 GiB ld.gold per core,
+      # more than a 16 GiB runner has at -j4.
+      - name: Build the Fil-C check
+        if: matrix.filc
+        run: nix build -L --cores 2 .#checks.${{ matrix.system }}.meson-tests-filc

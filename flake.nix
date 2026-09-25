@@ -11,10 +11,18 @@
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
+    # Fil-C packaged as a Nix cross toolchain. It pins its own nixpkgs fork
+    # -- stock lib.systems does not know the gnufilc0 ABI tag -- so it cannot
+    # follow ours, and it only defines x86_64-linux.
+    filnix.url = "github:mbrock/filnix";
   };
 
   outputs =
-    { self, nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      filnix,
+    }:
     let
       inherit (nixpkgs) lib;
       # Each output body takes the platform it is being built for.
@@ -51,7 +59,9 @@
           version = "0.1.0";
           inherit src;
           nativeBuildInputs = [
-            pkgs.meson
+            # Not pkgs.meson: filnix's ports overlay leaves it unspliced, which
+            # would build meson -- and a Python -- with Fil-C to run it here.
+            pkgs.buildPackages.meson
             pkgs.ninja
             pkgs.pkg-config
           ];
@@ -72,6 +82,12 @@
             platforms = lib.platforms.linux;
           };
         };
+
+      # filnix exposes Fil-C as a cross target of its own nixpkgs, so
+      # everything under defused -- libseccomp, libc -- is compiled with
+      # Fil-C as well, and the Meson suite runs against a binary that
+      # bounds- and type-checks every load and store.
+      filcPackages = lib.mapAttrs (_: filnixOutputs: filnixOutputs.pkgsFilc) filnix.legacyPackages;
     in
     {
       nixosModules = {
@@ -95,6 +111,9 @@
             touch $out
           '';
         }
+        // lib.optionalAttrs (filcPackages ? ${system}) {
+          meson-tests-filc = self.packages.${system}.defused-filc;
+        }
       );
 
       packages = forAllSystems (
@@ -105,6 +124,13 @@
           # Runs on a musl system with no shared libraries at all.
           defused-static = (mkDefused (staticPackages pkgs)).overrideAttrs (_: {
             pname = "defused-static";
+          });
+        }
+        // lib.optionalAttrs (filcPackages ? ${system}) {
+          # Memory-safe; see doc/contributing.md for filnix's binary cache,
+          # without which this builds the Fil-C compiler from source.
+          defused-filc = (mkDefused filcPackages.${system}).overrideAttrs (_: {
+            pname = "defused-filc";
           });
         }
       );

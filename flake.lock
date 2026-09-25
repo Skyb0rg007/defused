@@ -1,6 +1,41 @@
 {
   "nodes": {
+    "filnix": {
+      "inputs": {
+        "nixpkgs": "nixpkgs"
+      },
+      "locked": {
+        "lastModified": 1789804567,
+        "narHash": "sha256-zCtzMPwQfwRl41qTam/MVHtowBhxVMlOi5v3RExAiVE=",
+        "owner": "mbrock",
+        "repo": "filnix",
+        "rev": "32b26fcf410a62281bf9ee4e387a55e47ad1d150",
+        "type": "github"
+      },
+      "original": {
+        "owner": "mbrock",
+        "repo": "filnix",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1762633274,
+        "narHash": "sha256-Ygv7dtGtshVgYPWE9pNaCxA7s9V8OleD7UbFjuZr5ug=",
+        "owner": "lessrest",
+        "repo": "filnixpkgs",
+        "rev": "400439b089773d3fc593b512250e283a33485de4",
+        "type": "github"
+      },
+      "original": {
+        "owner": "lessrest",
+        "repo": "filnixpkgs",
+        "rev": "400439b089773d3fc593b512250e283a33485de4",
+        "type": "github"
+      }
+    },
+    "nixpkgs_2": {
       "locked": {
         "lastModified": 1789785513,
         "narHash": "sha256-B44WL6h0XoLjJ41bUPJk0X5SDinLCII//6EcBLXKiJ0=",
@@ -18,7 +53,8 @@
     },
     "root": {
       "inputs": {
-        "nixpkgs": "nixpkgs"
+        "filnix": "filnix",
+        "nixpkgs": "nixpkgs_2"
       }
     }
   },

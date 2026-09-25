@@ -41,7 +41,7 @@ Before considering a change verified, run the full check, not just
 nix flake check
 ```
 
-This covers three things:
+This covers:
 
 - `checks.<system>.meson-tests` builds the package, which runs `meson test`
   in the Nix build sandbox (the package sets `doCheck = true`).
@@ -51,12 +51,57 @@ This covers three things:
   kernel-version fallbacks are exercised on a kernel that really lacks the
   newer interface.
 - `reuse lint`, to ensure that all files have SPDX headers.
+- On x86_64, `checks.x86_64-linux.meson-tests-filc`, the same Meson suite
+  built with Fil-C -- see below, and expect a long first build without
+  filnix's cache configured.
 
-CI runs the first and third, but only evaluates the VM tests rather than
-running them, so this local run is the only thing that exercises them.
+CI runs all but the VM tests, which it only evaluates rather than running,
+so this local run is the only thing that exercises those.
 
 Pass `--print-build-logs` (`-L`) to see the Meson test output as it runs;
 without it a passing build prints nothing.
+
+## Building with Fil-C
+
+`packages.x86_64-linux.defused-filc` builds defused with
+[Fil-C](https://fil-c.org), a C compiler that bounds- and type-checks every
+load and store at run time, and `checks.x86_64-linux.meson-tests-filc` runs
+the Meson suite against that build. A test that passes there passes without
+any of the out-of-bounds accesses or use-after-frees that reading the
+seccomp and mount code is otherwise the only way to rule out.
+
+The toolchain comes from [filnix](https://github.com/mbrock/filnix), which
+packages Fil-C as a Nix cross target (`x86_64-unknown-linux-gnufilc0`) of
+its own nixpkgs fork, so libseccomp and libc are compiled with Fil-C too.
+Fil-C targets x86_64 only, so the package and the check exist on that system
+alone.
+
+filnix's cache is deliberately not in `flake.nix`: building defused should
+not require trusting a third-party cache. Add it yourself, either in
+`nix.conf`
+
+```
+extra-substituters = https://filc.cachix.org
+extra-trusted-public-keys = filc.cachix.org-1:8rA7kXyu1HaJuMTsAKfA9fU/+r8YtLv5KiZ5hfDNZMk=
+```
+
+or per build:
+
+```sh
+nix build -L .#checks.x86_64-linux.meson-tests-filc \
+  --extra-substituters https://filc.cachix.org \
+  --extra-trusted-public-keys 'filc.cachix.org-1:8rA7kXyu1HaJuMTsAKfA9fU/+r8YtLv5KiZ5hfDNZMk='
+```
+
+If the cache has not caught up with the pinned filnix revision, the first
+build compiles the Fil-C compiler itself -- an LLVM fork, around an hour.
+Its link step runs one `ld.gold` per core at roughly 3 GiB each, which a
+16 GiB machine does not survive at the default parallelism, so build it on
+its own first:
+
+```sh
+nix build --cores 2 'github:mbrock/filnix#filcc'
+```
 
 ## Coding style
 
