@@ -20,24 +20,22 @@ lazy=
 verbose=
 namespace=
 
-while getopts ":nlfvrt:N:" arg; do
+while getopts "nlfvrt:N:" arg; do
     case $arg in
         n|r|t) ;;
         f)  force=1;;
         l)  lazy=1;;
-        N)  namespace="$OPTARG";;
+        N)  namespace=$OPTARG;;
         v)  verbose=1;;
-        *)  echo >&2 "$prog: unrecognized option $OPTARG"; usage;;
+        *)  usage;;
     esac
 done
-
 shift $((OPTIND - 1))
-[ "$#" -eq 0 ] || usage
+[ $# -eq 0 ] || usage
 
 if [ -n "$force" ]; then
-    high=$(stat --cached always --format '%Hd' -- "$mountpoint")
-    low=$(stat --cached always --format '%Ld' -- "$mountpoint")
-    conn=$(( (high << 20) | low ))
+    dev=$(stat --cached always --format '%Hd %Ld' -- "$mountpoint")
+    conn=$(( (${dev% *} << 20) | ${dev#* } ))
     if ! [ -d "/sys/fs/fuse/connections/$conn" ]; then
         echo >&2 "$prog: $mountpoint is not a FUSE mount"
         exit 1
@@ -46,16 +44,8 @@ if [ -n "$force" ]; then
     echo 1 > "/sys/fs/fuse/connections/$conn/abort"
 fi
 
-fusermount_args=
-if [ "$lazy" = 1 ]; then
-    fusermount_args="-z"
-fi
-
-if [ -n "$namespace" ]; then
-    [ -z "$verbose" ] || echo >&2 "$prog: nsenter --mount=\"$namespace\" -- fusermount3 -u $fusermount_args -- \"$mountpoint\""
-    nsenter --mount="$namespace" -- fusermount3 -u $fusermount_args -- "$mountpoint"
-else
-    [ -z "$verbose" ] || echo >&2 "$prog: fusermount3 -u $fusermount_args -- \"$mountpoint\""
-    fusermount3 -u $fusermount_args -- "$mountpoint"
-fi
+set -- fusermount3 -u ${lazy:+-z} -- "$mountpoint"
+[ -z "$namespace" ] || set -- nsenter --mount="$namespace" -- "$@"
+[ -z "$verbose" ] || echo >&2 "$prog: $*"
+"$@"
 [ -z "$verbose" ] || echo >&2 "umount: $mountpoint unmounted"
