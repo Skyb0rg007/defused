@@ -60,30 +60,32 @@ enum {
 /* The filter pins the reply's length, not where it is formatted. */
 #define PROBE_REPLY_LEN ((long)sizeof(struct defused_reply))
 
-static long probe_arg(long v, const struct sandbox_job *job) {
+/* A pointer, not a long: a pointer that goes through an integer loses its
+ * bounds under Fil-C, and the kernel's read of the buffer then traps. */
+static const void *probe_arg(long v, const struct sandbox_job *job) {
     /* Filled at run time, so it is a distinct object whatever the compiler
      * does with identical literals. */
     static char path_copy[DEFUSED_MAX_FILENAME];
     static char handle_copy[512];
     switch (v) {
     case ARG_PATH:
-        return (long)job->path;
+        return job->path;
     case ARG_PATH_COPY:
         /* The same text as the pinned path, at a different address. */
         strcpy(path_copy, job->path);
-        return (long)path_copy;
+        return path_copy;
     case ARG_HANDLE:
-        return (long)defused_test_handle_buf(job);
+        return defused_test_handle_buf(job);
     case ARG_HANDLE_ID:
-        return (long)defused_test_handle_id(job);
+        return defused_test_handle_id(job);
     case ARG_HANDLE_COPY:
-        return (long)handle_copy;
+        return handle_copy;
     case ARG_REPLY: {
         static struct defused_reply reply;
-        return (long)&reply;
+        return &reply;
     }
     default:
-        return v;
+        return (const void *)v;
     }
 }
 
@@ -237,7 +239,7 @@ static int run_probe(const struct probe *p, enum defused_op op, bool filtered) {
         if (defused_test_pin_job(&job) != 0 ||
             (filtered && defused_test_install_seccomp(&job) != 0))
             _exit(PROBE_SETUP_FAILED);
-        long a[6];
+        const void *a[6];
         for (size_t i = 0; i < ARRAY_SIZE(a); i++)
             a[i] = probe_arg(p->args[i], &job);
         errno = 0;
