@@ -21,31 +21,26 @@ verbose=
 namespace=
 options=
 
-while getopts ":sfnvo:t:N:" arg; do
+while getopts "sfnvo:t:N:" arg; do
     case $arg in
         s|n) ;;
         f)  fake=1;;
-        o)  options="${options:+$options,}$OPTARG";;
-        t)  type="$OPTARG";;
-        N)  namespace="$OPTARG";;
+        o)  options=$OPTARG;;
+        t)  type=$OPTARG;;
+        N)  namespace=$OPTARG;;
         v)  verbose=1;;
-        *)  echo >&2 "$prog: unrecognized option $OPTARG"; usage;;
+        *)  usage;;
     esac
 done
-
 shift $((OPTIND - 1))
-[ "$#" -eq 0 ] || usage
+[ $# -eq 0 ] || usage
 
 case $type in
-    fuse.?*)    type=${type#fuse.};;
-    fuseblk.?*) type=${type#fuseblk.};;
-    fuse|fuseblk|"")
-        # No subtype: fstab's older "type#source" form.
+    fuse.?*|fuseblk.?*) type=${type#*.};;
+    *)  # No subtype: fstab's older "type#source" form.
         type=${source%%#*}
-        case $source in
-            *#*) source=${source#*#};;
-            *)   source=;;
-        esac
+        source=${source#"$type"}
+        source=${source#\#}
         ;;
 esac
 if [ -z "$type" ]; then
@@ -53,52 +48,30 @@ if [ -z "$type" ]; then
     exit 1
 fi
 
-# Like libfuse's mount.fuse3: drop the options meant for mount(8) alone, and
-# ask for dev and suid unless told otherwise, since mount(8) defaults to
-# them where libfuse does not.
+# Like libfuse's mount.fuse3: default to dev and suid as mount(8) does
+# (a later nodev or nosuid wins), and drop the options meant for mount(8).
+fsopts=dev,suid
 setuid=
-dev=dev
-suid=suid
-fsopts=
-set -f
-IFS=,
+set -f; IFS=,
 for opt in $options; do
     case $opt in
-        setuid=*)   setuid=${opt#setuid=};;
+        setuid=*) setuid=${opt#setuid=};;
         drop_privileges)
             echo >&2 "$prog: drop_privileges is not supported"
             exit 1
             ;;
         ""|user|nouser|users|auto|noauto|nofail|_netdev) ;;
-        *)
-            case $opt in
-                nodev)  dev=;;
-                nosuid) suid=;;
-            esac
-            fsopts="${fsopts:+$fsopts,}$opt"
-            ;;
+        *)  fsopts=$fsopts,$opt;;
     esac
 done
-unset IFS
-set +f
-for opt in $dev $suid; do
-    fsopts="${fsopts:+$fsopts,}$opt"
-done
+unset IFS; set +f
 
-set -- "$type"
-[ -z "$source" ] || set -- "$@" "$source"
-set -- "$@" "$mountpoint" -o "$fsopts"
+# Filesystems started at boot may otherwise have no HOME; runuser sets its own.
+export HOME="${HOME-/root}"
 
-if [ -n "$setuid" ]; then
-    set -- runuser -u "$setuid" -- "$@"
-else
-    # Filesystems started at boot may otherwise have no HOME.
-    export HOME="${HOME-/root}"
-fi
-if [ -n "$namespace" ]; then
-    set -- nsenter --mount="$namespace" -- "$@"
-fi
-
+set -- "$type" ${source:+"$source"} "$mountpoint" -o "$fsopts"
+[ -z "$setuid" ] || set -- runuser -u "$setuid" -- "$@"
+[ -z "$namespace" ] || set -- nsenter --mount="$namespace" -- "$@"
 [ -z "$verbose" ] || echo >&2 "$prog: $*"
 [ -z "$fake" ] || exit 0
 exec "$@"
