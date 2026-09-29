@@ -43,6 +43,16 @@ jobs:
         with:
           name: defused
 
+      # From the default branch, not the checkout: that may be an untrusted
+      # PR, and evaluating its flake would run its Nix code in this job.
+      - name: Put the dev shell's tools on PATH
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          nix develop "github:$GITHUB_REPOSITORY/$DEFAULT_BRANCH" \
+            --command printenv PATH | tr ':' '\n' | tac >> "$GITHUB_PATH"
+
       - name: Run Claude Code
         id: claude
         uses: anthropics/claude-code-action@cfc3eb22bfed5c26ef66e3223c982af27e4524de
@@ -56,5 +66,11 @@ jobs:
           # Optional: Add claude_args to customize behavior and configuration
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
-          claude_args: '--allowed-tools "Bash(nix *)"'
+          #
+          # Only programs that read the checkout without running any of it:
+          # nix, meson, ninja and treefmt (whose config names the commands it
+          # runs) would all execute code from the checkout.
+          claude_args: >-
+            --allowed-tools
+            "Bash(clang-format *),Bash(nixfmt *),Bash(reuse lint),Bash(reuse lint *)"
 
