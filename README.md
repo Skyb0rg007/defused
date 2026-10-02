@@ -28,29 +28,15 @@ fuse-overlayfs: cannot mount: Operation not permitted
 The `no_new_privileges` flag is important for proper application sandboxing,
 as Linux features such as [landlock][] and [seccomp-bpf][] can only be used
 after a call to `prctl(PR_SET_NO_NEW_PRIVS, 1)`.
-
-Using Unix domain sockets like defused does also means that the FUSE-mounting
-capability can be granted to applications by allow-listing the socket in the
-application's AppArmor or Landlock configuration.
-Doing so with `fusermount3` is much more challenging, as it is not compatible
-with Landlock.
+By using Unix domain sockets, the privileged mounting operation is performed
+by a process outside the unprivileged process tree, bypassing the
+`no_new_privileges` restrictions.
 
 ## Requirements
 
-Defused requires Linux 6.12 or later: `statmount()` needs 6.8, naming a
-mount namespace for it needs 6.11, and `name_to_handle_at()`'s
-`AT_HANDLE_MNT_ID_UNIQUE` needs 6.12. Debian 13 and Ubuntu 24.04 both ship
-a kernel that new.
-To authorize unmounts, the service resolves a client's pidfd to its pid with
-the `PIDFD_GET_INFO` ioctl on Linux 6.13 or later, and falls back to the
-`Pid:` line of `/proc/self/fdinfo/<pidfd>` on older kernels.
-Privileged callers (see below) skip the authorization entirely.
-
-Building needs libseccomp and the Linux UAPI headers, and nothing else:
-the client and the service speak a small binary protocol of their own over
-a Unix socket, so there is no RPC library in the picture. systemd is
-useful at runtime, for socket activation, but is not required either to
-build or to run -- see `defused --daemon` below.
+Defused requires Linux 6.12 or later as it uses [`name_to_handle_at()`](https://man7.org/linux/man-pages/man2/open_by_handle_at.2.html)'s
+`AT_HANDLE_MNT_ID_UNIQUE` argument to obtain a unique mount id.
+It also depends on libseccomp.
 
 ## Project structure
 
@@ -71,8 +57,8 @@ connections.
 
 ## Mount policy
 
-Command-line options decide who may mount and unmount at all; see
-[protocol.md](./doc/protocol.md):
+Instead of a config file (like libfuse's `/etc/fuse.conf`), all of defused's
+options are configured on the daemon's command line:
 
 | Option | Meaning | Default |
 | --- | --- | --- |
@@ -101,13 +87,8 @@ Environment=DEFUSED_EXTRA_ARGS=--allow-other
 ```
 
 A caller that is root or holds `CAP_SYS_ADMIN` does not need the service at
-all: it already holds the privilege, and it is already in the mount
-namespace the mount belongs in, so `fusermount3` mounts directly in its own
-process -- no socket, no helper, and none of the service's policy (no mount
-limit, no mountpoint ownership rule, no filesystem-type allowlist). It
-honors the `suid`, `dev` and `blkdev` options like libfuse's `fusermount3`
-does for root, and the `defused` service binary need not even be installed.
-libfuse's own `fusermount3` is therefore not needed at all.
+all, so `fusermount3` will bypass the socket in that case and perform the
+mount directly.
 
 ## Mountpoint ownership model
 
@@ -132,6 +113,7 @@ libfuse's setuid implementation will deny the mount while this implementation
 will still perform it.
 I do not believe this is an issue, however, as sandboxed applications should
 deny access to `/dev/fuse` or `/run/defused/defused.sock`.
+Otherwise you could use `systemd-run --user` to "escalate to user".
 
 See [protocol.md](./doc/protocol.md) for more information on how defused
 works.
