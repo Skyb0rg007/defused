@@ -32,6 +32,9 @@ By using Unix domain sockets, the privileged mounting operation is performed
 by a process outside the unprivileged process tree, bypassing the
 `no_new_privileges` restrictions.
 
+> [!CAUTION]
+> defused is a pre-alpha project: use at your own risk!
+
 ## Requirements
 
 Defused requires Linux 6.12 or later as it uses [`name_to_handle_at()`](https://man7.org/linux/man-pages/man2/open_by_handle_at.2.html)'s
@@ -63,7 +66,7 @@ options are configured on the daemon's command line:
 | Option | Meaning | Default |
 | --- | --- | --- |
 | `--max-mounts=N` | Refuse a mount once N FUSE filesystems are mounted (libfuse's `mount_max`) | 100 |
-| `--allow-groups=GROUP[,GROUP...]` | Only members of these groups (names or gids, supplementary included) may mount and unmount | any user |
+| `--allow-groups=GROUP[,GROUP...]` | Only members of these groups (names or gids) may mount and unmount | any user |
 | `--allow-other` | Let callers set the `allow_other` mount option (libfuse's `user_allow_other`) | refused |
 
 The ownership checks below always apply as well.
