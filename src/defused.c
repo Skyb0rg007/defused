@@ -6,8 +6,8 @@
  * The defused system service that mounts/unmounts FUSE filesystems on
  * behalf of unprivileged users.
  *
- * Every caller it serves is unprivileged: root and CAP_SYS_ADMIN callers
- * mount from fusermount3 itself, so nothing here skips the policy.
+ * Every caller it serves is unprivileged: callers with CAP_SYS_ADMIN mount
+ * from fusermount3 itself, so nothing here skips the policy.
  *
  * By default it handles the one connection systemd's Accept=yes socket
  * activation hands it, then exits. With --daemon it listens itself and

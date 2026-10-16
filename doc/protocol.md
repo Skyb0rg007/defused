@@ -153,8 +153,9 @@ reference would make a non-lazy unmount fail with `EBUSY`.
 
 ## Privileged callers
 
-A `fusermount3` caller that is root or holds `CAP_SYS_ADMIN` does not contact
-the defused socket.
+A `fusermount3` caller that holds `CAP_SYS_ADMIN` over its mount namespace
+(one whose user namespace owns that mount namespace) does not contact the
+defused socket.
 It already has the privilege to perform the mount itself, so it will call
 `defused_perform()` directly to do the work in its own process.
 By doing so, it also skips all of the policy checks.

@@ -89,9 +89,9 @@ like `--allow-other` is passed:
 Environment=DEFUSED_EXTRA_ARGS=--allow-other
 ```
 
-A caller that is root or holds `CAP_SYS_ADMIN` does not need the service at
-all, so `fusermount3` will bypass the socket in that case and perform the
-mount directly.
+A caller that holds `CAP_SYS_ADMIN` over its mount namespace does not need
+the service at all, so `fusermount3` will bypass the socket in that case and
+perform the mount directly.
 
 ## Mountpoint ownership model
 

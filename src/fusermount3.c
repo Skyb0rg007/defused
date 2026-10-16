@@ -36,6 +36,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+/* NS_GET_USERNS. */
+#include <linux/nsfs.h>
+
 #ifndef DEFUSED_VERSION
 #define DEFUSED_VERSION "unknown"
 #endif
@@ -73,13 +76,31 @@ static bool raise_cap_sys_admin(void) {
     return syscall(SYS_capset, &hdr, caps) == 0;
 }
 
+/* True unless shown otherwise: NS_GET_USERNS answers EPERM when the mount
+ * namespace's owner is an ancestor of this user namespace. */
+static bool owns_mount_namespace(void) {
+    _cleanup_close_ int mnt_ns =
+        open("/proc/self/ns/mnt", O_RDONLY | O_CLOEXEC);
+    if (mnt_ns < 0)
+        return true;
+    _cleanup_close_ int owner = sys_ioctl(mnt_ns, NS_GET_USERNS, NULL);
+    if (owner < 0)
+        return errno != EPERM;
+    struct stat owner_st, self_st;
+    if (fstat(owner, &owner_st) == -1 ||
+        stat("/proc/self/ns/user", &self_st) == -1)
+        return true;
+    return owner_st.st_dev == self_st.st_dev &&
+           owner_st.st_ino == self_st.st_ino;
+}
+
 static bool caller_is_privileged(void) {
 #ifdef DEFUSED_TEST
     const char *forced_uid = getenv("DEFUSED_TEST_UID");
     if (forced_uid != NULL)
         return strcmp(forced_uid, "0") == 0;
 #endif
-    return geteuid() == 0 || raise_cap_sys_admin();
+    return owns_mount_namespace() && raise_cap_sys_admin();
 }
 
 /*** Mount options ***/
