@@ -145,15 +145,16 @@ int defused_check_mount_request(const struct defused_request *req,
     uint32_t allowed = DEFUSED_MOUNT_FLAGS_MASK;
     if (!allow_privileged)
         allowed &= ~(uint32_t)DEFUSED_MOUNT_PRIVILEGED_FLAGS;
-    if (req->mount_flags & ~allowed) {
+    uint32_t rejected = req->mount_flags & ~allowed;
+    if (rejected) {
         char flags[160];
-        defused_error_setf(err, DEFUSED_ERR_BAD_OPTION, 0,
-                           "mount flags %s are not available here (%s)",
-                           defused_mount_flags_str(req->mount_flags & ~allowed,
-                                                   flags, sizeof(flags)),
-                           req->mount_flags & DEFUSED_MOUNT_PRIVILEGED_FLAGS
-                               ? "privileged flags need a privileged caller"
-                               : "unknown flag bits");
+        defused_error_setf(
+            err, DEFUSED_ERR_BAD_OPTION, 0,
+            "mount flags %s are not available here (%s)",
+            defused_mount_flags_str(rejected, flags, sizeof(flags)),
+            rejected & DEFUSED_MOUNT_PRIVILEGED_FLAGS
+                ? "privileged flags need a privileged caller"
+                : "unknown flag bits");
         return -EINVAL;
     }
     if (strchr(req->subtype, '/'))
