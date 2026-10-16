@@ -232,14 +232,17 @@ int defused_peer_mnt_ns_id(int pidfd, uint64_t *out_id) {
 }
 
 /* statmount() is told which namespace to look in, so this needs neither
- * the filter nor setns(). */
+ * the filter nor setns(). 0 with *out_uid set, 1 if mnt_id is no FUSE
+ * mount in the peer's namespace, or a negative errno. */
 static int peer_fuse_mount_owner(int pidfd, uint64_t mnt_id, uid_t *out_uid) {
     uint64_t ns_id;
     int ret = defused_peer_mnt_ns_id(pidfd, &ns_id);
     if (ret < 0)
         return ret;
     ret = defused_is_fuse_mount(ns_id, mnt_id, NULL, NULL, out_uid);
-    return ret < 0 ? ret : ret == 0 ? -EINVAL : 0;
+    if (ret == -ENOENT)
+        return 1;
+    return ret < 0 ? ret : !ret;
 }
 
 /* The rest runs after setns(). */
@@ -325,15 +328,17 @@ int defused_sandbox_unmount(int pidfd, int parent_fd, const char *name,
      * hence the initializer. */
     uid_t owner = (uid_t)-1;
     int ret = peer_fuse_mount_owner(pidfd, mnt_id, &owner);
-    if (ret < 0) {
-        defused_error_setf(
-            err, DEFUSED_ERR_NOT_A_FUSE_MOUNT, 0, "mnt_id %llu %s (%s)",
-            (unsigned long long)mnt_id,
-            ret == -ENOENT   ? "is not in the caller's mountinfo"
-            : ret == -EINVAL ? "is not a FUSE mount with a user_id= option"
-                             : "could not be read from the caller's mountinfo",
-            strerror(-ret));
-        return ret;
+    if (ret < 0)
+        return defused_error_setf(err, DEFUSED_ERR_UNMOUNT_FAILED, -ret,
+                                  "reading mnt_id %llu in the caller's mount "
+                                  "namespace failed",
+                                  (unsigned long long)mnt_id);
+    if (ret > 0) {
+        defused_error_setf(err, DEFUSED_ERR_NOT_A_FUSE_MOUNT, 0,
+                           "mnt_id %llu is not a FUSE mount in the caller's "
+                           "mount namespace",
+                           (unsigned long long)mnt_id);
+        return -EINVAL;
     }
     if (owner != uid) {
         defused_error_setf(err, DEFUSED_ERR_NOT_ALLOWED, 0,
