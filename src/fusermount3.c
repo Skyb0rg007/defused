@@ -303,7 +303,8 @@ static int check_reply(int ret, const char *what, const char *mnt,
         fprintf(stderr,
                 !strcmp(what, "mount")
                     ? "%s: mount of %s not allowed by the defused service\n"
-                    : "%s: not allowed to unmount %s: not mounted by you\n",
+                    : "%s: not allowed to unmount %s: not mounted by you, or "
+                      "refused by the defused service's policy\n",
                 progname, mnt);
         break;
     case DEFUSED_ERR_NOT_A_FUSE_MOUNT:
