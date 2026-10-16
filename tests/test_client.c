@@ -146,7 +146,7 @@ static void check_forwarded_fd(int comm_fd) {
  * subset of fusermount3's apart from those two. */
 #define MOUNT_OPTS                                                             \
     "ro,noexec,suid,dev,sync,dirsync,noatime,atime,large_read,"                \
-    "fsname=test\\,fs,subtype=mem\\,fs,"                                       \
+    "fsname=test\\,fs:/dir,subtype=mem\\,fs,"                                  \
     "max_read=4096,default_permissions,nonempty,x-gvfs-hide"
 static const char mount_opts[] = MOUNT_OPTS;
 static const char privileged_mount_opts[] = MOUNT_OPTS ",blkdev";
@@ -163,7 +163,7 @@ static void check_mount_request(const struct defused_request *req, int fuse_fd,
     CHECK(req->mount_flags == expected_flags);
     CHECK(req->max_read == 4096);
     CHECK(req->blksize == 0);
-    CHECK(strcmp(req->fsname, "test,fs") == 0);
+    CHECK(strcmp(req->fsname, "test,fs:/dir") == 0);
     CHECK(strcmp(req->subtype, "mem,fs") == 0);
 
     struct stat fuse_st;

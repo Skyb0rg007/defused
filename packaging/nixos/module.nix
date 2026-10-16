@@ -15,15 +15,6 @@ let
   cfg = config.services.defused;
   package = cfg.package;
 
-  # Granted and bounded alike: the service needs exactly these, and nothing
-  # it execs should be able to regain more.
-  capabilities = [
-    "CAP_DAC_READ_SEARCH"
-    "CAP_SYS_ADMIN"
-    "CAP_SYS_CHROOT"
-    "CAP_SYS_PTRACE"
-  ];
-
   # The same binary under either libfuse's helper name, unprivileged: the
   # wrapper is only here to take over the path libfuse execs.
   mkWrapper = name: {
@@ -104,7 +95,8 @@ in
         default = [ ];
         description = ''
           Additional command-line arguments passed to defused, after the
-          policy options the settings above generate.
+          policy options the settings above generate. The unit splits them
+          on whitespace, so no argument may contain any.
         '';
       };
     };
@@ -168,46 +160,17 @@ in
       '';
     };
 
-    systemd.sockets.defused = {
-      description = "defused FUSE mount service listening socket";
-      documentation = [ "https://github.com/Skyb0rg007/defused" ];
-      wantedBy = [ "sockets.target" ];
-
-      socketConfig = {
-        Accept = true;
-        ListenSequentialPacket = "/run/defused/defused.sock";
-        RuntimeDirectory = "defused";
-      };
-    };
-
+    systemd.packages = [ package ];
+    systemd.sockets.defused.wantedBy = [ "sockets.target" ];
     systemd.services."defused@" = {
-      description = "defused FUSE mount service";
-      documentation = [ "https://github.com/Skyb0rg007/defused" ];
-
-      serviceConfig = {
-        ExecStart = lib.escapeShellArgs (
-          [
-            "${package}/lib/defused/defused"
-            "--max-mounts=${toString cfg.maxMounts}"
-            "--allow-groups=${lib.concatStringsSep "," cfg.allowGroups}"
-          ]
-          ++ lib.optional cfg.allowOther "--allow-other"
-          ++ cfg.extraArgs
+      environment = {
+        DEFUSED_MAX_MOUNTS = toString cfg.maxMounts;
+        DEFUSED_ALLOW_GROUPS = lib.concatStringsSep "," cfg.allowGroups;
+        DEFUSED_EXTRA_ARGS = lib.concatStringsSep " " (
+          lib.optional cfg.allowOther "--allow-other" ++ cfg.extraArgs
         );
-        AmbientCapabilities = capabilities;
-        CapabilityBoundingSet = capabilities;
-        NoNewPrivileges = true;
-        AppArmorProfile = if config.security.apparmor.enable then "defused" else "-defused";
-
-        LockPersonality = true;
-        MemoryDenyWriteExecute = true;
-        ProtectHostname = true;
-        RemoveIPC = true;
-        RestrictAddressFamilies = [ "AF_UNIX" ];
-        RestrictRealtime = true;
-        RestrictSUIDSGID = true;
-        SystemCallArchitectures = "native";
       };
+      serviceConfig.AppArmorProfile = if config.security.apparmor.enable then "defused" else "-defused";
     };
   };
 }

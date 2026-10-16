@@ -36,6 +36,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+/* NS_GET_USERNS. */
+#include <linux/nsfs.h>
+
 #ifndef DEFUSED_VERSION
 #define DEFUSED_VERSION "unknown"
 #endif
@@ -73,13 +76,31 @@ static bool raise_cap_sys_admin(void) {
     return syscall(SYS_capset, &hdr, caps) == 0;
 }
 
+/* True unless shown otherwise: NS_GET_USERNS answers EPERM when the mount
+ * namespace's owner is an ancestor of this user namespace. */
+static bool owns_mount_namespace(void) {
+    _cleanup_close_ int mnt_ns =
+        open("/proc/self/ns/mnt", O_RDONLY | O_CLOEXEC);
+    if (mnt_ns < 0)
+        return true;
+    _cleanup_close_ int owner = sys_ioctl(mnt_ns, NS_GET_USERNS, NULL);
+    if (owner < 0)
+        return errno != EPERM;
+    struct stat owner_st, self_st;
+    if (fstat(owner, &owner_st) == -1 ||
+        stat("/proc/self/ns/user", &self_st) == -1)
+        return true;
+    return owner_st.st_dev == self_st.st_dev &&
+           owner_st.st_ino == self_st.st_ino;
+}
+
 static bool caller_is_privileged(void) {
 #ifdef DEFUSED_TEST
     const char *forced_uid = getenv("DEFUSED_TEST_UID");
     if (forced_uid != NULL)
         return strcmp(forced_uid, "0") == 0;
 #endif
-    return geteuid() == 0 || raise_cap_sys_admin();
+    return owns_mount_namespace() && raise_cap_sys_admin();
 }
 
 /*** Mount options ***/
@@ -168,7 +189,7 @@ static void parse_mount_opts(const char *opts, struct defused_request *req) {
 
         if (opt_starts(s, "fsname="))
             copy_name(req->fsname, sizeof(req->fsname), "fsname", s + 7,
-                      len - 7, privileged);
+                      len - 7, true);
         else if (opt_starts(s, "subtype="))
             copy_name(req->subtype, sizeof(req->subtype), "subtype", s + 8,
                       len - 8, false);
@@ -282,7 +303,8 @@ static int check_reply(int ret, const char *what, const char *mnt,
         fprintf(stderr,
                 !strcmp(what, "mount")
                     ? "%s: mount of %s not allowed by the defused service\n"
-                    : "%s: not allowed to unmount %s: not mounted by you\n",
+                    : "%s: not allowed to unmount %s: not mounted by you, or "
+                      "refused by the defused service's policy\n",
                 progname, mnt);
         break;
     case DEFUSED_ERR_NOT_A_FUSE_MOUNT:
@@ -354,7 +376,7 @@ static int send_fd(int sock, int fd) {
     memcpy(CMSG_DATA(c), &fd, sizeof(int));
     ssize_t n;
     do
-        n = sendmsg(sock, &msg, 0);
+        n = sendmsg(sock, &msg, MSG_NOSIGNAL);
     while (n == -1 && errno == EINTR);
     if (n != 1) {
         fprintf(stderr, "%s: sending the FUSE fd to the caller failed: %s\n",
@@ -364,10 +386,10 @@ static int send_fd(int sock, int fd) {
     return 0;
 }
 
-/* *req is left as the request, for auto_unmount to recognize the mount
- * by. */
+/* *req and *out_mnt_id (0 if unknown) are left for auto_unmount to
+ * recognize the mount by. */
 static int do_mount(const char *mnt, const char *opts, int cfd,
-                    struct defused_request *req) {
+                    struct defused_request *req, uint64_t *out_mnt_id) {
     *req = (struct defused_request){.magic = DEFUSED_MAGIC,
                                     .op = DEFUSED_OP_MOUNT};
     parse_mount_opts(opts, req);
@@ -388,6 +410,8 @@ static int do_mount(const char *mnt, const char *opts, int cfd,
                           "mount", mnt, &err);
     if (ret < 0)
         return ret;
+    if (defused_mnt_id(AT_FDCWD, mnt, out_mnt_id) < 0)
+        *out_mnt_id = 0;
 
     ret = send_fd(cfd, fuse_fd);
     if (ret < 0) {
@@ -428,15 +452,18 @@ static int close_inherited_fds(int cfd) {
 }
 
 /* libfuse's should_auto_unmount(): mnt must still be a mount of the type
- * mounted says -- of any type after --auto-unmount, which mounted nothing
- * and passes NULL -- and its server must be gone, which open() reports as
- * ENOTCONN, or as ECONNABORTED once the connection was aborted. */
+ * mounted says, with mnt_id mounted_id unless that is 0 -- of any type
+ * after --auto-unmount, which mounted nothing and passes NULL -- and its
+ * server must be gone, which open() reports as ENOTCONN, or as
+ * ECONNABORTED once the connection was aborted. */
 static bool should_auto_unmount(const char *mnt,
-                                const struct defused_request *mounted) {
+                                const struct defused_request *mounted,
+                                uint64_t mounted_id) {
     uint64_t mnt_id;
     bool blkdev = false;
     if (mounted != NULL &&
         (defused_mnt_id(AT_FDCWD, mnt, &mnt_id) < 0 ||
+         (mounted_id != 0 && mnt_id != mounted_id) ||
          defused_is_fuse_mount(0, mnt_id, &blkdev, mounted->subtype, NULL) !=
              1 ||
          blkdev != !!(mounted->mount_flags & DEFUSED_MOUNT_BLKDEV)))
@@ -454,7 +481,8 @@ static bool should_auto_unmount(const char *mnt,
  * FUSE server exits -- seen as EOF on the communication socket -- and lazily
  * unmounts the filesystem if it is still the one mounted describes. */
 static int wait_and_auto_unmount(int cfd, const char *mnt,
-                                 const struct defused_request *mounted) {
+                                 const struct defused_request *mounted,
+                                 uint64_t mounted_id) {
     int ret = close_inherited_fds(cfd);
     if (ret < 0)
         return ret;
@@ -472,7 +500,7 @@ static int wait_and_auto_unmount(int cfd, const char *mnt,
     while (n > 0 || (n < 0 && errno == EINTR));
 
     quiet = true;
-    if (!should_auto_unmount(mnt, mounted))
+    if (!should_auto_unmount(mnt, mounted, mounted_id))
         return 0;
     return do_unmount(mnt, true);
 }
@@ -601,14 +629,15 @@ int main(int argc, char *argv[]) {
         die("file descriptor %ld is not a socket", cfd);
 
     struct defused_request req;
+    uint64_t mnt_id = 0;
     if (!auto_unmount_only) {
-        if (do_mount(mnt, opts, (int)cfd, &req) < 0)
+        if (do_mount(mnt, opts, (int)cfd, &req, &mnt_id) < 0)
             return EXIT_FAILURE;
         if (!auto_unmount)
             return EXIT_SUCCESS;
     }
-    return wait_and_auto_unmount((int)cfd, mnt,
-                                 auto_unmount_only ? NULL : &req) < 0
+    return wait_and_auto_unmount((int)cfd, mnt, auto_unmount_only ? NULL : &req,
+                                 mnt_id) < 0
                ? EXIT_FAILURE
                : EXIT_SUCCESS;
 }

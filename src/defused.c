@@ -6,8 +6,8 @@
  * The defused system service that mounts/unmounts FUSE filesystems on
  * behalf of unprivileged users.
  *
- * Every caller it serves is unprivileged: root and CAP_SYS_ADMIN callers
- * mount from fusermount3 itself, so nothing here skips the policy.
+ * Every caller it serves is unprivileged: callers with CAP_SYS_ADMIN mount
+ * from fusermount3 itself, so nothing here skips the policy.
  *
  * By default it handles the one connection systemd's Accept=yes socket
  * activation hands it, then exits. With --daemon it listens itself and
@@ -49,8 +49,11 @@
 #include <linux/mount.h>
 
 #define DEFAULT_MAX_MOUNTS 100
-/* A backstop for --daemon, like systemd's MaxConnections=. */
+/* Backstops for --daemon, like systemd's MaxConnections= and
+ * MaxConnectionsPerSource=. */
 #define DAEMON_MAX_CONNECTIONS 64
+#define DAEMON_MAX_CONNECTIONS_PER_UID 16
+#define CONNECTION_TIMEOUT_SECONDS 30
 
 /* Where Accept=yes leaves the connection, per $LISTEN_PID/$LISTEN_FDS. */
 #define DEFUSED_LISTEN_FD 3
@@ -227,6 +230,13 @@ static bool fstype_allows_user_mounts(const struct statfs *fs) {
 }
 /* SPDX-SnippetEnd */
 
+/* See "Mountpoints inside another FUSE mount" in doc/protocol.md. */
+static bool in_private_fuse_mount(int fd, int sys_errno) {
+    struct statfs fs;
+    return sys_errno == EACCES && fstatfs(fd, &fs) == 0 &&
+           (unsigned long)fs.f_type == 0x65735546 /* FUSE_SUPER_MAGIC */;
+}
+
 /*** Mount ***/
 
 /* Best-effort path of an fd for log messages, as seen from this process's
@@ -305,8 +315,14 @@ static int mount_request(const struct defused_request *req, int mnt_fd,
                          struct defused_error *err) {
     struct stat st;
     int ret = defused_check_mount_request(req, false, err);
-    if (ret == 0)
+    if (ret == 0) {
         ret = defused_check_mountpoint(mnt_fd, &st, err);
+        if (ret < 0 && in_private_fuse_mount(mnt_fd, err->sys_errno))
+            return defused_error_setf(err, DEFUSED_ERR_MOUNT_FAILED, EACCES,
+                                      "the mountpoint is inside a FUSE mount "
+                                      "without allow_other, which the service "
+                                      "may not look into");
+    }
     if (ret < 0)
         return ret;
 
@@ -375,6 +391,11 @@ static int umount_request(const struct defused_request *req, int parent_fd,
                           const struct peer *peer, struct defused_error *err) {
     uint64_t mnt_id = 0;
     int ret = defused_check_umount_request(req, parent_fd, &mnt_id, err);
+    if (ret < 0 && in_private_fuse_mount(parent_fd, err->sys_errno))
+        return defused_error_setf(err, DEFUSED_ERR_UNMOUNT_FAILED, EACCES,
+                                  "the mountpoint is inside a FUSE mount "
+                                  "without allow_other, which the service "
+                                  "may not look into");
     if (ret == 0)
         ret = policy_check(peer, DEFUSED_OP_UNMOUNT, 0, err);
     if (ret < 0)
@@ -408,6 +429,8 @@ static int handle_unmount(const struct defused_request *req, int parent_fd,
  * descriptor cleanup on the way out fails with EPERM and is ignored. */
 static int handle_connection(int sock_fd) {
     _cleanup_close_ int sock = sock_fd;
+    signal(SIGALRM, SIG_DFL);
+    alarm(CONNECTION_TIMEOUT_SECONDS);
     struct defused_error err = {};
     struct defused_request req;
     int fds[DEFUSED_MAX_FDS];
@@ -436,14 +459,27 @@ static int handle_connection(int sock_fd) {
     return EXIT_SUCCESS;
 }
 
-static volatile sig_atomic_t live_children;
+static struct {
+    pid_t pid;
+    uid_t uid;
+} children[DAEMON_MAX_CONNECTIONS];
+static size_t n_children;
 
-static void sigchld_handler(int sig) {
-    (void)sig;
-    int saved_errno = errno;
-    while (waitpid(-1, NULL, WNOHANG) > 0)
-        live_children--;
-    errno = saved_errno;
+static void reap_children(void) {
+    pid_t pid;
+    while ((pid = waitpid(-1, NULL, WNOHANG)) > 0)
+        for (size_t i = 0; i < n_children; i++)
+            if (children[i].pid == pid) {
+                children[i] = children[--n_children];
+                break;
+            }
+}
+
+static size_t children_serving(uid_t uid) {
+    size_t n = 0;
+    for (size_t i = 0; i < n_children; i++)
+        n += children[i].uid == uid;
+    return n;
 }
 
 /* Mode 0666, so non-root callers can reach it. A stale socket (nothing
@@ -488,29 +524,38 @@ static int run_daemon(void) {
     if (listen_fd < 0)
         return listen_fd;
 
-    /* SA_RESTART: accept4() only sees EINTR from other signals. */
-    struct sigaction sa = {.sa_handler = sigchld_handler,
-                           .sa_flags = SA_RESTART};
-    sigemptyset(&sa.sa_mask);
-    if (sigaction(SIGCHLD, &sa, NULL) == -1)
-        return log_error(-errno, "sigaction(SIGCHLD)");
+    /* Not an inherited SIG_IGN, which reaps before waitpid() can. */
+    if (signal(SIGCHLD, SIG_DFL) == SIG_ERR)
+        return log_error(-errno, "signal(SIGCHLD)");
 
     for (;;) {
         _cleanup_close_ int conn = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
         if (conn == -1) {
-            if (errno == EINTR)
+            int ret = -errno;
+            if (ret == -EINTR)
                 continue;
-            log_error(-errno, "accept4");
-            if (errno == EMFILE || errno == ENFILE || errno == ECONNABORTED)
+            log_error(ret, "accept4");
+            if (ret == -EMFILE || ret == -ENFILE || ret == -ECONNABORTED)
                 continue; /* transient */
-            return -errno;
+            return ret;
         }
-        /* Past the cap: closed, so the client fails fast. */
-        if (live_children >= DAEMON_MAX_CONNECTIONS) {
+        reap_children();
+        struct ucred cred;
+        socklen_t len = sizeof(cred);
+        if (getsockopt(conn, SOL_SOCKET, SO_PEERCRED, &cred, &len) == -1) {
+            log_error(-errno, "SO_PEERCRED on a new connection");
+            continue;
+        }
+        /* Past a cap: closed, so the client fails fast. */
+        size_t serving = children_serving(cred.uid);
+        if (n_children >= DAEMON_MAX_CONNECTIONS ||
+            serving >= DAEMON_MAX_CONNECTIONS_PER_UID) {
             fprintf(stderr,
-                    "defused: refusing connection: %d already being handled "
-                    "(max %d)\n",
-                    (int)live_children, DAEMON_MAX_CONNECTIONS);
+                    "defused: refusing a connection from uid %u: %zu "
+                    "already being handled, %zu of them for that uid "
+                    "(max %d, %d per uid)\n",
+                    (unsigned)cred.uid, n_children, serving,
+                    DAEMON_MAX_CONNECTIONS, DAEMON_MAX_CONNECTIONS_PER_UID);
             continue;
         }
         pid_t pid = fork();
@@ -522,7 +567,9 @@ static int run_daemon(void) {
             listen_fd = safe_close(listen_fd);
             _exit(handle_connection(TAKE_FD(conn)));
         }
-        live_children++;
+        children[n_children].pid = pid;
+        children[n_children].uid = cred.uid;
+        n_children++;
     }
 }
 

@@ -36,9 +36,9 @@ common.mkTest {
     };
 
   script =
-    { nodes, ... }:
     let
-      socketPath = nodes.machine.systemd.sockets.defused.socketConfig.ListenSequentialPacket;
+      # ListenSequentialPacket= in packaging/systemd/defused.socket.
+      socketPath = "/run/defused/defused.sock";
     in
     ''
       boot(machine)

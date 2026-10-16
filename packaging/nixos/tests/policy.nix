@@ -55,10 +55,10 @@ common.mkTest {
 
     with subtest("the unit carries the policy options"):
         restricted.succeed(
-            "systemctl cat defused@.service | grep -F -- '--allow-groups=fusers'"
+            "systemctl cat defused@.service | grep -F 'DEFUSED_ALLOW_GROUPS=fusers'"
         )
         allowOther.succeed(
-            "systemctl cat defused@.service | grep -F -- '--allow-other'"
+            "systemctl cat defused@.service | grep -F 'DEFUSED_EXTRA_ARGS=--allow-other'"
         )
 
     with subtest("a member of --allow-groups mounts and unmounts"):

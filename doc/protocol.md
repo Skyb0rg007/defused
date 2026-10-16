@@ -36,6 +36,17 @@ It must be started as root.
 A connection lasts for exactly one request and one reply; the service exits
 after answering.
 
+A connection is bounded in time and number, so no one user can starve the
+others:
+
+- A connection still open 30 seconds after it was accepted is killed, whether
+  the client never sent its request or a FUSE server never answered the
+  service.
+- The socket unit sets `MaxConnectionsPerSource=16`, which systemd counts per
+  peer uid on an `AF_UNIX` socket, under its default `MaxConnections=64`.
+  `--daemon` enforces the same two limits itself, and closes a connection over
+  either one without an answer.
+
 ## Messages
 
 Both messages are fixed-size and use native endian encoding.
@@ -153,16 +164,16 @@ reference would make a non-lazy unmount fail with `EBUSY`.
 
 ## Privileged callers
 
-A `fusermount3` caller that is root or holds `CAP_SYS_ADMIN` does not contact
-the defused socket.
+A `fusermount3` caller that holds `CAP_SYS_ADMIN` over its mount namespace
+(one whose user namespace owns that mount namespace) does not contact the
+defused socket.
 It already has the privilege to perform the mount itself, so it will call
 `defused_perform()` directly to do the work in its own process.
 By doing so, it also skips all of the policy checks.
 
 The privileged code path also accepts `DEFUSED_MOUNT_ALLOW_SUID` (`suid`),
 `DEFUSED_MOUNT_ALLOW_DEV` (`dev`) and `DEFUSED_MOUNT_BLKDEV` (`blkdev`: a
-`fuseblk` mount whose `fsname` is the block device path, so it may contain
-slashes here)
+`fuseblk` mount whose `fsname` is the block device path).
 Those options are unsafe to let unprivileged users set, so the service responds
 with `DEFUSED_ERR_BAD_OPTION` to all three.
 
@@ -218,6 +229,22 @@ The sandboxed process re-checks the fd-relative lookup right before
 The kernel refuses to rename a mountpoint, or over one, within the
 caller's mount namespace, so what remains is a window of two syscalls in which
 only the mount table itself could change under the same directory entry.
+
+## Mountpoints inside another FUSE mount
+
+The kernel only lets a FUSE mount's own user look inside it, unless it was
+mounted with `allow_other`.
+It checks the real, effective and saved uids and gids alike, so the root
+service is refused (`EACCES`) whenever it would `fstat()` a mountpoint, or look
+up an unmount target, inside another user's FUSE mount without `allow_other`.
+libfuse's setuid `fusermount3` runs with an effective uid of 0 and is refused
+in the same way.
+
+So mounting or unmounting on a path inside another FUSE mount through the
+service needs that outer mount to use `allow_other`.
+Otherwise the service answers `DEFUSED_ERR_MOUNT_FAILED` or
+`DEFUSED_ERR_UNMOUNT_FAILED` with `EACCES`, and logs the reason.
+A privileged caller, which mounts from `fusermount3` itself, is not affected.
 
 ## The mount policy
 

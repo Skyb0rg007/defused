@@ -33,9 +33,6 @@
 #define _ASM_GENERIC_FCNTL_H
 #include <linux/fcntl.h>
 
-#define DEFUSED_MOVE_MOUNT_FLAGS                                               \
-    (MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH)
-
 const char *defused_mount_flags_str(uint32_t flags, char *buf, size_t size) {
     static const char *const names[] = {
         "ro",          "dev",
@@ -119,22 +116,19 @@ int defused_is_fuse_mount(uint64_t mnt_ns_id, uint64_t mnt_id, bool *out_blkdev,
     return ret < 0 ? ret : 1;
 }
 
-/* struct file_handle ends in a flexible array member, so it cannot be
- * embedded. The same layout, at the largest size. */
-struct mount_handle {
-    unsigned int handle_bytes;
-    int handle_type;
-    unsigned char f_handle[MAX_HANDLE_SZ];
-};
-
-int defused_mnt_id(int dir_fd, const char *name, uint64_t *out_id) {
+int defused_mnt_id_into(int dir_fd, const char *name,
+                        struct defused_handle *handle, uint64_t *out_id) {
     /* Unlike statx(), never calls getattr() -- see doc/protocol.md. */
-    struct mount_handle handle = {.handle_bytes = MAX_HANDLE_SZ};
-    if (sys_name_to_handle_at(dir_fd, name, &handle, out_id,
-                              AT_EMPTY_PATH | AT_HANDLE_FID |
-                                  AT_HANDLE_MNT_ID_UNIQUE) == -1)
+    handle->handle_bytes = MAX_HANDLE_SZ;
+    if (sys_name_to_handle_at(dir_fd, name, handle, out_id,
+                              DEFUSED_HANDLE_FLAGS) == -1)
         return -errno;
     return 0;
+}
+
+int defused_mnt_id(int dir_fd, const char *name, uint64_t *out_id) {
+    struct defused_handle handle;
+    return defused_mnt_id_into(dir_fd, name, &handle, out_id);
 }
 
 int defused_check_mount_request(const struct defused_request *req,
@@ -145,24 +139,18 @@ int defused_check_mount_request(const struct defused_request *req,
     uint32_t allowed = DEFUSED_MOUNT_FLAGS_MASK;
     if (!allow_privileged)
         allowed &= ~(uint32_t)DEFUSED_MOUNT_PRIVILEGED_FLAGS;
-    if (req->mount_flags & ~allowed) {
+    uint32_t rejected = req->mount_flags & ~allowed;
+    if (rejected) {
         char flags[160];
-        defused_error_setf(err, DEFUSED_ERR_BAD_OPTION, 0,
-                           "mount flags %s are not available here (%s)",
-                           defused_mount_flags_str(req->mount_flags & ~allowed,
-                                                   flags, sizeof(flags)),
-                           req->mount_flags & DEFUSED_MOUNT_PRIVILEGED_FLAGS
-                               ? "privileged flags need a privileged caller"
-                               : "unknown flag bits");
+        defused_error_setf(
+            err, DEFUSED_ERR_BAD_OPTION, 0,
+            "mount flags %s are not available here (%s)",
+            defused_mount_flags_str(rejected, flags, sizeof(flags)),
+            rejected & DEFUSED_MOUNT_PRIVILEGED_FLAGS
+                ? "privileged flags need a privileged caller"
+                : "unknown flag bits");
         return -EINVAL;
     }
-    /* Only blkdev's fsname names a device path, so only it may have a
-     * slash. */
-    if (!allow_privileged && strchr(req->fsname, '/'))
-        return defused_error_setf(err, DEFUSED_ERR_MALFORMED, EINVAL,
-                                  "fsname \"%s\" contains '/' and the caller "
-                                  "is not privileged",
-                                  req->fsname);
     if (strchr(req->subtype, '/'))
         return defused_error_setf(err, DEFUSED_ERR_MALFORMED, EINVAL,
                                   "subtype \"%s\" contains '/'", req->subtype);
