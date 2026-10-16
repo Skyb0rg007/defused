@@ -42,6 +42,10 @@ others:
 - A connection still open 30 seconds after it was accepted is killed, whether
   the client never sent its request or a FUSE server never answered the
   service.
+- The socket unit sets `MaxConnectionsPerSource=16`, which systemd counts per
+  peer uid on an `AF_UNIX` socket, under its default `MaxConnections=64`.
+  `--daemon` enforces the same two limits itself, and closes a connection over
+  either one without an answer.
 
 ## Messages
 

@@ -49,8 +49,10 @@
 #include <linux/mount.h>
 
 #define DEFAULT_MAX_MOUNTS 100
-/* A backstop for --daemon, like systemd's MaxConnections=. */
+/* Backstops for --daemon, like systemd's MaxConnections= and
+ * MaxConnectionsPerSource=. */
 #define DAEMON_MAX_CONNECTIONS 64
+#define DAEMON_MAX_CONNECTIONS_PER_UID 16
 #define CONNECTION_TIMEOUT_SECONDS 30
 
 /* Where Accept=yes leaves the connection, per $LISTEN_PID/$LISTEN_FDS. */
@@ -439,17 +441,27 @@ static int handle_connection(int sock_fd) {
     return EXIT_SUCCESS;
 }
 
-static pid_t children[DAEMON_MAX_CONNECTIONS];
+static struct {
+    pid_t pid;
+    uid_t uid;
+} children[DAEMON_MAX_CONNECTIONS];
 static size_t n_children;
 
 static void reap_children(void) {
     pid_t pid;
     while ((pid = waitpid(-1, NULL, WNOHANG)) > 0)
         for (size_t i = 0; i < n_children; i++)
-            if (children[i] == pid) {
+            if (children[i].pid == pid) {
                 children[i] = children[--n_children];
                 break;
             }
+}
+
+static size_t children_serving(uid_t uid) {
+    size_t n = 0;
+    for (size_t i = 0; i < n_children; i++)
+        n += children[i].uid == uid;
+    return n;
 }
 
 /* Mode 0666, so non-root callers can reach it. A stale socket (nothing
@@ -510,12 +522,22 @@ static int run_daemon(void) {
             return ret;
         }
         reap_children();
-        /* Past the cap: closed, so the client fails fast. */
-        if (n_children >= DAEMON_MAX_CONNECTIONS) {
+        struct ucred cred;
+        socklen_t len = sizeof(cred);
+        if (getsockopt(conn, SOL_SOCKET, SO_PEERCRED, &cred, &len) == -1) {
+            log_error(-errno, "SO_PEERCRED on a new connection");
+            continue;
+        }
+        /* Past a cap: closed, so the client fails fast. */
+        size_t serving = children_serving(cred.uid);
+        if (n_children >= DAEMON_MAX_CONNECTIONS ||
+            serving >= DAEMON_MAX_CONNECTIONS_PER_UID) {
             fprintf(stderr,
-                    "defused: refusing connection: %zu already being handled "
-                    "(max %d)\n",
-                    n_children, DAEMON_MAX_CONNECTIONS);
+                    "defused: refusing a connection from uid %u: %zu "
+                    "already being handled, %zu of them for that uid "
+                    "(max %d, %d per uid)\n",
+                    (unsigned)cred.uid, n_children, serving,
+                    DAEMON_MAX_CONNECTIONS, DAEMON_MAX_CONNECTIONS_PER_UID);
             continue;
         }
         pid_t pid = fork();
@@ -527,7 +549,9 @@ static int run_daemon(void) {
             listen_fd = safe_close(listen_fd);
             _exit(handle_connection(TAKE_FD(conn)));
         }
-        children[n_children++] = pid;
+        children[n_children].pid = pid;
+        children[n_children].uid = cred.uid;
+        n_children++;
     }
 }
 

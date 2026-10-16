@@ -460,10 +460,9 @@ static int test_daemon_missing_socket_dir(const char *defused_path) {
     return 0;
 }
 
-/* Must match DAEMON_MAX_CONNECTIONS in src/defused.c: the number of
- * concurrent connections test_daemon_connection_cap() needs to open to pin
- * run_daemon()'s count at the cap. */
-#define TEST_DAEMON_MAX_CONNECTIONS 64
+/* Must match DAEMON_MAX_CONNECTIONS_PER_UID in src/defused.c: every
+ * connection here comes from one uid. */
+#define TEST_DAEMON_MAX_CONNECTIONS 16
 
 /* The connections test_daemon_connection_cap() holds open, closed together
  * when the batch goes out of scope. */

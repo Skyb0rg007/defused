@@ -10,6 +10,8 @@ Documentation=https://github.com/Skyb0rg007/defused
 Accept=yes
 ListenSequentialPacket=/run/defused/defused.sock
 RuntimeDirectory=defused
+# Per uid on an AF_UNIX socket.
+MaxConnectionsPerSource=16
 
 [Install]
 WantedBy=sockets.target
