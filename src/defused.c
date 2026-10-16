@@ -498,12 +498,13 @@ static int run_daemon(void) {
     for (;;) {
         _cleanup_close_ int conn = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
         if (conn == -1) {
-            if (errno == EINTR)
+            int ret = -errno;
+            if (ret == -EINTR)
                 continue;
-            log_error(-errno, "accept4");
-            if (errno == EMFILE || errno == ENFILE || errno == ECONNABORTED)
+            log_error(ret, "accept4");
+            if (ret == -EMFILE || ret == -ENFILE || ret == -ECONNABORTED)
                 continue; /* transient */
-            return -errno;
+            return ret;
         }
         /* Past the cap: closed, so the client fails fast. */
         if (live_children >= DAEMON_MAX_CONNECTIONS) {
