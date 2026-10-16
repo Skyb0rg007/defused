@@ -40,28 +40,10 @@
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(scmp_filter_ctx, seccomp_release);
 
-/* AT_EMPTY_PATH asks about a directory fd itself. Without
- * AT_SYMLINK_FOLLOW a final symlink is never followed. */
-#define SANDBOX_HANDLE_FLAGS                                                   \
-    (AT_EMPTY_PATH | AT_HANDLE_FID | AT_HANDLE_MNT_ID_UNIQUE)
-#define SANDBOX_MOVE_MOUNT_FLAGS                                               \
-    (MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH)
-
-/* struct file_handle ends in a flexible array member, so it cannot be a
- * member of anything else. The same layout, at the largest size. */
-struct sandbox_handle {
-    unsigned int handle_bytes;
-    int handle_type;
-    unsigned char f_handle[MAX_HANDLE_SZ];
-};
-_Static_assert(offsetof(struct sandbox_handle, f_handle) ==
-                   sizeof(struct file_handle),
-               "struct sandbox_handle must match struct file_handle");
-
 /* The writable pinned memory, kept out of the strings' mapping so that one
  * can stay read-only. */
 struct sandbox_buf {
-    struct sandbox_handle handle;
+    struct defused_handle handle;
     uint64_t mnt_id;
 };
 
@@ -80,10 +62,9 @@ struct sandbox_strings {
  * encodes on any filesystem; buf is the pinned scratch. */
 static int sandbox_mnt_id(int dir_fd, const char *name, struct sandbox_buf *buf,
                           uint64_t *out_id) {
-    buf->handle.handle_bytes = MAX_HANDLE_SZ;
-    if (sys_name_to_handle_at(dir_fd, name, &buf->handle, &buf->mnt_id,
-                              SANDBOX_HANDLE_FLAGS) == -1)
-        return -errno;
+    int ret = defused_mnt_id_into(dir_fd, name, &buf->handle, &buf->mnt_id);
+    if (ret < 0)
+        return ret;
     *out_id = buf->mnt_id;
     return 0;
 }
@@ -149,13 +130,13 @@ static int install_seccomp(const struct sandbox_job *job) {
          DEFUSED_OP_MOUNT,
          5,
          {ARG(0, job->mountfd), ARG(1, job->path), ARG(2, job->mnt_fd),
-          ARG(3, job->path), ARG(4, SANDBOX_MOVE_MOUNT_FLAGS)}},
+          ARG(3, job->path), ARG(4, DEFUSED_MOVE_MOUNT_FLAGS)}},
         {SCMP_SYS(fchdir), DEFUSED_OP_UNMOUNT, 1, {ARG(0, job->parent_fd)}},
         {SCMP_SYS(name_to_handle_at),
          DEFUSED_OP_UNMOUNT,
          5,
          {ARG(0, job->parent_fd), ARG(1, job->path), ARG(2, &buf->handle),
-          ARG(3, &buf->mnt_id), ARG(4, SANDBOX_HANDLE_FLAGS)}},
+          ARG(3, &buf->mnt_id), ARG(4, DEFUSED_HANDLE_FLAGS)}},
         {SCMP_SYS(umount2),
          DEFUSED_OP_UNMOUNT,
          2,
@@ -265,7 +246,7 @@ static int peer_fuse_mount_owner(int pidfd, uint64_t mnt_id, uid_t *out_uid) {
 static int sandbox_do_mount(const struct sandbox_job *job,
                             struct defused_error *err) {
     if (sys_move_mount(job->mountfd, job->path, job->mnt_fd, job->path,
-                       SANDBOX_MOVE_MOUNT_FLAGS) == -1)
+                       DEFUSED_MOVE_MOUNT_FLAGS) == -1)
         return defused_error_setf(err, DEFUSED_ERR_MOUNT_FAILED, errno,
                                   "move_mount() onto the mountpoint in the "
                                   "client's mount namespace failed");

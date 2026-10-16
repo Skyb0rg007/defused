@@ -13,9 +13,30 @@
 
 #include "defused-proto.h"
 
+#include <fcntl.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+
+/* These expand to <linux/fcntl.h>'s and <linux/mount.h>'s constants, which
+ * the user includes. AT_EMPTY_PATH asks about a directory fd itself;
+ * without AT_SYMLINK_FOLLOW a final symlink is never followed. */
+#define DEFUSED_HANDLE_FLAGS                                                   \
+    (AT_EMPTY_PATH | AT_HANDLE_FID | AT_HANDLE_MNT_ID_UNIQUE)
+#define DEFUSED_MOVE_MOUNT_FLAGS                                               \
+    (MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH)
+
+/* struct file_handle ends in a flexible array member, so it cannot be a
+ * member of anything else. The same layout, at the largest size. */
+struct defused_handle {
+    unsigned int handle_bytes;
+    int handle_type;
+    unsigned char f_handle[MAX_HANDLE_SZ];
+};
+_Static_assert(offsetof(struct defused_handle, f_handle) ==
+                   sizeof(struct file_handle),
+               "struct defused_handle must match struct file_handle");
 
 /* "ro,allow_other"; unknown bits are appended in hex. */
 const char *defused_mount_flags_str(uint32_t flags, char *buf, size_t size);
@@ -31,6 +52,9 @@ int defused_is_fuse_mount(uint64_t mnt_ns_id, uint64_t mnt_id, bool *out_blkdev,
 /* The 64-bit mount id, which the kernel never reuses. From the VFS, so it
  * works even when the FUSE server is dead. */
 int defused_mnt_id(int dir_fd, const char *name, uint64_t *out_id);
+/* The same, into the caller's buffers. */
+int defused_mnt_id_into(int dir_fd, const char *name,
+                        struct defused_handle *handle, uint64_t *out_id);
 
 /* allow_privileged lets suid/dev/blkdev through. */
 int defused_check_mount_request(const struct defused_request *req,
