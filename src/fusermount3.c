@@ -375,7 +375,7 @@ static int send_fd(int sock, int fd) {
     memcpy(CMSG_DATA(c), &fd, sizeof(int));
     ssize_t n;
     do
-        n = sendmsg(sock, &msg, 0);
+        n = sendmsg(sock, &msg, MSG_NOSIGNAL);
     while (n == -1 && errno == EINTR);
     if (n != 1) {
         fprintf(stderr, "%s: sending the FUSE fd to the caller failed: %s\n",
