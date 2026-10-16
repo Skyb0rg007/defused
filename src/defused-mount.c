@@ -156,13 +156,6 @@ int defused_check_mount_request(const struct defused_request *req,
                                : "unknown flag bits");
         return -EINVAL;
     }
-    /* Only blkdev's fsname names a device path, so only it may have a
-     * slash. */
-    if (!allow_privileged && strchr(req->fsname, '/'))
-        return defused_error_setf(err, DEFUSED_ERR_MALFORMED, EINVAL,
-                                  "fsname \"%s\" contains '/' and the caller "
-                                  "is not privileged",
-                                  req->fsname);
     if (strchr(req->subtype, '/'))
         return defused_error_setf(err, DEFUSED_ERR_MALFORMED, EINVAL,
                                   "subtype \"%s\" contains '/'", req->subtype);

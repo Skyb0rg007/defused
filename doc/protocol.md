@@ -161,8 +161,7 @@ By doing so, it also skips all of the policy checks.
 
 The privileged code path also accepts `DEFUSED_MOUNT_ALLOW_SUID` (`suid`),
 `DEFUSED_MOUNT_ALLOW_DEV` (`dev`) and `DEFUSED_MOUNT_BLKDEV` (`blkdev`: a
-`fuseblk` mount whose `fsname` is the block device path, so it may contain
-slashes here)
+`fuseblk` mount whose `fsname` is the block device path).
 Those options are unsafe to let unprivileged users set, so the service responds
 with `DEFUSED_ERR_BAD_OPTION` to all three.
 

@@ -32,8 +32,7 @@ int defused_is_fuse_mount(uint64_t mnt_ns_id, uint64_t mnt_id, bool *out_blkdev,
  * works even when the FUSE server is dead. */
 int defused_mnt_id(int dir_fd, const char *name, uint64_t *out_id);
 
-/* allow_privileged lets suid/dev/blkdev through, and with them an fsname
- * that may name a block device path. */
+/* allow_privileged lets suid/dev/blkdev through. */
 int defused_check_mount_request(const struct defused_request *req,
                                 bool allow_privileged,
                                 struct defused_error *err);

@@ -168,7 +168,7 @@ static void parse_mount_opts(const char *opts, struct defused_request *req) {
 
         if (opt_starts(s, "fsname="))
             copy_name(req->fsname, sizeof(req->fsname), "fsname", s + 7,
-                      len - 7, privileged);
+                      len - 7, true);
         else if (opt_starts(s, "subtype="))
             copy_name(req->subtype, sizeof(req->subtype), "subtype", s + 8,
                       len - 8, false);
