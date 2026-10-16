@@ -36,6 +36,13 @@ It must be started as root.
 A connection lasts for exactly one request and one reply; the service exits
 after answering.
 
+A connection is bounded in time and number, so no one user can starve the
+others:
+
+- A connection still open 30 seconds after it was accepted is killed, whether
+  the client never sent its request or a FUSE server never answered the
+  service.
+
 ## Messages
 
 Both messages are fixed-size and use native endian encoding.

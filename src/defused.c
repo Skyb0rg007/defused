@@ -51,6 +51,7 @@
 #define DEFAULT_MAX_MOUNTS 100
 /* A backstop for --daemon, like systemd's MaxConnections=. */
 #define DAEMON_MAX_CONNECTIONS 64
+#define CONNECTION_TIMEOUT_SECONDS 30
 
 /* Where Accept=yes leaves the connection, per $LISTEN_PID/$LISTEN_FDS. */
 #define DEFUSED_LISTEN_FD 3
@@ -408,6 +409,8 @@ static int handle_unmount(const struct defused_request *req, int parent_fd,
  * descriptor cleanup on the way out fails with EPERM and is ignored. */
 static int handle_connection(int sock_fd) {
     _cleanup_close_ int sock = sock_fd;
+    signal(SIGALRM, SIG_DFL);
+    alarm(CONNECTION_TIMEOUT_SECONDS);
     struct defused_error err = {};
     struct defused_request req;
     int fds[DEFUSED_MAX_FDS];
