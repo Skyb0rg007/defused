@@ -398,7 +398,7 @@ static int run_daemon_mount_req(const char *sock_path,
 
 /* Two requests back-to-back against a --daemon instance: one alone would
  * not show that it keeps accepting after handling a connection, and not
- * pausing between them exercises the live_children cap without
+ * pausing between them exercises the connection cap without
  * tripping it. */
 static int test_daemon_mode(const char *defused_path) {
     _cleanup_(daemon_scratch_done) struct daemon_scratch scratch = {};
@@ -462,7 +462,7 @@ static int test_daemon_missing_socket_dir(const char *defused_path) {
 
 /* Must match DAEMON_MAX_CONNECTIONS in src/defused.c: the number of
  * concurrent connections test_daemon_connection_cap() needs to open to pin
- * run_daemon()'s live_children count at the cap. */
+ * run_daemon()'s count at the cap. */
 #define TEST_DAEMON_MAX_CONNECTIONS 64
 
 /* The connections test_daemon_connection_cap() holds open, closed together

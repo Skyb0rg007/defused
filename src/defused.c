@@ -439,14 +439,17 @@ static int handle_connection(int sock_fd) {
     return EXIT_SUCCESS;
 }
 
-static volatile sig_atomic_t live_children;
+static pid_t children[DAEMON_MAX_CONNECTIONS];
+static size_t n_children;
 
-static void sigchld_handler(int sig) {
-    (void)sig;
-    int saved_errno = errno;
-    while (waitpid(-1, NULL, WNOHANG) > 0)
-        live_children--;
-    errno = saved_errno;
+static void reap_children(void) {
+    pid_t pid;
+    while ((pid = waitpid(-1, NULL, WNOHANG)) > 0)
+        for (size_t i = 0; i < n_children; i++)
+            if (children[i] == pid) {
+                children[i] = children[--n_children];
+                break;
+            }
 }
 
 /* Mode 0666, so non-root callers can reach it. A stale socket (nothing
@@ -491,12 +494,9 @@ static int run_daemon(void) {
     if (listen_fd < 0)
         return listen_fd;
 
-    /* SA_RESTART: accept4() only sees EINTR from other signals. */
-    struct sigaction sa = {.sa_handler = sigchld_handler,
-                           .sa_flags = SA_RESTART};
-    sigemptyset(&sa.sa_mask);
-    if (sigaction(SIGCHLD, &sa, NULL) == -1)
-        return log_error(-errno, "sigaction(SIGCHLD)");
+    /* Not an inherited SIG_IGN, which reaps before waitpid() can. */
+    if (signal(SIGCHLD, SIG_DFL) == SIG_ERR)
+        return log_error(-errno, "signal(SIGCHLD)");
 
     for (;;) {
         _cleanup_close_ int conn = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
@@ -509,12 +509,13 @@ static int run_daemon(void) {
                 continue; /* transient */
             return ret;
         }
+        reap_children();
         /* Past the cap: closed, so the client fails fast. */
-        if (live_children >= DAEMON_MAX_CONNECTIONS) {
+        if (n_children >= DAEMON_MAX_CONNECTIONS) {
             fprintf(stderr,
-                    "defused: refusing connection: %d already being handled "
+                    "defused: refusing connection: %zu already being handled "
                     "(max %d)\n",
-                    (int)live_children, DAEMON_MAX_CONNECTIONS);
+                    n_children, DAEMON_MAX_CONNECTIONS);
             continue;
         }
         pid_t pid = fork();
@@ -526,7 +527,7 @@ static int run_daemon(void) {
             listen_fd = safe_close(listen_fd);
             _exit(handle_connection(TAKE_FD(conn)));
         }
-        live_children++;
+        children[n_children++] = pid;
     }
 }
 
