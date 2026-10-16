@@ -230,6 +230,13 @@ static bool fstype_allows_user_mounts(const struct statfs *fs) {
 }
 /* SPDX-SnippetEnd */
 
+/* See "Mountpoints inside another FUSE mount" in doc/protocol.md. */
+static bool in_private_fuse_mount(int fd, int sys_errno) {
+    struct statfs fs;
+    return sys_errno == EACCES && fstatfs(fd, &fs) == 0 &&
+           (unsigned long)fs.f_type == 0x65735546 /* FUSE_SUPER_MAGIC */;
+}
+
 /*** Mount ***/
 
 /* Best-effort path of an fd for log messages, as seen from this process's
@@ -308,8 +315,14 @@ static int mount_request(const struct defused_request *req, int mnt_fd,
                          struct defused_error *err) {
     struct stat st;
     int ret = defused_check_mount_request(req, false, err);
-    if (ret == 0)
+    if (ret == 0) {
         ret = defused_check_mountpoint(mnt_fd, &st, err);
+        if (ret < 0 && in_private_fuse_mount(mnt_fd, err->sys_errno))
+            return defused_error_setf(err, DEFUSED_ERR_MOUNT_FAILED, EACCES,
+                                      "the mountpoint is inside a FUSE mount "
+                                      "without allow_other, which the service "
+                                      "may not look into");
+    }
     if (ret < 0)
         return ret;
 
@@ -378,6 +391,11 @@ static int umount_request(const struct defused_request *req, int parent_fd,
                           const struct peer *peer, struct defused_error *err) {
     uint64_t mnt_id = 0;
     int ret = defused_check_umount_request(req, parent_fd, &mnt_id, err);
+    if (ret < 0 && in_private_fuse_mount(parent_fd, err->sys_errno))
+        return defused_error_setf(err, DEFUSED_ERR_UNMOUNT_FAILED, EACCES,
+                                  "the mountpoint is inside a FUSE mount "
+                                  "without allow_other, which the service "
+                                  "may not look into");
     if (ret == 0)
         ret = policy_check(peer, DEFUSED_OP_UNMOUNT, 0, err);
     if (ret < 0)

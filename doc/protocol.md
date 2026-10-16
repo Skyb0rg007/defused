@@ -230,6 +230,22 @@ The kernel refuses to rename a mountpoint, or over one, within the
 caller's mount namespace, so what remains is a window of two syscalls in which
 only the mount table itself could change under the same directory entry.
 
+## Mountpoints inside another FUSE mount
+
+The kernel only lets a FUSE mount's own user look inside it, unless it was
+mounted with `allow_other`.
+It checks the real, effective and saved uids and gids alike, so the root
+service is refused (`EACCES`) whenever it would `fstat()` a mountpoint, or look
+up an unmount target, inside another user's FUSE mount without `allow_other`.
+libfuse's setuid `fusermount3` runs with an effective uid of 0 and is refused
+in the same way.
+
+So mounting or unmounting on a path inside another FUSE mount through the
+service needs that outer mount to use `allow_other`.
+Otherwise the service answers `DEFUSED_ERR_MOUNT_FAILED` or
+`DEFUSED_ERR_UNMOUNT_FAILED` with `EACCES`, and logs the reason.
+A privileged caller, which mounts from `fusermount3` itself, is not affected.
+
 ## The mount policy
 
 Because defused runs as a system service, it is unable to use process-specific
