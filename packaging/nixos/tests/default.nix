@@ -11,8 +11,8 @@
 let
   inherit (pkgs) lib;
 
-  # Every test runs on both, so the service's kernel-version fallbacks are
-  # taken for real: PIDFD_GET_INFO (6.13), socket inode xattrs (7.0).
+  # Every test runs on both, so the oldest supported kernel and a current
+  # one are each exercised for real.
   kernels = [
     pkgs.linuxPackages_6_12
     pkgs.linuxPackages_7_2

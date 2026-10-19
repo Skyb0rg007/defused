@@ -21,9 +21,7 @@ profile defused flags=(attach_disconnected) {
   # on the client, whatever that client's own label is.
   ptrace (read),
 
-  /proc/@{pid}/fdinfo/* r,
-
-  # An fd on /proc/<pid>/ns/mnt is an nsfs file with no path of its own, so
+  # PIDFD_GET_MNT_NAMESPACE opens an nsfs file with no path of its own, so
   # attach_disconnected reports it as "/", which /** does not match.
   / r,
 

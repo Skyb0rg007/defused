@@ -15,12 +15,9 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <limits.h>
-#include <poll.h>
 #include <sched.h>
 #include <seccomp.h>
 #include <stddef.h>
-#include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
@@ -32,7 +29,7 @@
 #include <linux/mount.h>
 #include <linux/nsfs.h>
 
-/* AT_HANDLE_FID, AT_HANDLE_MNT_ID_UNIQUE, PIDFD_GET_INFO */
+/* AT_HANDLE_FID, AT_HANDLE_MNT_ID_UNIQUE, PIDFD_GET_MNT_NAMESPACE */
 #define _ASM_GENERIC_FCNTL_H
 #include <linux/fcntl.h>
 #include <linux/pidfd.h>
@@ -136,74 +133,15 @@ static int install_seccomp(const struct sandbox_job *job) {
     return seccomp_load(ctx);
 }
 
-/* Linux 6.13+. ENODATA, not EINVAL, for a useless reply: EINVAL means the
- * kernel lacks the ioctl. */
-static pid_t pidfd_to_pid_ioctl(int pidfd) {
-    struct pidfd_info info = {0};
-    if (sys_ioctl(pidfd, PIDFD_GET_INFO, &info) == -1)
-        return -errno;
-    if (!(info.mask & PIDFD_INFO_PID) || info.pid == 0 ||
-        info.pid > (unsigned int)INT_MAX)
-        return -ENODATA;
-    return (pid_t)info.pid;
-}
-
-/* A "Pid:" of -1 (not visible from this pid namespace) or 0 (exited) means
- * there is no process to look up. */
-static pid_t fdinfo_pid(FILE *f) {
-    char line[256];
-    while (fgets(line, sizeof(line), f)) {
-        if (strncmp(line, "Pid:", 4) != 0)
-            continue;
-        char *end;
-        errno = 0;
-        long pid = strtol(line + 4, &end, 10);
-        if (end == line + 4 || errno != 0 || pid > INT_MAX ||
-            (*end != '\n' && *end != '\0'))
-            return -EINVAL;
-        return pid > 0 ? (pid_t)pid : -ESRCH;
-    }
-    return -ENODATA;
-}
-
-/* Kernels before 6.13 fail PIDFD_GET_INFO with ENOTTY (no pidfd_ioctl()) or
- * EINVAL (6.11/6.12 reject any ioctl with an argument).
- * The fallback, Linux 5.2+'s fdinfo "Pid:", is reported in the reader's pid
- * namespace, the one /proc/<pid>/mountinfo is opened from. */
-static pid_t pidfd_to_pid(int pidfd) {
-    pid_t pid = pidfd_to_pid_ioctl(pidfd);
-    if (pid != -ENOTTY && pid != -EINVAL)
-        return pid;
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", pidfd);
-    _cleanup_fclose_ FILE *f = fopen(path, "re");
-    return f ? fdinfo_pid(f) : -errno;
-}
-
-/* A pidfd polls readable once its process has exited. */
-static int pidfd_alive(int pidfd) {
-    struct pollfd pfd = {.fd = pidfd, .events = POLLIN};
-    int n;
-    do
-        n = poll(&pfd, 1, 0);
-    while (n == -1 && errno == EINTR);
-    return n == -1 ? -errno : n == 0 ? 0 : -ESRCH;
-}
-
-/* By id, not by fd: an fd of 0 in mnt_id_req silently means "my own". */
+/* By id, not by fd: an fd of 0 in mnt_id_req silently means "my own".
+ * PIDFD_GET_MNT_NAMESPACE (Linux 6.11+) makes the same PTRACE_MODE_READ
+ * check as opening /proc/<pid>/ns/mnt, without going through a pid that
+ * could have been recycled, and fails with ESRCH once the process has
+ * exited. */
 int defused_peer_mnt_ns_id(int pidfd, uint64_t *out_id) {
-    pid_t pid = pidfd_to_pid(pidfd);
-    if (pid < 0)
-        return (int)pid;
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/ns/mnt", (int)pid);
-    _cleanup_close_ int ns_fd = open(path, O_RDONLY | O_CLOEXEC);
+    _cleanup_close_ int ns_fd = sys_ioctl(pidfd, PIDFD_GET_MNT_NAMESPACE, NULL);
     if (ns_fd < 0)
         return -errno;
-    /* Checked after the open(): the pid wasn't recycled to another task. */
-    int ret = pidfd_alive(pidfd);
-    if (ret < 0)
-        return ret;
     return sys_ioctl(ns_fd, NS_GET_MNTNS_ID, out_id) == -1 ? -errno : 0;
 }
 
@@ -347,10 +285,5 @@ const void *defused_test_handle_buf(const struct sandbox_job *job) {
 
 const void *defused_test_handle_id(const struct sandbox_job *job) {
     return &job->buf->mnt_id;
-}
-
-pid_t defused_test_fdinfo_pid(const char *text) {
-    _cleanup_fclose_ FILE *f = fmemopen((void *)text, strlen(text), "r");
-    return f ? fdinfo_pid(f) : -errno;
 }
 #endif

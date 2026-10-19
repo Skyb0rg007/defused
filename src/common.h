@@ -47,9 +47,6 @@ static inline void close_pairp(int (*p)[2]) {
 static inline void freep(void *p) { free(*(void **)p); }
 #define _cleanup_free_ _cleanup_(freep)
 
-DEFINE_TRIVIAL_CLEANUP_FUNC(FILE *, fclose);
-#define _cleanup_fclose_ _cleanup_(fclosep)
-
 static inline int take_fd(int *fd) {
     int r = *fd;
     *fd = -EBADF;

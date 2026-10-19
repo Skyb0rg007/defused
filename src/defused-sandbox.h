@@ -49,7 +49,6 @@ int defused_test_install_seccomp(const struct sandbox_job *job);
 /* The buffers pinning handed the filter: the handle and the mount id. */
 const void *defused_test_handle_buf(const struct sandbox_job *job);
 const void *defused_test_handle_id(const struct sandbox_job *job);
-pid_t defused_test_fdinfo_pid(const char *text);
 #endif
 
 #endif /* DEFUSED_SANDBOX_H */

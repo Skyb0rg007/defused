@@ -326,20 +326,6 @@ static void test_mount_opts_parser(void) {
           -EINVAL);
 }
 
-static void test_fdinfo_pid(void) {
-    CHECK(
-        defused_test_fdinfo_pid("pos:\t0\nflags:\t02\nmnt_id:\t14\nino:\t1234\n"
-                                "Pid:\t4242\nNSpid:\t4242\t1\n") == 4242);
-    CHECK(defused_test_fdinfo_pid("Pid:\t7") == 7);
-    CHECK(defused_test_fdinfo_pid("pos:\t0\nNSpid:\t1\nPPid:\t1\n") ==
-          -ENODATA);
-    CHECK(defused_test_fdinfo_pid("Pid:\t-1\nNSpid:\t-1\n") == -ESRCH);
-    CHECK(defused_test_fdinfo_pid("Pid:\t0\n") == -ESRCH);
-    CHECK(defused_test_fdinfo_pid("Pid:\t\n") == -EINVAL);
-    CHECK(defused_test_fdinfo_pid("Pid:\t2147483648\n") == -EINVAL);
-    CHECK(defused_test_fdinfo_pid("Pid:\t4242 junk\n") == -EINVAL);
-}
-
 /* Probes in a child, so the filter never lands on the test process. One
  * that fails to build is never loaded, so the child can report why. */
 static int seccomp_available(void) {
@@ -387,6 +373,5 @@ int main(void) {
 
     test_filter();
     test_mount_opts_parser();
-    test_fdinfo_pid();
     return failures ? 1 : 0;
 }
