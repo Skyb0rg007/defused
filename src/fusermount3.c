@@ -20,7 +20,6 @@
 #include <getopt.h>
 #include <libgen.h>
 #include <limits.h>
-#include <linux/capability.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -28,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/auxv.h>
+#include <sys/capability.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -41,6 +41,8 @@
 #ifndef DEFUSED_VERSION
 #define DEFUSED_VERSION "unknown"
 #endif
+
+DEFINE_TRIVIAL_CLEANUP_FUNC(cap_t, cap_free);
 
 static const char *progname = "fusermount3";
 static bool quiet, auto_unmount, privileged;
@@ -59,19 +61,19 @@ die(const char *fmt, ...) {
 /* If we can gain CAP_SYS_ADMIN, then we can perform the FUSE mount without
  * going through defused */
 static bool raise_cap_sys_admin(void) {
-    struct __user_cap_header_struct hdr = {
-        .version = _LINUX_CAPABILITY_VERSION_3, .pid = 0};
-    struct __user_cap_data_struct caps[2] = {0};
-    if (sys_capget(&hdr, caps) == -1)
+    const cap_value_t sys_admin = CAP_SYS_ADMIN;
+    cap_flag_value_t effective, permitted;
+    _cleanup_(cap_freep) cap_t caps = cap_get_proc();
+    if (caps == NULL ||
+        cap_get_flag(caps, sys_admin, CAP_EFFECTIVE, &effective) == -1 ||
+        cap_get_flag(caps, sys_admin, CAP_PERMITTED, &permitted) == -1)
         return false;
-    const unsigned idx = CAP_TO_INDEX(CAP_SYS_ADMIN);
-    const uint32_t bit = CAP_TO_MASK(CAP_SYS_ADMIN);
-    if (caps[idx].effective & bit)
+    if (effective == CAP_SET)
         return true;
-    if (!(caps[idx].permitted & bit))
+    if (permitted != CAP_SET)
         return false;
-    caps[idx].effective |= bit;
-    return sys_capset(&hdr, caps) == 0;
+    return cap_set_flag(caps, CAP_EFFECTIVE, 1, &sys_admin, CAP_SET) == 0 &&
+           cap_set_proc(caps) == 0;
 }
 
 /* True unless shown otherwise: NS_GET_USERNS answers EPERM when the mount

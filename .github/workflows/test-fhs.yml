@@ -38,6 +38,7 @@ jobs:
             gcc \
             git \
             libc6-dev \
+            libcap-dev \
             libseccomp-dev \
             meson \
             ninja-build \

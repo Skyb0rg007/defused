@@ -11,6 +11,7 @@ project(
 )
 
 seccomp_dep = dependency('libseccomp')
+libcap_dep = dependency('libcap')
 
 # Not $libdir: the AppArmor profile hard-codes this path.
 defused_install_dir = get_option('prefix') / 'lib/defused'
@@ -47,6 +48,7 @@ fusermount3_exe = executable(
   'src/fusermount3.c',
   defused_mount_sources,
   c_args : fusermount3_c_args,
+  dependencies : [libcap_dep],
   install : true,
 )
 
@@ -109,6 +111,7 @@ test_fusermount3_exe = executable(
     '-DDEFUSED_TEST',
     '-DDEFUSED_VERSION="@0@"'.format(meson.project_version()),
   ],
+  dependencies : [libcap_dep],
 )
 
 # The shared request handling, driven directly: the privileged path has no

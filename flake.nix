@@ -56,6 +56,7 @@
             pkgs.pkg-config
           ];
           buildInputs = [
+            pkgs.libcap
             pkgs.libseccomp
             pkgs.linuxHeaders
           ];

@@ -39,7 +39,7 @@ by a process outside the unprivileged process tree, bypassing the
 
 Defused requires Linux 6.12 or later as it uses [`name_to_handle_at()`](https://man7.org/linux/man-pages/man2/open_by_handle_at.2.html)'s
 `AT_HANDLE_MNT_ID_UNIQUE` argument to obtain a unique mount id.
-It also depends on libseccomp.
+It also depends on libseccomp and libcap.
 
 ## Project structure
 

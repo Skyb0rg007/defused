@@ -19,8 +19,6 @@
 
 /* struct mnt_id_req, which musl does not declare. */
 #include <linux/mount.h>
-/* struct __user_cap_header_struct, struct __user_cap_data_struct */
-#include <linux/capability.h>
 
 static inline int sys_setns(int fd, int nstype) {
     return (int)syscall(SYS_setns, (long)fd, (long)nstype);
@@ -89,16 +87,6 @@ static inline int sys_fsmount(int fd, unsigned int flags,
 static inline int sys_close_range(unsigned int first, unsigned int last,
                                   unsigned int flags) {
     return (int)syscall(SYS_close_range, (long)first, (long)last, (long)flags);
-}
-
-static inline int sys_capget(struct __user_cap_header_struct *hdrp,
-                             struct __user_cap_data_struct *datap) {
-    return (int)syscall(SYS_capget, hdrp, datap);
-}
-
-static inline int sys_capset(struct __user_cap_header_struct *hdrp,
-                             const struct __user_cap_data_struct *datap) {
-    return (int)syscall(SYS_capset, hdrp, datap);
 }
 
 #endif /* DEFUSED_SYSCALL_H */
