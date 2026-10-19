@@ -3,10 +3,7 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * Putting a message on the wire and taking it off again: a
- * sendmsg()/recvmsg() pair plus the SCM_RIGHTS bookkeeping, and a plain
- * sendto() for the reply. Nothing here inspects a request beyond checking
- * that it is one.
+ * Implements the wire protocol.
  */
 #define _GNU_SOURCE
 #include "defused-proto.h"
@@ -50,7 +47,7 @@ union control_buf {
 static int send_msg(int sock, const void *msg, size_t size, const int *fds,
                     size_t n_fds) {
     struct iovec iov = {.iov_base = (void *)msg, .iov_len = size};
-    union control_buf control = {};
+    union control_buf control = {0};
     struct msghdr mh = {.msg_iov = &iov, .msg_iovlen = 1};
     if (n_fds > 0) {
         mh.msg_control = control.bytes;
@@ -67,14 +64,12 @@ static int send_msg(int sock, const void *msg, size_t size, const int *fds,
     while (n < 0 && errno == EINTR);
     if (n < 0)
         return -errno;
-    /* Seqpacket delivers a message whole or not at all. */
+    /* SEQPACKET delivers a message whole or not at all. */
     return n == (ssize_t)size ? 0 : -EIO;
 }
 
-/* *n_fds is the room in fds going in and the count coming out; on any
- * error it is 0 and nothing is left open. fds needs DEFUSED_MAX_FDS
- * entries whatever the caller expects, so surplus descriptors can be seen
- * and closed rather than leaked. */
+/* *n_fds is the capacity of fds on input and the count on return.
+ * On any error it is 0 and all fds are closed. */
 static int recv_msg(int sock, void *msg, size_t size, int *fds, size_t *n_fds) {
     struct iovec iov = {.iov_base = msg, .iov_len = size};
     union control_buf control;
@@ -182,6 +177,6 @@ int defused_send_reply(int sock, const struct defused_error *err) {
     while (n < 0 && errno == EINTR);
     if (n < 0)
         return -errno;
-    /* Seqpacket delivers a message whole or not at all. */
+    /* SEQPACKET delivers a message whole or not at all. */
     return n == (ssize_t)sizeof(reply) ? 0 : -EIO;
 }

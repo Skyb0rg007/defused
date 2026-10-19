@@ -3,12 +3,11 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * Drop-in replacement for libfuse's setuid-root fusermount3, implemented as
- * an unprivileged client of the defused service. The same binary is also
- * installed as libfuse2's `fusermount`, whose command line is a subset.
+ * Replacement for libfuse's setuid-root fusermount3. This binary also
+ * supports libfuse2's fusermount interface.
  *
- * libfuse hands over a socket via _FUSE_COMMFD (or --comm-fd); after the
- * mount, the opened /dev/fuse fd is sent back over it with SCM_RIGHTS.
+ * libfuse passes a socket via _FUSE_COMMFD or --comm-fd. After the mount,
+ * the opened /dev/fuse fd is sent back over it with SCM_RIGHTS.
  */
 #define _GNU_SOURCE
 #include "common.h"
@@ -57,14 +56,13 @@ die(const char *fmt, ...) {
     exit(EXIT_FAILURE);
 }
 
-/* CAP_SYS_ADMIN in the effective set, raised from permitted if it is
- * only there. Nothing has to survive an execve() any more, so the
- * ambient set is left alone. */
+/* If we can gain CAP_SYS_ADMIN, then we can perform the FUSE mount without
+ * going through defused */
 static bool raise_cap_sys_admin(void) {
     struct __user_cap_header_struct hdr = {
         .version = _LINUX_CAPABILITY_VERSION_3, .pid = 0};
-    struct __user_cap_data_struct caps[2] = {};
-    if (syscall(SYS_capget, &hdr, caps) == -1)
+    struct __user_cap_data_struct caps[2] = {0};
+    if (sys_capget(&hdr, caps) == -1)
         return false;
     const unsigned idx = CAP_TO_INDEX(CAP_SYS_ADMIN);
     const uint32_t bit = CAP_TO_MASK(CAP_SYS_ADMIN);
@@ -73,7 +71,7 @@ static bool raise_cap_sys_admin(void) {
     if (!(caps[idx].permitted & bit))
         return false;
     caps[idx].effective |= bit;
-    return syscall(SYS_capset, &hdr, caps) == 0;
+    return sys_capset(&hdr, caps) == 0;
 }
 
 /* True unless shown otherwise: NS_GET_USERNS answers EPERM when the mount
@@ -247,10 +245,7 @@ static int connect_socket(const char *path) {
     return TAKE_FD(fd);
 }
 
-/* A privileged caller performs the request here -- it holds the
- * privilege and is already in the right mount namespace -- and everyone
- * else sends it to the service. Both fill *err the same way, so only
- * this function knows the difference. */
+/* Perform the request in-process, or connect to the defused service. */
 static int submit(const struct defused_request *req, const int *fds,
                   struct defused_error *err) {
     if (privileged)
@@ -405,7 +400,7 @@ static int do_mount(const char *mnt, const char *opts, int cfd,
         die("failed to open %s: %s", dev, strerror(errno));
 
     struct defused_error err;
-    /* The order the protocol fixes: /dev/fuse, then the mountpoint. */
+    /* /dev/fuse, then the mountpoint. See doc/protocol.md. */
     int ret = check_reply(submit(req, (const int[]){fuse_fd, mnt_fd}, &err),
                           "mount", mnt, &err);
     if (ret < 0)
@@ -425,9 +420,9 @@ static int do_mount(const char *mnt, const char *opts, int cfd,
 
 /*** auto_unmount ***/
 
-/* Closes every inherited fd but cfd and points stdio at /dev/null: this
- * process lingers for the FUSE server's lifetime and must not hold anything
- * else open. */
+/* Closes every inherited fd but cfd and points stdio at /dev/null.
+ * This process lingers for the FUSE server's lifetime and must not hold
+ * anything else open. */
 static int close_inherited_fds(int cfd) {
     if (cfd <= STDERR_FILENO)
         return -EINVAL; /* We can't even report an error */

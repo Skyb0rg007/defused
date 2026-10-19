@@ -10,14 +10,11 @@ Documentation=https://github.com/Skyb0rg007/defused
 # Override with a drop-in; see `defused --help`.
 Environment=DEFUSED_MAX_MOUNTS=100
 Environment=DEFUSED_ALLOW_GROUPS=
-# Split on whitespace, so it can carry flag-only options like
-# --allow-other; see `defused --help`.
 Environment=DEFUSED_EXTRA_ARGS=
 ExecStart=@DEFUSED_PATH@ --max-mounts=${DEFUSED_MAX_MOUNTS} --allow-groups=${DEFUSED_ALLOW_GROUPS} $DEFUSED_EXTRA_ARGS
 AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SYS_PTRACE
 CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SYS_PTRACE
 NoNewPrivileges=yes
-# Drop the "-" where AppArmor is known to be enabled, to fail closed.
 AppArmorProfile=-defused
 
 LockPersonality=yes

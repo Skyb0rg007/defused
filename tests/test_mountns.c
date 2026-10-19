@@ -110,7 +110,7 @@ static int scratch_mount_create(struct scratch_mount *m) {
 static int send_non_fuse_umount_request(int sock_fd,
                                         struct defused_error *err) {
     _cleanup_close_ int sock = sock_fd;
-    _cleanup_(scratch_mount_done) struct scratch_mount scratch = {};
+    _cleanup_(scratch_mount_done) struct scratch_mount scratch = {0};
     int ret = scratch_mount_create(&scratch);
     if (ret < 0)
         return ret;

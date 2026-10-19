@@ -216,7 +216,7 @@ static void test_perform(const char *dir) {
 int main(void) {
     test_set_timeout();
 
-    _cleanup_(scratch_done) struct scratch scratch = {};
+    _cleanup_(scratch_done) struct scratch scratch = {0};
     if (scratch_create(&scratch) < 0)
         return 1;
 

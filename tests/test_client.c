@@ -214,7 +214,7 @@ static int serve_connection(int conn_fd) {
     _cleanup_close_ int fd0 = fds[0];
     _cleanup_close_ int fd1 = n_fds > 1 ? fds[1] : -EBADF;
 
-    struct defused_error err = {};
+    struct defused_error err = {0};
     if (req.op == DEFUSED_OP_MOUNT) {
         check_mount_request(&req, fd0, fd1);
     } else {

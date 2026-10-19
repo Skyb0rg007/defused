@@ -6,10 +6,7 @@
  * The defused system service that mounts/unmounts FUSE filesystems on
  * behalf of unprivileged users.
  *
- * Every caller it serves is unprivileged: callers with CAP_SYS_ADMIN mount
- * from fusermount3 itself, so nothing here skips the policy.
- *
- * By default it handles the one connection systemd's Accept=yes socket
+ * By default it handles the one connection that systemd's Accept=yes socket
  * activation hands it, then exits. With --daemon it listens itself and
  * forks a child per connection.
  */
@@ -40,22 +37,17 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-/* The kernel's own constants: SO_PEERGROUPS and SO_PEERPIDFD, and the new
- * mount API's FSOPEN_*, FSCONFIG_*, MOUNT_ATTR_* and MOVE_MOUNT_*. musl
- * declares none of them, and both libcs tolerate these alongside their own
- * headers. The mount API is used by syscall number: glibc only grew
- * wrappers in 2.36 and musl has none. */
+/* SO_PEERGROUPS, SO_PEERPIDFD */
 #include <asm/socket.h>
+/* FSOPEN_*, FSCONFIG_*, MOUNT_ATTR_*, MOVE_MOUNT_* */
 #include <linux/mount.h>
 
 #define DEFAULT_MAX_MOUNTS 100
-/* Backstops for --daemon, like systemd's MaxConnections= and
- * MaxConnectionsPerSource=. */
+/* Limits for --daemon mode */
 #define DAEMON_MAX_CONNECTIONS 64
 #define DAEMON_MAX_CONNECTIONS_PER_UID 16
 #define CONNECTION_TIMEOUT_SECONDS 30
 
-/* Where Accept=yes leaves the connection, per $LISTEN_PID/$LISTEN_FDS. */
 #define DEFUSED_LISTEN_FD 3
 
 static bool cfg_daemon, cfg_allow_other;
@@ -431,7 +423,7 @@ static int handle_connection(int sock_fd) {
     _cleanup_close_ int sock = sock_fd;
     signal(SIGALRM, SIG_DFL);
     alarm(CONNECTION_TIMEOUT_SECONDS);
-    struct defused_error err = {};
+    struct defused_error err = {0};
     struct defused_request req;
     int fds[DEFUSED_MAX_FDS];
     size_t n_fds = 0;
@@ -685,9 +677,7 @@ static int parse_args(int argc, char *argv[]) {
     return 0;
 }
 
-/* The $LISTEN_PID/$LISTEN_FDS handover, all this ever needed of
- * sd_listen_fds(3): one connected socket of our type, or a negative
- * errno. */
+/* Inherits the socket passed through socket activation */
 static int inherited_connection(void) {
     const char *pid = getenv("LISTEN_PID"), *count = getenv("LISTEN_FDS");
     long value;

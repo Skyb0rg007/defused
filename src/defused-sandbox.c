@@ -3,8 +3,9 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * Joining a client's mount namespace under a seccomp allowlist, and the
- * unmount ownership check that gates it.
+ * Implements a strict seccomp sandbox.
+ * Entering into an untrusted mount namespace as root is extremely risky,
+ * so we make sure to first lockdown the process with seccomp.
  */
 #define _GNU_SOURCE
 #include "defused-sandbox.h"
@@ -24,16 +25,14 @@
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
-#include <sys/syscall.h>
 #include <unistd.h>
 
-/* MOVE_MOUNT_*, struct mnt_id_req, struct statmount, NS_GET_MNTNS_ID:
- * musl declares none of them. */
+/* MOVE_MOUNT_*, struct mnt_id_req, struct statmount, NS_GET_MNTNS_ID
+ * Needed for musl */
 #include <linux/mount.h>
 #include <linux/nsfs.h>
 
-/* AT_HANDLE_FID, AT_HANDLE_MNT_ID_UNIQUE and PIDFD_GET_INFO. The define
- * skips <asm-generic/fcntl.h>, which would clash with <fcntl.h> above. */
+/* AT_HANDLE_FID, AT_HANDLE_MNT_ID_UNIQUE, PIDFD_GET_INFO */
 #define _ASM_GENERIC_FCNTL_H
 #include <linux/fcntl.h>
 #include <linux/pidfd.h>
@@ -47,31 +46,16 @@ struct sandbox_buf {
     uint64_t mnt_id;
 };
 
-/* move_mount()'s empty path: one const object, so it sits in .rodata at a
- * fixed address and the filter rule and the call site cannot differ. */
+/* A fixed-address empty string for use in seccomp filters */
 static const char sandbox_empty[] = "";
 
-/* The read-only mapping a request-supplied path needs; sandbox_empty
- * needs none. */
+/* Will hold the unmount path, to be marked read-only by mprotect. */
 struct sandbox_strings {
     char path[DEFUSED_MAX_FILENAME];
 };
 
-/* statx() would call fuse_getattr(), which refuses a non-empty request
- * from anyone but the mount's user_id, root included. AT_HANDLE_FID
- * encodes on any filesystem; buf is the pinned scratch. */
-static int sandbox_mnt_id(int dir_fd, const char *name, struct sandbox_buf *buf,
-                          uint64_t *out_id) {
-    int ret = defused_mnt_id_into(dir_fd, name, &buf->handle, &buf->mnt_id);
-    if (ret < 0)
-        return ret;
-    *out_id = buf->mnt_id;
-    return 0;
-}
-
 /* Maps the path read-only and the scratch writable, at the addresses
- * install_seccomp() pins. mprotect() is not allowed, so the path cannot be
- * rewritten once the filter is up. */
+ * install_seccomp() pins. */
 static int pin_job_memory(struct sandbox_job *job) {
     if (job->path != sandbox_empty) {
         struct sandbox_strings *s =
@@ -99,12 +83,7 @@ static int pin_job_memory(struct sandbox_job *job) {
 
 #define ARG(n, v) {(n), SCMP_CMP_EQ, (scmp_datum_t)(long)(v), 0}
 
-/* The filter is here to keep libc away from the client's filesystem, so
- * what it scrutinizes is anything that names a file: a rule for such a
- * call pins every argument, and the call cannot be aimed elsewhere.
- * A call that only acts on a descriptor already opened needs no such
- * care, so the reply and the log line are pinned by descriptor alone,
- * whatever buffer libc hands them. Anything else is EPERM. */
+/* This filter keeps libc away from the client's filesystem. */
 static int install_seccomp(const struct sandbox_job *job) {
     const struct sandbox_buf *buf = job->buf;
     const struct {
@@ -142,7 +121,6 @@ static int install_seccomp(const struct sandbox_job *job) {
          2,
          {ARG(0, job->path), ARG(1, job->umount_flags)}},
     };
-    /* The kernel keeps its own copy of a loaded filter. */
     _cleanup_(seccomp_releasep) scmp_filter_ctx ctx =
         seccomp_init(SCMP_ACT_ERRNO(EPERM));
     if (!ctx)
@@ -189,9 +167,9 @@ static pid_t fdinfo_pid(FILE *f) {
 }
 
 /* Kernels before 6.13 fail PIDFD_GET_INFO with ENOTTY (no pidfd_ioctl()) or
- * EINVAL (6.11/6.12 reject any ioctl with an argument). The fallback, Linux
- * 5.2+'s fdinfo "Pid:", is reported in the reader's pid namespace, the one
- * /proc/<pid>/mountinfo is opened from. */
+ * EINVAL (6.11/6.12 reject any ioctl with an argument).
+ * The fallback, Linux 5.2+'s fdinfo "Pid:", is reported in the reader's pid
+ * namespace, the one /proc/<pid>/mountinfo is opened from. */
 static pid_t pidfd_to_pid(int pidfd) {
     pid_t pid = pidfd_to_pid_ioctl(pidfd);
     if (pid != -ENOTTY && pid != -EINVAL)
@@ -202,9 +180,7 @@ static pid_t pidfd_to_pid(int pidfd) {
     return f ? fdinfo_pid(f) : -errno;
 }
 
-/* A pidfd polls readable once its process has exited. Unlike a
- * pidfd_send_signal() probe this needs no CAP_KILL, which the hardened
- * service unit doesn't grant. */
+/* A pidfd polls readable once its process has exited. */
 static int pidfd_alive(int pidfd) {
     struct pollfd pfd = {.fd = pidfd, .events = POLLIN};
     int n;
@@ -231,9 +207,8 @@ int defused_peer_mnt_ns_id(int pidfd, uint64_t *out_id) {
     return sys_ioctl(ns_fd, NS_GET_MNTNS_ID, out_id) == -1 ? -errno : 0;
 }
 
-/* statmount() is told which namespace to look in, so this needs neither
- * the filter nor setns(). 0 with *out_uid set, 1 if mnt_id is no FUSE
- * mount in the peer's namespace, or a negative errno. */
+/* statmount() takes a mount namespace parameter, so it can be called before
+ * setns() and thus before the seccomp filter is installed. */
 static int peer_fuse_mount_owner(int pidfd, uint64_t mnt_id, uid_t *out_uid) {
     uint64_t ns_id;
     int ret = defused_peer_mnt_ns_id(pidfd, &ns_id);
@@ -262,15 +237,15 @@ static int sandbox_do_unmount(const struct sandbox_job *job,
         return defused_error_setf(err, DEFUSED_ERR_UNMOUNT_FAILED, errno,
                                   "fchdir() to the parent directory in the "
                                   "client's mount namespace failed");
-    /* name must still be the mount the parent authorized.
-     * name_to_handle_at() holds no reference, so it cannot make the
-     * non-lazy umount2() below fail with EBUSY. */
-    uint64_t id = 0;
-    int ret = sandbox_mnt_id(job->parent_fd, job->path, job->buf, &id);
+    /* name must still be the mount the parent authorized. The filter pins
+     * both name_to_handle_at() out-pointers to job->buf. */
+    int ret = defused_mnt_id_into(job->parent_fd, job->path, &job->buf->handle,
+                                  &job->buf->mnt_id);
     if (ret < 0)
         return defused_error_setf(err, DEFUSED_ERR_UNMOUNT_FAILED, -ret,
                                   "reading the mountpoint's mnt_id in the "
                                   "client's mount namespace failed");
+    uint64_t id = job->buf->mnt_id;
     if (id != job->mnt_id)
         return defused_error_setf(err, DEFUSED_ERR_UNMOUNT_FAILED, ESTALE,
                                   "the mountpoint changed between the "
@@ -285,9 +260,8 @@ static int sandbox_do_unmount(const struct sandbox_job *job,
     return 0;
 }
 
-/* Pins, loads the filter, joins the namespace and runs the operation, all
- * in this process. The filter stays loaded on return: the caller answers
- * the client, logs, and exits. */
+/* Pins, loads the filter, joins the namespace and runs the operation.
+ * Remember that on return the seccomp filter will still be loaded. */
 static int run_sandboxed(struct sandbox_job *job, struct defused_error *err) {
     uint32_t fail_code = job->op == DEFUSED_OP_MOUNT
                              ? DEFUSED_ERR_MOUNT_FAILED
@@ -323,9 +297,6 @@ int defused_sandbox_mount(int pidfd, int mountfd, int mnt_fd, int sock,
 int defused_sandbox_unmount(int pidfd, int parent_fd, const char *name,
                             bool lazy, uint64_t mnt_id, uid_t uid, int sock,
                             struct defused_error *err) {
-    /* Before the filter, so an unauthorized caller's namespace is never
-     * entered. GCC cannot see that owner is set whenever this returns 0,
-     * hence the initializer. */
     uid_t owner = (uid_t)-1;
     int ret = peer_fuse_mount_owner(pidfd, mnt_id, &owner);
     if (ret < 0)

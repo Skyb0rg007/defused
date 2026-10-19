@@ -57,8 +57,6 @@
           ];
           buildInputs = [
             pkgs.libseccomp
-            # <linux/mount.h> and <asm/socket.h>: the new mount API and
-            # SO_PEERPIDFD, which musl does not declare itself.
             pkgs.linuxHeaders
           ];
 

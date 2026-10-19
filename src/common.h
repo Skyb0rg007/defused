@@ -3,11 +3,7 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * Scope-based resource cleanup, after systemd's coding style: a resource is
- * released when the variable holding it goes out of scope, and ownership is
- * handed off with TAKE_FD()/TAKE_PTR() so the handler becomes a no-op.
- * File descriptors are "empty" at -EBADF (any negative value), pointers at
- * NULL.
+ * Helpers for systemd-style resource cleanup.
  */
 
 #ifndef DEFUSED_COMMON_H
@@ -22,7 +18,6 @@
 
 #define _cleanup_(x) __attribute__((__cleanup__(x)))
 
-/* Defines func##p(), a _cleanup_ handler that calls func() on non-NULL. */
 #define DEFINE_TRIVIAL_CLEANUP_FUNC(type, func)                                \
     static inline void func##p(type *p) {                                      \
         if (*p != NULL)                                                        \
@@ -30,8 +25,6 @@
     }                                                                          \
     struct defused_useless_struct_to_allow_trailing_semicolon_
 
-/* close() that is a no-op on an unset fd, preserves errno, and returns the
- * empty value so it can be used as `fd = safe_close(fd);`. */
 static inline int safe_close(int fd) {
     if (fd >= 0) {
         int saved_errno = errno;

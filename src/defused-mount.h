@@ -13,15 +13,13 @@
 
 #include "defused-proto.h"
 
+#include <assert.h>
 #include <fcntl.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
-/* These expand to <linux/fcntl.h>'s and <linux/mount.h>'s constants, which
- * the user includes. AT_EMPTY_PATH asks about a directory fd itself;
- * without AT_SYMLINK_FOLLOW a final symlink is never followed. */
 #define DEFUSED_HANDLE_FLAGS                                                   \
     (AT_EMPTY_PATH | AT_HANDLE_FID | AT_HANDLE_MNT_ID_UNIQUE)
 #define DEFUSED_MOVE_MOUNT_FLAGS                                               \
@@ -34,55 +32,54 @@ struct defused_handle {
     int handle_type;
     unsigned char f_handle[MAX_HANDLE_SZ];
 };
-_Static_assert(offsetof(struct defused_handle, f_handle) ==
-                   sizeof(struct file_handle),
-               "struct defused_handle must match struct file_handle");
+static_assert(offsetof(struct defused_handle, f_handle) ==
+                  sizeof(struct file_handle),
+              "struct defused_handle must match struct file_handle");
 
 /* "ro,allow_other"; unknown bits are appended in hex. */
 const char *defused_mount_flags_str(uint32_t flags, char *buf, size_t size);
 
-/* 1 if mnt_id names a FUSE mount in namespace mnt_ns_id (0 for the
- * caller's own), 0 for any other mount, or a negative errno. The optional
- * out_blkdev distinguishes "fuseblk"; given subtype, a mount reporting
- * another subtype counts as another mount; the optional out_uid gets
- * user_id=, and asking for it makes a FUSE mount without one an error. */
+/* Returns 1 if mnt_id names a FUSE mount in namespace mnt_ns_id (pass 0 for
+ * the caller's own mount namespace).
+ * Returns 0 for any other mount, or a negative errno.
+ * The optional out_blkdev distinguishes "fuseblk" from "fuse". */
 int defused_is_fuse_mount(uint64_t mnt_ns_id, uint64_t mnt_id, bool *out_blkdev,
                           const char *subtype, uid_t *out_uid);
 
-/* The 64-bit mount id, which the kernel never reuses. From the VFS, so it
- * works even when the FUSE server is dead. */
+/* Computes the unique mount id for the file named name in directory dir_fd.
+ * If name is "", computes the unique mount id for dir_fd. */
 int defused_mnt_id(int dir_fd, const char *name, uint64_t *out_id);
 /* The same, into the caller's buffers. */
 int defused_mnt_id_into(int dir_fd, const char *name,
                         struct defused_handle *handle, uint64_t *out_id);
 
-/* allow_privileged lets suid/dev/blkdev through. */
+/* Validates a mount request.
+ * allow_privileged lets suid/dev/blkdev through. */
 int defused_check_mount_request(const struct defused_request *req,
                                 bool allow_privileged,
                                 struct defused_error *err);
 
-/* A directory or a regular file. *out_st is for the caller's root mode
- * and, service-side, its ownership rule. */
+/* Determine if mnt_fd is a directory or regular file.
+ * Also computes the file status struct. */
 int defused_check_mountpoint(int mnt_fd, struct stat *out_st,
                              struct defused_error *err);
 
+/* Determine if dev_fd was created from open("/dev/fuse", O_RDWR) */
 int defused_check_fuse_device(int dev_fd, struct defused_error *err);
 
-/* The superblock and a detached mount of it, still to be attached with
- * move_mount(); returns the mount fd. */
+/* Returns a detached mount file descriptor */
 int defused_create_mount(const struct defused_request *req, int dev_fd,
                          mode_t rootmode, uid_t uid, gid_t gid,
                          struct defused_error *err);
 
-/* *out_mnt_id identifies the target from here on. Takes no fd on it: an
- * open reference would make a non-lazy umount2() fail with EBUSY. */
+/* Resolve the request target's unique mount id, making sure it differs from
+ * the parent. Returns the target's mount_id in *out_mnt_id. */
 int defused_check_umount_request(const struct defused_request *req,
                                  int parent_fd, uint64_t *out_mnt_id,
                                  struct defused_error *err);
 
-/* The whole request, in this process and with no policy: what fusermount3
- * does for a root or CAP_SYS_ADMIN caller. Mirrors defused_call(), down to
- * reporting in *err, so the two are interchangeable at the call site. */
+/* Performs the request without any checks.
+ * Called by fusermount3 when already privileged. */
 int defused_perform(const struct defused_request *req, const int *fds,
                     struct defused_error *err);
 

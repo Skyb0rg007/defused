@@ -401,7 +401,7 @@ static int run_daemon_mount_req(const char *sock_path,
  * pausing between them exercises the connection cap without
  * tripping it. */
 static int test_daemon_mode(const char *defused_path) {
-    _cleanup_(daemon_scratch_done) struct daemon_scratch scratch = {};
+    _cleanup_(daemon_scratch_done) struct daemon_scratch scratch = {0};
     int ret = daemon_scratch_create(&scratch);
     if (ret < 0)
         return ret;
@@ -423,7 +423,7 @@ static int test_daemon_mode(const char *defused_path) {
 /* --daemon binds inside a directory that must already exist (systemd's
  * RuntimeDirectory=); it must fail fast rather than create it or hang. */
 static int test_daemon_missing_socket_dir(const char *defused_path) {
-    _cleanup_(daemon_scratch_done) struct daemon_scratch scratch = {};
+    _cleanup_(daemon_scratch_done) struct daemon_scratch scratch = {0};
     int ret = daemon_scratch_create(&scratch);
     if (ret < 0)
         return ret;
@@ -514,7 +514,7 @@ static int open_daemon_connections(const char *sock_path,
  * backlog room), but the daemon should close it rather than fork for it,
  * and the connections under the cap should be untouched. */
 static int test_daemon_connection_cap(const char *defused_path) {
-    _cleanup_(daemon_scratch_done) struct daemon_scratch scratch = {};
+    _cleanup_(daemon_scratch_done) struct daemon_scratch scratch = {0};
     int ret = daemon_scratch_create(&scratch);
     if (ret < 0)
         return ret;
