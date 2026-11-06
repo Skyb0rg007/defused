@@ -13,8 +13,7 @@ project(
 seccomp_dep = dependency('libseccomp')
 libcap_dep = dependency('libcap')
 
-# Not $libdir: the AppArmor profile hard-codes this path.
-defused_install_dir = get_option('prefix') / 'lib/defused'
+defused_install_dir = get_option('prefix') / get_option('libexecdir')
 systemd_unit_dir = get_option('prefix') / 'lib/systemd/system'
 
 fusermount3_c_args = [

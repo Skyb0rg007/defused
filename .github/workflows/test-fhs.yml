@@ -62,7 +62,7 @@ jobs:
       - name: Start defused --daemon
         run: |
           mkdir -p /run/defused
-          setsid /usr/lib/defused/defused --daemon >/run/defused/daemon.log 2>&1 &
+          setsid /usr/libexec/defused --daemon >/run/defused/daemon.log 2>&1 &
           for _ in $(seq 50); do
             test -S /run/defused/defused.sock && break
             sleep 0.1
@@ -74,8 +74,8 @@ jobs:
       # e2e.sh created that user above.
       - name: Restart defused --daemon with a restricted policy
         run: |
-          pkill -f '^/usr/lib/defused/defused --daemon' || true
-          setsid /usr/lib/defused/defused --daemon \
+          pkill -f '^/usr/libexec/defused --daemon' || true
+          setsid /usr/libexec/defused --daemon \
             --allow-groups=defused-test --max-mounts=10 \
             >>/run/defused/daemon.log 2>&1 &
           for _ in $(seq 50); do

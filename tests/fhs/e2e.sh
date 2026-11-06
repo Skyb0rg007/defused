@@ -21,7 +21,7 @@ socket=/run/defused/defused.sock
 fusermount3=/usr/bin/fusermount3
 # libfuse2 execs this one; the same binary serves both.
 fusermount=/usr/bin/fusermount
-defused=/usr/lib/defused/defused
+defused=/usr/libexec/defused
 here=$(dirname "$0")
 
 fail() {
