@@ -11,12 +11,12 @@ common.mkTest {
     boot(machine)
 
     machine.succeed("test -S /run/defused/defused.sock")
-    machine.succeed("test -x ${common.package}/lib/defused/defused")
+    machine.succeed("test -x ${common.package}/libexec/defused")
     machine.succeed("test -x ${common.package}/bin/fusermount3")
 
     machine.succeed(
         "grep '^ExecStart=' /etc/systemd/system/defused@.service | "
-        "grep -F '${common.package}/lib/defused/defused'"
+        "grep -F '${common.package}/libexec/defused'"
     )
 
     machine.succeed(
