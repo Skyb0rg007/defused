@@ -10,6 +10,10 @@ include <tunables/global>
 profile defused flags=(attach_disconnected) {
   include <abstractions/base>
 
+  # The kernel maps the binary after the exec has entered this profile, and
+  # <abstractions/base> only grants m on shared libraries.
+  @DEFUSED_PATH@ mr,
+
   capability dac_read_search,
   capability sys_admin,
   capability sys_chroot,

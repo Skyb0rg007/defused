@@ -156,7 +156,6 @@ in
       policies.defused.path = "${package}/etc/apparmor.d/defused";
       includes."local/defused" = ''
         include "${pkgs.apparmorRulesFromClosure { name = "defused"; } [ package ]}"
-        ${package}/libexec/defused mr,
       '';
     };
 
