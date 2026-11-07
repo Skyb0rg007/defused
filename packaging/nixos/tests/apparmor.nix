@@ -73,7 +73,7 @@ common.mkTest {
           # aa-status keys processes by executable, not by profile name.
           machine.succeed(
               "${pkgs.apparmor-bin-utils}/bin/aa-status --json | "
-              f"${pkgs.jq}/bin/jq -e '.processes[\"${package}/lib/defused/defused\"][] | "
+              f"${pkgs.jq}/bin/jq -e '.processes[\"${package}/libexec/defused\"][] | "
               f"select((.pid | tostring) == \"{pid}\" "
               "and .profile == \"defused\" and .status == \"enforce\")'"
           )

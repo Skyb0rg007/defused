@@ -28,7 +28,7 @@ common.mkTest {
         wantedBy = [ "multi-user.target" ];
 
         serviceConfig = {
-          ExecStart = "${package}/lib/defused/defused --daemon";
+          ExecStart = "${package}/libexec/defused --daemon";
           RuntimeDirectory = "defused";
         };
       };
@@ -49,7 +49,7 @@ common.mkTest {
 
     machine.succeed(
         "grep '^ExecStart=' /etc/systemd/system/defused.service | "
-        "grep -F '${package}/lib/defused/defused --daemon'"
+        "grep -F '${package}/libexec/defused --daemon'"
     )
 
     # --daemon binds the socket 0666 itself, unlike systemd's Accept=yes
