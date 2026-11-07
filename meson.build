@@ -66,19 +66,26 @@ install_data(
   install_mode : 'rwxr-xr-x',
 )
 
-unit_conf = configuration_data()
-unit_conf.set('DEFUSED_PATH', defused_install_dir / 'defused')
+path_conf = configuration_data()
+path_conf.set('DEFUSED_PATH', defused_install_dir / 'defused')
 configure_file(
   input : 'packaging/systemd/defused@.service.in',
   output : 'defused@.service',
-  configuration : unit_conf,
+  configuration : path_conf,
   install : true,
   install_dir : systemd_unit_dir,
 )
 install_data('packaging/systemd/defused.socket', install_dir : systemd_unit_dir)
 
+# Not output : 'defused', which is the service binary in this directory.
+apparmor_profile = configure_file(
+  input : 'packaging/apparmor/defused.in',
+  output : 'defused.apparmor',
+  configuration : path_conf,
+)
 install_data(
-  'packaging/apparmor/defused',
+  apparmor_profile,
+  rename : 'defused',
   install_dir : get_option('sysconfdir') / 'apparmor.d',
 )
 
