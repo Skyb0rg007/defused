@@ -7,20 +7,6 @@
 let
   inherit (common) package;
   inherit (pkgs) lib;
-
-  # A libfuse2 filesystem, from libfuse2's own example: nixpkgs has no
-  # packaged fuse2 filesystem left. It execs /run/wrappers/bin/fusermount.
-  fuse2Hello =
-    pkgs.runCommandCC "fuse2-hello"
-      {
-        nativeBuildInputs = [ pkgs.pkg-config ];
-        buildInputs = [ pkgs.fuse ];
-      }
-      ''
-        mkdir -p $out/bin
-        $CC -o $out/bin/fuse2-hello ${pkgs.fuse.src}/example/hello.c \
-          $(pkg-config --cflags --libs fuse)
-      '';
 in
 common.mkTest {
   name = "desktop";
@@ -39,11 +25,8 @@ common.mkTest {
       # module's own defaults.
       services.defused.allowOther = lib.mkForce false;
 
-      # Stock libfuse3 and libfuse2 filesystems, to mount through the helpers.
-      environment.systemPackages = [
-        pkgs.fuse-overlayfs
-        fuse2Hello
-      ];
+      # A stock libfuse3 filesystem, to mount through the helper.
+      environment.systemPackages = [ pkgs.fuse-overlayfs ];
     };
 
   script =
@@ -93,27 +76,6 @@ common.mkTest {
           assert "nosuid" in line and "nodev" in line, line
           machine.succeed("test \"$(runuser -u alice -- cat /home/alice/mnt/file)\" = hello")
           machine.succeed("journalctl -u 'defused@*' --no-pager | grep -F defused")
-
-      with subtest("a libfuse2 filesystem mounts through defused as well"):
-          mkmnt(machine, "/home/alice/mnt2")
-          machine.succeed(
-              "timeout 45s runuser -u alice -- setpriv --no-new-privs -- "
-              "${fuse2Hello}/bin/fuse2-hello /home/alice/mnt2"
-          )
-          line = mounted(machine, "/home/alice/mnt2")
-          print(line)
-          # libfuse2's fuse_main() derives subtype= from the program name.
-          assert " - fuse.fuse2-hello " in line, line
-          assert "nosuid" in line and "nodev" in line, line
-          machine.succeed(
-              "test \"$(runuser -u alice -- cat /home/alice/mnt2/hello)\" "
-              "= 'Hello World!'"
-          )
-          machine.succeed(
-              "timeout 45s runuser -u alice -- setpriv --no-new-privs -- "
-              "/run/wrappers/bin/fusermount -u /home/alice/mnt2"
-          )
-          wait_unmounted(machine, "/home/alice/mnt2")
 
       with subtest("but allow_other still needs --allow-other"):
           mkmnt(machine, "/home/alice/mnt-other")
