@@ -19,6 +19,7 @@
 #define _GNU_SOURCE
 #include "common.h"
 #include "defused-proto.h"
+#include "test_kernel.h"
 #include "test_util.h"
 
 #include <errno.h>
@@ -402,6 +403,7 @@ int main(int argc, char *argv[]) {
         return 2;
     }
     test_set_timeout();
+    test_require_kernel();
 
     int ret = userns_available();
     if (ret < 0) {

@@ -13,6 +13,7 @@
 #define _GNU_SOURCE
 #include "common.h"
 #include "defused-mount.h"
+#include "test_kernel.h"
 #include "test_util.h"
 
 #include <errno.h>
@@ -215,6 +216,7 @@ static void test_perform(const char *dir) {
 
 int main(void) {
     test_set_timeout();
+    test_require_kernel();
 
     _cleanup_(scratch_done) struct scratch scratch = {0};
     if (scratch_create(&scratch) < 0)
