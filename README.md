@@ -121,6 +121,16 @@ Otherwise you could use `systemd-run --user` to "escalate to user".
 See [protocol.md](./doc/protocol.md) for more information on how defused
 works.
 
+## Distribution packages
+
+[![build result][obs-badge]][obs-package]
+
+Packages for openSUSE Tumbleweed, Fedora, Debian, and Ubuntu are available on
+the [Open Build Service][obs-package].
+Installing `defused` replaces the `fuse3` package.
+You may need to enable the socket after installation:
+`systemctl enable --now defused.socket`.
+
 ## NixOS
 
 ```nix
@@ -165,3 +175,5 @@ will be GPL-2.0-only.
 [NoNewPrivileges]: https://docs.kernel.org/userspace-api/no_new_privs.html
 [seccomp-bpf]: https://docs.kernel.org/userspace-api/seccomp_filter.html
 [landlock]: https://docs.kernel.org/userspace-api/landlock.html
+[obs-badge]: https://build.opensuse.org/projects/home:skyenet:defused/packages/defused/badge.svg?type=default
+[obs-package]: https://build.opensuse.org/package/show/home:skyenet:defused/defused
