@@ -1,0 +1,4 @@
+usr/bin/fusermount
+usr/bin/fusermount3
+usr/sbin/mount.fuse
+usr/sbin/umount.fuse

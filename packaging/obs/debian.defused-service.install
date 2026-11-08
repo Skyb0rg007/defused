@@ -1,0 +1,4 @@
+etc/apparmor.d/defused
+usr/lib/systemd/system/defused.socket
+usr/lib/systemd/system/defused@.service
+usr/libexec/defused
