@@ -11,6 +11,7 @@
 #define _GNU_SOURCE
 #include "common.h"
 #include "defused-proto.h"
+#include "test_kernel.h"
 #include "test_util.h"
 
 #include <errno.h>
@@ -579,6 +580,7 @@ int main(int argc, char *argv[]) {
     }
     const char *defused = argv[1];
     test_set_timeout();
+    test_require_kernel();
 
     /* Refused for its shape; this only checks the options parse. */
     static const char *const all_policy_args[] = {
