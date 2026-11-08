@@ -243,11 +243,12 @@ static const char *fd_path(int fd, char *buf, size_t size) {
     return buf;
 }
 
-/* "fuse.sshfs on \"/home/u/mnt\" (fsname=..., flags=ro,nosuid)" */
+/* "fuse.sshfs on \"/home/u/mnt\" (fsname=..., flags=ro,nosuid)". The fsname
+ * is cut to the path's length, so that size 1024 always fits. */
 static const char *describe_mount_req(const struct defused_request *req,
                                       int mnt_fd, char *buf, size_t size) {
     char path[256], flags[160];
-    snprintf(buf, size, "%s%s%s on \"%s\" (fsname=\"%s\", flags=%s)",
+    snprintf(buf, size, "%s%s%s on \"%s\" (fsname=\"%.255s\", flags=%s)",
              req->mount_flags & DEFUSED_MOUNT_BLKDEV ? "fuseblk" : "fuse",
              req->subtype[0] ? "." : "", req->subtype,
              fd_path(mnt_fd, path, sizeof(path)), req->fsname,
@@ -365,7 +366,7 @@ static int handle_mount(const struct defused_request *req, int dev_fd,
                         int mnt_fd, struct peer *peer,
                         struct defused_error *err) {
     /* Before the operation: readlink() is not allowed afterwards. */
-    char target[512];
+    char target[1024];
     describe_mount_req(req, mnt_fd, target, sizeof(target));
     int ret = get_peer_pidfd(peer);
     if (ret < 0)
