@@ -1,0 +1,12 @@
+#!/usr/bin/make -f
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@
+
+execute_after_dh_install:
+	dh_apparmor -pdefused-service --profile-name=defused
+
+override_dh_installsystemd:
+	dh_installsystemd -pdefused-service --no-stop-on-upgrade defused.socket

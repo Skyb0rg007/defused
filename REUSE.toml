@@ -8,10 +8,13 @@ path = [
 SPDX-License-Identifier = "GPL-2.0-or-later"
 SPDX-FileCopyrightText = "2026 Skye Soss <skye@soss.website>"
 
-# A comment header would be read as part of the changelog.
+# Formats without comments, or where a comment header would be read as
+# content.
 [[annotations]]
 path = [
+    "packaging/obs/debian.*",
     "packaging/obs/defused.changes",
+    "packaging/obs/defused.dsc",
 ]
 SPDX-License-Identifier = "MIT-0"
 SPDX-FileCopyrightText = "2026 Skye Soss <skye@soss.website>"

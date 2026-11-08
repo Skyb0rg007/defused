@@ -1,0 +1,63 @@
+Source: defused
+Section: utils
+Priority: optional
+Maintainer: Skye Soss <skye@soss.website>
+Build-Depends:
+ debhelper-compat (= 13),
+ dh-apparmor,
+ libcap-dev,
+ libseccomp-dev,
+ linux-libc-dev (>= 6.12),
+ meson (>= 1.3.0),
+ pkgconf,
+Standards-Version: 4.7.4
+Homepage: https://github.com/Skyb0rg007/defused
+Vcs-Browser: https://github.com/Skyb0rg007/defused
+Vcs-Git: https://github.com/Skyb0rg007/defused.git
+Rules-Requires-Root: no
+
+Package: defused
+Architecture: linux-any
+Depends:
+ defused-service (= ${binary:Version}),
+ ${misc:Depends},
+ ${shlibs:Depends},
+Provides:
+ fuse (= 3.18),
+ fuse3 (= 3.18),
+Conflicts:
+ fuse,
+ fuse3,
+Replaces:
+ fuse,
+ fuse3,
+Description: setuid-less fusermount implementation
+ The kernel's FUSE implementation needs privileges to mount, which libfuse
+ normally obtains from a setuid fusermount3 helper. A setuid helper cannot be
+ used by a process that has set no_new_privileges, which rules out seccomp-bpf
+ and Landlock sandboxing in FUSE clients.
+ .
+ defused replaces the setuid bit with a system service on a Unix socket:
+ clients ask it to mount and it hands back the /dev/fuse descriptor.
+ .
+ This package holds /usr/bin/fusermount3 and /usr/bin/fusermount as clients
+ of that service in place of libfuse's setuid helpers, so it replaces the
+ fuse3 package. libfuse execs these by absolute path, so installing this
+ package is what lets an existing FUSE client mount without setuid and under
+ no_new_privileges. It also installs the mount.fuse and umount.fuse helpers
+ that mount(8) and umount(8) run for fuse.* filesystems, so fstab entries
+ work too.
+
+Package: defused-service
+Architecture: linux-any
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+Description: system service that performs FUSE mounts for defused clients
+ The defused system service, its systemd units and its AppArmor profile. It
+ listens on /run/defused/defused.sock and mounts and unmounts FUSE
+ filesystems on behalf of its clients.
+ .
+ Install this package on its own to keep libfuse's setuid helpers on the
+ host while granting FUSE mounts to sandboxes by bind-mounting the socket
+ into them.
