@@ -7,3 +7,11 @@ path = [
 ]
 SPDX-License-Identifier = "GPL-2.0-or-later"
 SPDX-FileCopyrightText = "2026 Skye Soss <skye@soss.website>"
+
+# A comment header would be read as part of the changelog.
+[[annotations]]
+path = [
+    "packaging/obs/defused.changes",
+]
+SPDX-License-Identifier = "MIT-0"
+SPDX-FileCopyrightText = "2026 Skye Soss <skye@soss.website>"
