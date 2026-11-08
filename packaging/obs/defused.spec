@@ -97,7 +97,7 @@ The AppArmor profile that confines the defused service.
 %apparmor_reload %{apparmor_profilesdir}/%{name}
 
 %files
-%license LICENSES/*
+%license LICENSES/GPL-2.0-or-later.txt LICENSES/MIT-0.txt
 %doc README.md
 %{_bindir}/fusermount
 %{_bindir}/fusermount3
@@ -105,13 +105,14 @@ The AppArmor profile that confines the defused service.
 %{_sbindir}/umount.fuse
 
 %files service
-%license LICENSES/*
+%license LICENSES/GPL-2.0-only.txt LICENSES/MIT-0.txt
 %doc README.md
 %{_libexecdir}/defused
 %{_unitdir}/%{name}@.service
 %{_unitdir}/%{name}.socket
 
 %files apparmor
+%license LICENSES/MIT-0.txt
 %dir %{apparmor_profilesdir}
 %config(noreplace) %{apparmor_profilesdir}/%{name}
 
