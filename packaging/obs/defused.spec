@@ -2,7 +2,14 @@
 #
 # SPDX-License-Identifier: MIT-0
 #
-# spec file for openSUSE
+# spec file for openSUSE and Fedora
+
+# Fedora uses SELinux, so the AppArmor profile is only packaged for openSUSE.
+%if 0%{?suse_version}
+%bcond_without apparmor
+%else
+%bcond_with apparmor
+%endif
 
 # The libfuse versions that defused is tested against.
 # This is used in the Provides: section.
@@ -17,13 +24,20 @@ License:        GPL-2.0-only
 URL:            https://github.com/Skyb0rg007/defused
 Source:         %{name}-%{version}.tar.xz
 
-BuildRequires:  apparmor-rpm-macros
+BuildRequires:  gcc
 BuildRequires:  meson >= 1.3.0
 BuildRequires:  pkgconfig
 BuildRequires:  pkgconfig(libcap)
 BuildRequires:  pkgconfig(libseccomp)
-BuildRequires:  linux-glibc-devel
 BuildRequires:  systemd-rpm-macros
+%if 0%{?suse_version}
+BuildRequires:  linux-glibc-devel
+%else
+BuildRequires:  kernel-headers
+%endif
+%if %{with apparmor}
+BuildRequires:  apparmor-rpm-macros
+%endif
 
 Requires:       %{name}-service = %{version}-%{release}
 Provides:       fuse3 = %{libfuse3_series}
@@ -59,6 +73,7 @@ The defused system service and its systemd units. It listens on
 /run/defused/defused.sock and mounts/unmounts FUSE filesystems on behalf of its
 clients.
 
+%if %{with apparmor}
 %package apparmor
 Summary:        AppArmor profile for the defused service
 BuildArch:      noarch
@@ -67,6 +82,7 @@ Supplements:    (%{name}-service and apparmor-abstractions)
 
 %description apparmor
 The AppArmor profile that confines the defused service.
+%endif
 
 %prep
 %autosetup -n %{name}-%{version}
@@ -77,10 +93,14 @@ The AppArmor profile that confines the defused service.
 
 %install
 %meson_install
+%if %{without apparmor}
+rm -r %{buildroot}%{_sysconfdir}/apparmor.d
+%endif
 
 %check
 %meson_test
 
+%if 0%{?suse_version}
 %pre service
 %service_add_pre %{name}.socket
 
@@ -92,9 +112,21 @@ The AppArmor profile that confines the defused service.
 
 %postun service
 %service_del_postun_without_restart %{name}.socket
+%else
+%post service
+%systemd_post %{name}.socket
 
+%preun service
+%systemd_preun %{name}.socket
+
+%postun service
+%systemd_postun %{name}.socket
+%endif
+
+%if %{with apparmor}
 %post apparmor
 %apparmor_reload %{apparmor_profilesdir}/%{name}
+%endif
 
 %files
 %license LICENSES/GPL-2.0-or-later.txt LICENSES/MIT-0.txt
@@ -111,9 +143,11 @@ The AppArmor profile that confines the defused service.
 %{_unitdir}/%{name}@.service
 %{_unitdir}/%{name}.socket
 
+%if %{with apparmor}
 %files apparmor
 %license LICENSES/MIT-0.txt
 %dir %{apparmor_profilesdir}
 %config(noreplace) %{apparmor_profilesdir}/%{name}
+%endif
 
 %changelog
