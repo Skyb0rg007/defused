@@ -13,8 +13,10 @@
 #include "common.h"
 #include "defused-syscall.h"
 
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +29,22 @@
 /* FSOPEN_*, FSCONFIG_*, MOUNT_ATTR_* and MOVE_MOUNT_*: musl declares
  * none of them. */
 #include <linux/mount.h>
+
+/* STATMOUNT_FS_SUBTYPE and fs_subtype are Linux 6.13 uapi */
+#define STATMOUNT_FS_SUBTYPE_OFFSET 120
+#ifdef STATMOUNT_FS_SUBTYPE
+static_assert(offsetof(struct statmount, fs_subtype) ==
+                  STATMOUNT_FS_SUBTYPE_OFFSET,
+              "struct statmount ABI changed");
+#else
+#define STATMOUNT_FS_SUBTYPE 0x00000100U
+#endif
+
+static uint32_t statmount_fs_subtype(const struct statmount *sm) {
+    uint32_t off;
+    memcpy(&off, (const char *)sm + STATMOUNT_FS_SUBTYPE_OFFSET, sizeof(off));
+    return off;
+}
 
 /* AT_HANDLE_FID and AT_HANDLE_MNT_ID_UNIQUE. The define skips
  * <asm-generic/fcntl.h>, which would clash with <fcntl.h> above. */
@@ -104,7 +122,7 @@ int defused_is_fuse_mount(uint64_t mnt_ns_id, uint64_t mnt_id, bool *out_blkdev,
     /* Linux 6.12 reports no subtype at all, and later kernels report none
      * for a mount without one, so only a reported subtype is compared. */
     if (subtype && (buf.sm.mask & STATMOUNT_FS_SUBTYPE) &&
-        strcmp(buf.sm.str + buf.sm.fs_subtype, subtype) != 0)
+        strcmp(buf.sm.str + statmount_fs_subtype(&buf.sm), subtype) != 0)
         return 0;
     if (out_blkdev)
         *out_blkdev = blkdev;
