@@ -124,6 +124,7 @@ works.
 ## Distribution packages
 
 [![build result][obs-badge]][obs-package]
+[![nightly][obs-nightly-badge]][obs-nightly-package]
 
 Packages for openSUSE Tumbleweed, Fedora, Debian, and Ubuntu are available on
 the [Open Build Service][obs-package].
@@ -177,3 +178,5 @@ will be GPL-2.0-only.
 [landlock]: https://docs.kernel.org/userspace-api/landlock.html
 [obs-badge]: https://build.opensuse.org/projects/home:skyenet:defused/packages/defused/badge.svg?type=default
 [obs-package]: https://build.opensuse.org/package/show/home:skyenet:defused/defused
+[obs-nightly-badge]: https://build.opensuse.org/projects/home:skyenet:defused:nightly/packages/defused/badge.svg?type=default
+[obs-nightly-package]: https://build.opensuse.org/package/show/home:skyenet:defused:nightly/defused
