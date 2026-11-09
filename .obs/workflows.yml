@@ -1,0 +1,21 @@
+version: '1.1'
+
+pr_build:
+  steps:
+    - branch_package:
+        source_project: home:skyenet:defused:nightly
+        source_package: defused
+        target_project: home:skyenet:defused:CI
+  filters:
+    event: pull_request
+
+main_update:
+  steps:
+    - trigger_services:
+        project: home:skyenet:defused:nightly
+        package: defused
+  filters:
+    event: push
+    branches:
+      only:
+        - main
