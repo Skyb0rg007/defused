@@ -132,6 +132,35 @@ Installing `defused` replaces the `fuse3` package.
 You may need to enable the socket after installation:
 `systemctl enable --now defused.socket`.
 
+### Debian/Ubuntu
+
+Replace `Debian_13` with `Debian_Unstable`, `xUbuntu_26.04`, `xUbuntu_26.10`
+as needed.
+
+```console
+$ curl -fsSL https://download.opensuse.org/repositories/home:skyenet:defused/Debian_13/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/obs-home-skyenet.gpg
+$ echo 'deb [signed-by=/etc/apt/keyrings/obs-home-skyenet.gpg] https://download.opensuse.org/repositories/home:/skyenet:/defused/Debian_13/ /' | sudo tee /etc/apt/sources.list.d/home:skyenet:defused.list
+$ sudo apt update
+$ sudo apt install defused
+```
+
+### Fedora
+
+Replace `Fedora_44` with `Fedora_Rawhide` as needed.
+
+```console
+# dnf config-manager addrepo --from-repofile=https://download.opensuse.org/repositories/home:skyenet:defused/Fedora_44/home:skyenet:defused.repo
+# dnf install defused
+```
+
+### openSUSE
+
+```console
+# zypper addrepo https://download.opensuse.org/repositories/home:skyenet:defused/openSUSE_Tumbleweed/home:skyenet:defused.repo
+# zypper refresh
+# zypper install defused
+```
+
 ## NixOS
 
 ```nix
