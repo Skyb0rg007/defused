@@ -23,3 +23,11 @@ main_update:
     branches:
       only:
         - main
+
+tag_release:
+  steps:
+    - trigger_services:
+        project: home:skyenet:defused
+        package: defused
+  filters:
+    event: tag_push
