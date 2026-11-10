@@ -76,6 +76,81 @@ log_error(int ret, const char *fmt, ...) {
     return ret;
 }
 
+/* The length of the well-formed UTF-8 sequence at s, or 0: no overlong
+ * forms, surrogates, or code points past U+10FFFF. Stops at a NUL. */
+static size_t utf8_seq_len(const unsigned char *s) {
+    unsigned char lo = 0x80, hi = 0xbf;
+    size_t len;
+    if (s[0] >= 0xc2 && s[0] <= 0xdf)
+        len = 2;
+    else if (s[0] >= 0xe0 && s[0] <= 0xef) {
+        len = 3;
+        if (s[0] == 0xe0)
+            lo = 0xa0;
+        else if (s[0] == 0xed)
+            hi = 0x9f;
+    } else if (s[0] >= 0xf0 && s[0] <= 0xf4) {
+        len = 4;
+        if (s[0] == 0xf0)
+            lo = 0x90;
+        else if (s[0] == 0xf4)
+            hi = 0x8f;
+    } else
+        return 0;
+    if (s[1] < lo || s[1] > hi)
+        return 0;
+    for (size_t i = 2; i < len; i++)
+        if (s[i] < 0x80 || s[i] > 0xbf)
+            return 0;
+    return len;
+}
+
+/* Copies a client-controlled string into dst for a log line: control
+ * characters (C0, DEL, C1) and bytes that are not well-formed UTF-8 become
+ * \xHH, a backslash is doubled, and with quote a '"' becomes \" so it
+ * cannot close the log's own quotes. A newline can then never start a
+ * forged journal entry. Output that does not fit is cut at a character
+ * boundary and ends in "...". Makes no system calls, so it is safe under
+ * the seccomp filter. */
+static const char *log_escape(char *dst, size_t size, const char *src,
+                              bool quote) {
+    const unsigned char *s = (const unsigned char *)src;
+    size_t n = 0, mark = 0;
+    while (*s != '\0') {
+        char item[8];
+        size_t len, step = *s < 0x80 ? 1 : utf8_seq_len(s);
+        if (*s == '\\' || (quote && *s == '"')) {
+            item[0] = '\\';
+            item[1] = (char)*s;
+            step = 1;
+            len = 2;
+        } else if (*s < 0x20 || *s == 0x7f || step == 0 ||
+                   (s[0] == 0xc2 && s[1] < 0xa0)) {
+            /* One byte at a time: the rest of a C1 pair follows alone. */
+            step = 1;
+            len = (size_t)snprintf(item, sizeof(item), "\\x%02x", s[0]);
+        } else {
+            memcpy(item, s, step);
+            len = step;
+        }
+        if (n + len >= size) {
+            if (mark + 3 < size) {
+                memcpy(dst + mark, "...", 3);
+                n = mark + 3;
+            } else
+                n = mark;
+            break;
+        }
+        memcpy(dst + n, item, len);
+        n += len;
+        s += step;
+        if (n + 3 < size)
+            mark = n;
+    }
+    dst[n] = '\0';
+    return dst;
+}
+
 static int parse_long(const char *s, long *out) {
     char *end;
     errno = 0;
@@ -243,15 +318,22 @@ static const char *fd_path(int fd, char *buf, size_t size) {
     return buf;
 }
 
-/* "fuse.sshfs on \"/home/u/mnt\" (fsname=..., flags=ro,nosuid)". The fsname
- * is cut to the path's length, so that size 1024 always fits. */
+/* "fuse.sshfs on \"/home/u/mnt\" (fsname=..., flags=ro,nosuid)". Each field
+ * is escaped into its own array, which bounds it, so that size 2048 always
+ * fits. */
 static const char *describe_mount_req(const struct defused_request *req,
                                       int mnt_fd, char *buf, size_t size) {
     char path[256], flags[160];
-    snprintf(buf, size, "%s%s%s on \"%s\" (fsname=\"%.255s\", flags=%s)",
+    /* Room for every escaped byte, except a long fsname is cut short. */
+    char subtype_esc[4 * DEFUSED_MAX_SUBTYPE], path_esc[4 * sizeof(path)],
+        fsname_esc[512];
+    log_escape(subtype_esc, sizeof(subtype_esc), req->subtype, true);
+    log_escape(path_esc, sizeof(path_esc), fd_path(mnt_fd, path, sizeof(path)),
+               true);
+    log_escape(fsname_esc, sizeof(fsname_esc), req->fsname, true);
+    snprintf(buf, size, "%s%s%s on \"%s\" (fsname=\"%s\", flags=%s)",
              req->mount_flags & DEFUSED_MOUNT_BLKDEV ? "fuseblk" : "fuse",
-             req->subtype[0] ? "." : "", req->subtype,
-             fd_path(mnt_fd, path, sizeof(path)), req->fsname,
+             req->subtype[0] ? "." : "", subtype_esc, path_esc, fsname_esc,
              defused_mount_flags_str(req->mount_flags, flags, sizeof(flags)));
     return buf;
 }
@@ -259,12 +341,15 @@ static const char *describe_mount_req(const struct defused_request *req,
 /* Answers, then logs the outcome. Only the code and errno go on the wire;
  * err->detail stays in the log. After a sandboxed operation this runs
  * under the seccomp filter, which lets the reply and stderr through and
- * nothing else: target was formatted beforehand, and the log line is
- * best-effort. */
+ * nothing else: target was formatted (and escaped) beforehand, and the log
+ * line is best-effort. err->detail can quote the client's strings, so it
+ * is escaped here; its own quotes are the service's, so '"' is left as is. */
 static int finish_request(const char *what, const char *target,
                           const struct peer *peer, int ret,
                           const struct defused_error *err) {
     int sent = defused_send_reply(peer->sock, err);
+    char detail[4 * sizeof(err->detail)];
+    log_escape(detail, sizeof(detail), err->detail, false);
     if (ret >= 0)
         fprintf(stderr, "defused: %sed %s for uid %u\n", what, target,
                 (unsigned)peer->uid);
@@ -275,7 +360,7 @@ static int finish_request(const char *what, const char *target,
                 what, (int)peer->pid, (unsigned)peer->uid, target,
                 defused_error_description(err->code),
                 strerror(err->sys_errno ? err->sys_errno : -ret),
-                err->detail[0] ? " -- " : "", err->detail);
+                detail[0] ? " -- " : "", detail);
     return sent < 0 ? log_error(sent, "sending the reply failed") : ret;
 }
 
@@ -366,7 +451,7 @@ static int handle_mount(const struct defused_request *req, int dev_fd,
                         int mnt_fd, struct peer *peer,
                         struct defused_error *err) {
     /* Before the operation: readlink() is not allowed afterwards. */
-    char target[1024];
+    char target[2048];
     describe_mount_req(req, mnt_fd, target, sizeof(target));
     int ret = get_peer_pidfd(peer);
     if (ret < 0)
@@ -401,9 +486,13 @@ static int umount_request(const struct defused_request *req, int parent_fd,
 static int handle_unmount(const struct defused_request *req, int parent_fd,
                           struct peer *peer, struct defused_error *err) {
     /* Before the operation: readlink() is not allowed afterwards. */
-    char path[256], target[512];
+    char path[256], path_esc[4 * sizeof(path)],
+        name_esc[4 * DEFUSED_MAX_FILENAME];
+    char target[sizeof(path_esc) + sizeof(name_esc) + 16];
     snprintf(target, sizeof(target), "\"%s/%s\"%s",
-             fd_path(parent_fd, path, sizeof(path)), req->name,
+             log_escape(path_esc, sizeof(path_esc),
+                        fd_path(parent_fd, path, sizeof(path)), true),
+             log_escape(name_esc, sizeof(name_esc), req->name, true),
              req->lazy ? " (lazy)" : "");
     int ret = get_peer_pidfd(peer);
     if (ret < 0)
