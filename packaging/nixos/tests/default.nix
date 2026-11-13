@@ -15,7 +15,7 @@ let
   # one are each exercised for real.
   kernels = [
     pkgs.linuxPackages_6_12
-    pkgs.linuxPackages_7_2
+    pkgs.linuxPackages_7_3
   ];
 
   # ... and against both builds, so the statically-linked musl binaries are
