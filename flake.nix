@@ -32,18 +32,6 @@
         fileset = lib.fileset.gitTracked ./.;
       };
 
-      staticPackages =
-        pkgs:
-        pkgs.pkgsStatic.extend (
-          _: prev: {
-            # Its test suite defines fgetxattr()/fsetxattr(), which collide
-            # with musl's static libc.
-            libcap_ng = prev.libcap_ng.overrideAttrs (_: {
-              doCheck = false;
-            });
-          }
-        );
-
       mkDefused =
         pkgs:
         pkgs.stdenv.mkDerivation {
@@ -102,7 +90,7 @@
           default = self.packages.${system}.defused;
           defused = mkDefused pkgs;
           # Runs on a musl system with no shared libraries at all.
-          defused-static = (mkDefused (staticPackages pkgs)).overrideAttrs (_: {
+          defused-static = (mkDefused pkgs.pkgsStatic).overrideAttrs (_: {
             pname = "defused-static";
           });
         }
