@@ -1,3 +1,13 @@
+defused (0.2-0) unstable; urgency=medium
+
+  * The service is now installed into /usr/libexec
+  * Builds with Linux 6.12 headers now work properly
+  * Open Build Service builds are now setup for continuous integration
+  * Fixes log message truncation due to long path names
+  * The AppArmor profile is templated with the installation directory
+
+ -- Skye Soss <skye@soss.website>  Fri, 20 Nov 2026 11:55:50 +0000
+
 defused (0.1-0) unstable; urgency=medium
 
   * Initial package of defused.

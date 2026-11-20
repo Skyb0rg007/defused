@@ -36,7 +36,7 @@
         pkgs:
         pkgs.stdenv.mkDerivation {
           pname = "defused";
-          version = "0.1";
+          version = "0.2";
           inherit src;
           nativeBuildInputs = [
             pkgs.meson

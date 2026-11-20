@@ -2,7 +2,7 @@ Format: 3.0 (quilt)
 Source: defused
 Binary: defused, defused-service
 Architecture: linux-any
-Version: 0.1-0
+Version: 0.2-0
 Maintainer: Skye Soss <skye@soss.website>
 Homepage: https://github.com/Skyb0rg007/defused
 Vcs-Browser: https://github.com/Skyb0rg007/defused
